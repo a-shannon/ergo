@@ -41,6 +41,16 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
   private val candidateGenDelay: FiniteDuration    = 3.seconds
   private val blockValidationDelay: FiniteDuration = 2.seconds
 
+  private def expectBlockAccepted(testProbe: TestProbe, block: ErgoFullBlock): Unit = {
+    val messages = testProbe.receiveN(2, blockValidationDelay)
+    messages.count(_ == StatusReply.Success(())) shouldBe 1
+    messages.count {
+      case FullBlockApplied(header) if header.id != block.header.parentId => true
+      case _                                                              => false
+    } shouldBe 1
+    testProbe.expectNoMessage(200.millis)
+  }
+
   val defaultSettings: ErgoSettings = {
     val empty = ErgoSettingsReader.read()
     val nodeSettings = empty.nodeSettings.copy(
@@ -859,13 +869,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
       .proveCandidate(initCandidate.candidateBlock, defaultMinerSecret.w, 0, 1000)
       .get
     candidateGenerator.tell(initBlock.header.powSolution, testProbe.ref)
-    // Wait for exactly two messages — StatusReply.Success(()) ack and FullBlockApplied — in any
-    // order, then assert nothing else is in flight. This guarantees the state update has fully
-    // propagated to CandidateGenerator before the forced regeneration below.
-    val initMsgs = testProbe.receiveN(2, blockValidationDelay)
-    initMsgs.collect { case StatusReply.Success(()) => () }.size shouldBe 1
-    initMsgs.collect { case FullBlockApplied(header) if header.id != initBlock.header.parentId => () }.size shouldBe 1
-    testProbe.expectNoMessage(200.millis)
+    expectBlockAccepted(testProbe, initBlock)
 
     // Get first candidate after chain is established
     candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), testProbe.ref)
@@ -893,10 +897,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
     // Submit solution - should succeed because candidate1 should be in cachedPreviousCandidate
     candidateGenerator.tell(solvedBlock.header.powSolution, testProbe.ref)
 
-    val solvedMsgs = testProbe.receiveN(2, blockValidationDelay)
-    solvedMsgs.collect { case StatusReply.Success(()) => () }.size shouldBe 1
-    solvedMsgs.collect { case FullBlockApplied(header) if header.id != solvedBlock.header.parentId => () }.size shouldBe 1
-    testProbe.expectNoMessage(200.millis)
+    expectBlockAccepted(testProbe, solvedBlock)
 
     system.terminate()
   }

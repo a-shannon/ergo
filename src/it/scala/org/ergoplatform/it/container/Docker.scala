@@ -393,9 +393,9 @@ class Docker(
     stopNode(node.containerId, secondsToWait)
 
   def stopNode(containerId: String, secondsToWait: Int = 5): Unit = {
-    // Save logs BEFORE stopping/removing the container — docker-java refuses log
+    // Save logs before stopping/removing the container; docker-java refuses log
     // requests once the container is "dead or marked for removal".
-    Try(saveLogs(containerId, if (tag.isEmpty) containerId else tag))
+    Try(saveLogs(containerId, tag))
       .recover { case NonFatal(e) => log.warn(s"Failed to save logs for $containerId: ${e.getMessage}") }
     nodeRepository = nodeRepository.filterNot(_.containerId == containerId)
     client.stopContainerCmd(containerId).withTimeout(secondsToWait).exec()
@@ -410,7 +410,7 @@ class Docker(
     if (isStopped.compareAndSet(false, true)) {
       log.info("Stopping containers")
 
-      // Save logs BEFORE stopping — once a container is stopped + marked for removal,
+      // Save logs before stopping; once a container is stopped and marked for removal,
       // docker-java's logContainerCmd returns 409 Conflict.
       saveNodeLogs()
       apiCheckerOpt.foreach { checker =>
@@ -442,13 +442,14 @@ class Docker(
     }
   }
 
-  private def saveLogs(containerId: String, tag: String): Unit = {
+  private def saveLogs(containerId: String, logFilePrefix: String): Unit = {
     val logDir: Path = Paths.get(System.getProperty("user.dir"), "target", "logs")
     Files.createDirectories(logDir)
 
-    val fileName: String = s"$tag-$containerId"
+    val fileName: String =
+      if (logFilePrefix.isEmpty) containerId else s"$logFilePrefix-$containerId"
     val logFile: File    = logDir.resolve(s"$fileName.log").toFile
-    log.info(s"Writing logs of $tag-$containerId to ${logFile.getAbsolutePath}")
+    log.info(s"Writing logs of $containerId to ${logFile.getAbsolutePath}")
 
     val fileStream: FileOutputStream = new FileOutputStream(logFile, false)
     try {
@@ -474,7 +475,7 @@ class Docker(
 
   private def saveNodeLogs(): Unit = {
     nodeRepository.foreach { node =>
-      Try(saveLogs(node.nodeInfo.containerId, if (tag.isEmpty) node.nodeInfo.containerId else tag))
+      Try(saveLogs(node.nodeInfo.containerId, tag))
         .recover { case NonFatal(e) =>
           log.warn(s"Failed to save logs for ${node.nodeInfo.containerId}: ${e.getMessage}")
         }

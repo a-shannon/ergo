@@ -548,7 +548,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       Option(syncTracker.peersByStatus.getOrElse(Older, mutable.WrappedArray.empty))
         .filter(_.nonEmpty)
         .orElse {
-          // Defensive fallback: cached peer status can go stale — a peer flagged
+          // Defensive fallback: cached peer status can go stale - a peer flagged
           // `Younger` at initial handshake may have since caught up via gossip and be
           // the only source of a header we need (e.g. when chasing back a missing
           // parent after `ParentHeaderNotFoundError`). Falling straight through to
@@ -576,7 +576,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       }
       .orElse {
         // Defensive fallback: if no Older/Equal/Unknown/Fork peers, also try Younger.
-        // A peer's cached status can go stale — e.g. it advertised an older chain at
+        // A peer's cached status can go stale - e.g. it advertised an older chain at
         // initial handshake but has since caught up via gossip from other peers, while
         // we still have it pinned as `Younger`. Without this fallback the node ends up
         // locked out of block downloads in that case.

@@ -116,7 +116,7 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite with Eventually
       isMiningBOpt map (_ shouldBe false)
 
       // 5. Wait until minerB converges with minerA's chain at the target height.
-      // We can't rely on waitForHeight alone here — minerB's on-disk chain may already
+      // We can't rely on waitForHeight alone here - minerB's on-disk chain may already
       // exceed minerABestHeight (mining continued briefly between the fullHeight capture
       // and the phase-2 stop), so reaching the height doesn't mean we've adopted
       // minerA's chain. Wait for chain agreement (same block id at the target height).
