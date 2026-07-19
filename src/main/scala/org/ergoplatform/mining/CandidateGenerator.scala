@@ -33,7 +33,7 @@ import sigma.crypto.CryptoFacade
 import sigma.data.{Digest32Coll, ProveDlog}
 import sigma.interpreter.ProverResult
 import sigma.validation.ReplacedRule
-import sigma.{Coll, Colls}
+import sigma.{Coll, Colls, VersionContext}
 
 import scala.annotation.tailrec
 import scala.concurrent.duration._
@@ -250,6 +250,24 @@ class CandidateGenerator(
 }
 
 object CandidateGenerator extends ScorexLogging {
+
+  private[mining] def ensureCandidateScriptVersionSupported(
+    blockVersion: Byte,
+    maxSupportedScriptVersion: Byte = VersionContext.MaxSupportedScriptVersion
+  ): Byte = {
+    val scriptVersion = Header.scriptFromBlockVersion(blockVersion)
+    require(
+      scriptVersion >= 0,
+      s"Cannot create block candidate: block version $blockVersion maps to invalid " +
+        s"script version $scriptVersion"
+    )
+    require(
+      scriptVersion <= maxSupportedScriptVersion,
+      s"Cannot create block candidate: block version $blockVersion requires script version $scriptVersion, " +
+        s"but this interpreter supports up to $maxSupportedScriptVersion"
+    )
+    blockVersion
+  }
 
   /**
     * Holder for both candidate block and data for external miners derived from it
@@ -586,13 +604,15 @@ object CandidateGenerator extends ScorexLogging {
           (interlinksExtension, Array(0: Byte, 0: Byte, 0: Byte), Header.InitialVersion)
         )
 
+      val candidateVersion = ensureCandidateScriptVersionSupported(version)
+
       val upcomingContext = state.stateContext.upcoming(
         minerPk.value,
         timestamp,
         nBits,
         votes,
         proposedUpdate,
-        version
+        candidateVersion
       )
 
       val emissionTxs = emissionTxOpt.toSeq
@@ -637,7 +657,7 @@ object CandidateGenerator extends ScorexLogging {
         case Success((adProof, adDigest)) =>
           val candidate = CandidateBlock(
             bestHeaderOpt,
-            version,
+            candidateVersion,
             nBits,
             adDigest,
             adProof,
@@ -669,7 +689,7 @@ object CandidateGenerator extends ScorexLogging {
                 case (adProof, adDigest) =>
                   val candidate = CandidateBlock(
                     bestHeaderOpt,
-                    version,
+                    candidateVersion,
                     nBits,
                     adDigest,
                     adProof,
