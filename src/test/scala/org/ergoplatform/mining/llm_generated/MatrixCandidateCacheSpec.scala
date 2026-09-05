@@ -77,7 +77,7 @@ class MatrixCandidateCacheSpec extends ErgoCorePropertyTest {
     val cached = withInputTip(tip)
     val stored = cached.candidateBlock.inputBlockFields.prevTransactionsDigest
     val selected = Digest32 @@ stored.clone()
-    (stored eq selected) shouldBe false
+    (stored.asInstanceOf[AnyRef] eq selected.asInstanceOf[AnyRef]) shouldBe false
     CandidateGenerator.cachedFor(Some(cached), Seq.empty, defaultMinerPk,
       Some(bytesToId(tip)), selected) shouldBe true
   }
