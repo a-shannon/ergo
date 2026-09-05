@@ -265,7 +265,9 @@ class CandidateGeneratorPropSpec extends ErgoCorePropertyTest {
         defaultMinerPk,
         emptyStateContext
       )
-      txs.length shouldBe 2
+      val feeBoxes = blockTxs.flatMap(_.outputs)
+      val chunkSize = CandidateGenerator.MaxFeeBoxesPerTransaction
+      txs.length shouldBe 1 + (feeBoxes.size + chunkSize - 1) / chunkSize
 
       val emissionTx = txs.head
       emissionTx.outputs.length shouldBe 2
@@ -274,12 +276,16 @@ class CandidateGeneratorPropSpec extends ErgoCorePropertyTest {
         defaultMinerPk
       )
 
-      val feeTx = txs.last
-      feeTx.outputs.length shouldBe 1
-      feeTx.outputs.head.value shouldBe blockTxs.flatMap(_.outputs).map(_.value).sum
-      feeTx.outputs.head.propositionBytes shouldEqual expectedRewardOutputScriptBytes(
-        defaultMinerPk
-      )
+      val feeTxs = txs.tail
+      feeTxs.foreach { feeTx =>
+        feeTx.inputs.length should be <= chunkSize
+        feeTx.outputs.length shouldBe 1
+        feeTx.outputs.head.propositionBytes shouldEqual expectedRewardOutputScriptBytes(defaultMinerPk)
+      }
+      feeTxs.flatMap(_.outputs).map(_.value).sum shouldBe feeBoxes.map(_.value).sum
+      val spent = feeTxs.flatMap(_.inputs).map(in => in.boxId.toSeq)
+      spent.distinct.size shouldBe spent.size
+      spent.toSet shouldBe feeBoxes.map(_.id.toSeq).toSet
     }
   }
 
