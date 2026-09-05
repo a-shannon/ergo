@@ -3,8 +3,10 @@ package org.ergoplatform.mining
 import com.google.common.io.Files.createTempDir
 import org.ergoplatform.{DataInput, ErgoBox, ErgoBoxCandidate, Input}
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
+import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.nodeView.state.{BoxHolder, UtxoState}
-import org.ergoplatform.settings.Constants.TrueTree
+import org.ergoplatform.settings.Parameters
+import org.ergoplatform.settings.Constants.{FalseTree, TrueTree}
 import org.ergoplatform.utils.{ErgoCompilerHelpers, ErgoCorePropertyTest}
 import org.ergoplatform.utils.ErgoCoreTestConstants.{defaultMinerPk, emptyVSUpdate, parameters}
 import org.ergoplatform.utils.ErgoNodeTestConstants.settings
@@ -27,17 +29,88 @@ class MatrixTransactionSelectionSpec extends ErgoCorePropertyTest with ErgoCompi
     ErgoTransaction(IndexedSeq(Input(input.id, ProverResult.empty)), dataInputs,
       IndexedSeq(new ErgoBoxCandidate(input.value, outputTree, 1)))
 
-  private def select(boxes: Seq[ErgoBox], txs: Seq[ErgoTransaction]) = {
-    val state = UtxoState.fromBoxHolder(BoxHolder(boxes), None, createTempDir(), settings, parameters)
+  private def select(boxes: Seq[ErgoBox], txs: Seq[ErgoTransaction],
+                     version: Byte = Header.Interpreter60Version,
+                     currentVersion: Byte = Header.InitialVersion,
+                     maxCost: Int = parameters.maxBlockCost,
+                     maxSize: Int = parameters.maxBlockSize) = {
+    val currentParameters = Parameters(parameters.height,
+      parameters.parametersTable.updated(Parameters.BlockVersion, currentVersion.toInt), parameters.proposedUpdate)
+    val state = UtxoState.fromBoxHolder(BoxHolder(boxes), None, createTempDir(), settings, currentParameters)
     val context = state.stateContext.upcoming(defaultMinerPk.value, 1L, settings.chainSettings.initialNBits,
-      Array.emptyByteArray, emptyVSUpdate, 4.toByte)
-    val result = CandidateGenerator.collectTxs(defaultMinerPk, parameters.maxBlockCost,
-      parameters.maxBlockSize, state, context, txs)
+      Array.emptyByteArray, emptyVSUpdate, version)
+    val result = CandidateGenerator.collectTxs(defaultMinerPk, maxCost,
+      maxSize, state, context, txs)
     // Both selected payloads must have a UTXO proof independently of the other new payload.
     Seq(result._1, result._2).filter(_.nonEmpty).foreach { payload =>
       state.proofsForTransactions(payload).isSuccess shouldBe true
     }
     result
+  }
+
+  Seq(Header.InitialVersion, Header.HardeningVersion, Header.Interpreter50Version).foreach { version =>
+    property(s"version $version includes ordinary transactions and their descendants in ordering blocks") {
+      val initial = box(11)
+      val parent = spend(initial)
+      val child = spend(parent.outputs.head)
+      val (input, ordering, invalid) = select(Seq(initial), Seq(parent, child), version)
+      input shouldBe empty
+      ordering shouldBe Seq(parent, child)
+      invalid shouldBe empty
+    }
+  }
+
+  property("the first version 4 candidate partitions transactions while current parameters are version 3") {
+    val inputBox = box(12)
+    val orderingBox = box(13, orderingTree)
+    val inputTx = spend(inputBox)
+    val orderingTx = spend(orderingBox)
+    val (input, ordering, invalid) = select(Seq(inputBox, orderingBox), Seq(inputTx, orderingTx),
+      Header.Interpreter60Version, Header.Interpreter50Version)
+    input shouldBe Seq(inputTx)
+    ordering shouldBe Seq(orderingTx)
+    invalid shouldBe empty
+  }
+
+  property("legacy candidates keep dependencies between ordinary and context-dependent transactions") {
+    Seq(false, true).foreach { contextDependentParent =>
+      val initial = box(14, if (contextDependentParent) orderingTree else TrueTree)
+      val parent = spend(initial, if (contextDependentParent) TrueTree else orderingTree)
+      val child = spend(parent.outputs.head)
+      val (input, ordering, invalid) = select(Seq(initial), Seq(parent, child), Header.Interpreter50Version)
+      input shouldBe empty
+      ordering shouldBe Seq(parent, child)
+      invalid shouldBe empty
+    }
+  }
+
+  Seq(Header.Interpreter50Version, Header.Interpreter60Version).foreach { version =>
+    property(s"version $version rejects an unsatisfied script") {
+      val initial = box(15, FalseTree)
+      val tx = spend(initial)
+      val (input, ordering, invalid) = select(Seq(initial), Seq(tx), version)
+      input shouldBe empty
+      ordering shouldBe empty
+      invalid shouldBe Seq(tx.id)
+    }
+
+    property(s"version $version rejects a transaction exceeding the validation cost budget") {
+      val initial = box(16)
+      val tx = spend(initial)
+      val (input, ordering, invalid) = select(Seq(initial), Seq(tx), version, maxCost = 1)
+      input shouldBe empty
+      ordering shouldBe empty
+      invalid shouldBe Seq(tx.id)
+    }
+
+    property(s"version $version leaves a valid transaction unselected when the payload is full") {
+      val initial = box(17)
+      val tx = spend(initial)
+      val (input, ordering, invalid) = select(Seq(initial), Seq(tx), version, maxSize = 1)
+      input shouldBe empty
+      ordering shouldBe empty
+      invalid shouldBe empty
+    }
   }
 
   property("ordinary and soft-field transactions enter their respective partitions") {
