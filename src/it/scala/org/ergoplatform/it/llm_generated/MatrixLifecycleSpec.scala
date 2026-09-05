@@ -15,6 +15,7 @@ import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.nodeView.wallet.ErgoWalletServiceImpl
 import org.ergoplatform.sdk.SecretString
 import org.ergoplatform.settings.{ErgoValidationSettingsUpdate, NetworkType, Parameters}
+import org.ergoplatform.wallet.Constants.MiningScanId
 import org.ergoplatform.wallet.boxes.ErgoBoxSerializer
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
@@ -94,6 +95,13 @@ class MatrixLifecycleSpec extends AnyFlatSpec
       .map(j => j.hcursor.downField("box").as[ErgoBox].fold(throw _, identity))
 
   private def walletIds(node: Node): Set[String] = walletBoxes(node).map(b => Base16.encode(b.id)).toSet
+
+  private def miningRewards(node: Node): Map[String, (ErgoBox, Int)] =
+    get(node, s"/scan/unspentBoxes/$MiningScanId?minConfirmations=0&limit=1000").asArray.get
+      .map { json =>
+        val box = json.hcursor.downField("box").as[ErgoBox].fold(throw _, identity)
+        (Base16.encode(box.id), (box, field[Int](json, "inclusionHeight")))
+      }.toMap
 
   private def walletBalance(node: Node): Long =
     field[Long](get(node, "/wallet/balances/withUnconfirmed"), "balance")
@@ -484,7 +492,11 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     val rewardDelay = monetary.minerRewardDelay
     rewardDelay shouldBe 1
     val openingBalance = walletBalance(payer)
-    nodeList.foreach(n => walletBalance(n) shouldBe openingBalance)
+    val openingMiningRewards = miningRewards(payer)
+    nodeList.foreach { node =>
+      walletBalance(node) shouldBe openingBalance
+      miningRewards(node) shouldBe openingMiningRewards
+    }
 
     val source = spendable(payer).head
     val tx = payment(payer, source, 2000000L)
@@ -529,6 +541,15 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     val emissionRewards = emission.head.outputs.filter(b => java.util.Arrays.equals(b.propositionBytes, expectedScript))
     emissionRewards.size shouldBe 1
     emissionRewards.head.value shouldBe emissionAmount
+    val emissionRewardId = Base16.encode(emissionRewards.head.id)
+    val (olderMatured, olderImmature) = openingMiningRewards.partition {
+      case (_, (_, inclusionHeight)) => inclusionHeight + rewardDelay <= header.height
+    }
+    val orderingBalance = openingBalance - fee + olderMatured.values.map(_._1.value).sum
+    val expectedMiningRewards = olderImmature ++ Map(
+      (rewardId, (reward, header.height)),
+      (emissionRewardId, (emissionRewards.head, header.height))
+    )
 
     nodeList.foreach { node =>
       val nodeOrdered = field[Vector[ErgoTransaction]](get(node, s"/blocks/$orderingId/transactions"), "transactions")
@@ -538,8 +559,12 @@ class MatrixLifecycleSpec extends AnyFlatSpec
         await(node.singleGet(s"/utxo/byId/$id", _.setHeader("api_key", "hello"))).getStatusCode shouldBe 404
       }
       get(node, s"/utxo/byId/$rewardId").as[ErgoBox].fold(throw _, identity) shouldBe reward
-      walletIds(node) should contain(rewardId)
-      walletBalance(node) shouldBe openingBalance - fee + reward.value + emissionAmount
+      miningRewards(node) shouldBe expectedMiningRewards
+      val paymentIds = walletIds(node)
+      paymentIds should not contain rewardId
+      paymentIds should not contain emissionRewardId
+      olderMatured.keys.foreach(id => paymentIds should contain(id))
+      walletBalance(node) shouldBe orderingBalance
     }
 
     // The fee reward is smaller than payment plus fee, so include a normal funding box.
@@ -548,6 +573,22 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     while (height(orderingMiner) < maturityHeight) {
       mine(orderingMiner, input = false)
       settled()
+    }
+    val (newlyMatured, stillImmature) = expectedMiningRewards.partition {
+      case (_, (_, inclusionHeight)) => inclusionHeight + rewardDelay <= maturityHeight
+    }
+    newlyMatured.keySet should contain(rewardId)
+    newlyMatured.keySet should contain(emissionRewardId)
+    val maturityBalance = orderingBalance + newlyMatured.values.map(_._1.value).sum
+    nodeList.foreach { node =>
+      height(node) shouldBe maturityHeight
+      val paymentIds = walletIds(node)
+      newlyMatured.keys.foreach(id => paymentIds should contain(id))
+      val mining = miningRewards(node)
+      newlyMatured.keys.foreach(id => mining.keySet should not contain id)
+      stillImmature.foreach { case (id, trackedReward) => mining(id) shouldBe trackedReward }
+      walletBalance(node) shouldBe maturityBalance
+      get(node, s"/utxo/byId/$rewardId").as[ErgoBox].fold(throw _, identity) shouldBe reward
     }
     val funding = spendable(payer).find(b => Base16.encode(b.id) != rewardId).get
     val spending = payment(payer, Seq(reward, funding), 2000000L)
