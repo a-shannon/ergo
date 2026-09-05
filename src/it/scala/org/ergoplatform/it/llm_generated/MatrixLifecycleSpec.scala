@@ -5,11 +5,12 @@ import io.circe.{Decoder, Json}
 import io.circe.parser.parse
 import io.circe.syntax._
 import org.asynchttpclient.Response
-import org.ergoplatform.ErgoBox
+import org.ergoplatform.{ErgoBox, ErgoTreePredef}
 import org.ergoplatform.http.api.ApiCodecs
 import org.ergoplatform.it.container.{Docker, IntegrationTestConstants, Node}
 import org.ergoplatform.mining.AutolykosSolutionJsonCodecs
 import org.ergoplatform.mining.llm_generated.MatrixTestMiner
+import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.nodeView.wallet.ErgoWalletServiceImpl
 import org.ergoplatform.sdk.SecretString
@@ -19,6 +20,7 @@ import org.scalatest.BeforeAndAfterAll
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import scorex.util.encode.Base16
+import sigma.data.ProveDlog
 import sigma.serialization.GroupElementSerializer
 
 import java.nio.file.{Files, Path, Paths}
@@ -153,12 +155,15 @@ class MatrixLifecycleSpec extends AnyFlatSpec
       .sortBy(b => (b.creationHeight, Base16.encode(b.id)))
   }
 
-  private def payment(node: Node, input: ErgoBox, amount: Long): ErgoTransaction = {
+  private def payment(node: Node, input: ErgoBox, amount: Long): ErgoTransaction =
+    payment(node, Seq(input), amount)
+
+  private def payment(node: Node, inputs: Seq[ErgoBox], amount: Long): ErgoTransaction = {
     val address = get(node, "/wallet/addresses").asArray.get.head.asString.get
     val request = Json.obj(
       "requests" -> Json.arr(Json.obj("address" -> address.asJson, "value" -> amount.asJson)),
       "fee" -> fee.asJson,
-      "inputsRaw" -> Json.arr(Base16.encode(ErgoBoxSerializer.toBytes(input)).asJson))
+      "inputsRaw" -> inputs.map(b => Base16.encode(ErgoBoxSerializer.toBytes(b))).asJson)
     post(node, "/wallet/transaction/generate", request).as[ErgoTransaction].fold(throw _, identity)
   }
 
@@ -464,6 +469,104 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     settled() shouldBe checkpoint
     val next = mine(nodeList.head, input = false)
     settled()._1 shouldBe next
+  }
+
+  it should "collect a legacy payment fee when ordering and spend the miner reward after maturity" in {
+    assume(pendingRestartComplete, "The preceding payment and restart scenarios must pass")
+    settled()
+    nodeList.foreach { node =>
+      inputTip(node) shouldBe empty
+      mempool(node) shouldBe empty
+    }
+    val payer = nodeList.head
+    val orderingMiner = nodeList(1)
+    val monetary = orderingMiner.settings.chainSettings.monetary
+    val rewardDelay = monetary.minerRewardDelay
+    rewardDelay shouldBe 1
+    val openingBalance = walletBalance(payer)
+    nodeList.foreach(n => walletBalance(n) shouldBe openingBalance)
+
+    val source = spendable(payer).head
+    val tx = payment(payer, source, 2000000L)
+    val feeBoxes = tx.outputs.filter(b => java.util.Arrays.equals(b.propositionBytes, monetary.feePropositionBytes))
+    feeBoxes.size shouldBe 1
+    feeBoxes.map(_.value).sum shouldBe fee
+    tx.outputs.map(_.value).sum shouldBe source.value
+    val feeIds = feeBoxes.map(b => Base16.encode(b.id)).toSet
+
+    submit(payer, tx)
+    nodeList.foreach(n => until("fee-paying transaction reaches mempool")(mempool(n))(_.contains(tx.id)))
+    val inputId = mine(payer, input = true, txs = Seq(tx))
+    assertAppliedInput(inputId, Seq(tx), nodeList)
+    nodeList.foreach { node =>
+      val ids = get(node, s"/blocks/$inputId/inputBlockTransactionIds").as[Vector[String]].fold(throw _, identity)
+      ids.count(_ == tx.id) shouldBe 1
+      walletBalance(node) shouldBe openingBalance - fee
+    }
+
+    val orderingId = mine(orderingMiner, input = false)
+    settled()
+    assertConfirmed(orderingId, Seq(tx))
+    val header = get(orderingMiner, s"/blocks/$orderingId/header").as[Header].fold(throw _, identity)
+    val expectedScript = ErgoTreePredef.rewardOutputScript(rewardDelay, ProveDlog(header.minerPk)).bytes
+    val ordered = field[Vector[ErgoTransaction]](get(orderingMiner, s"/blocks/$orderingId/transactions"), "transactions")
+    val collectors = ordered.filter(_.inputs.exists(i => feeIds.contains(Base16.encode(i.boxId))))
+    collectors.size shouldBe 1
+    val collector = collectors.head
+    collector.inputs.map(i => Base16.encode(i.boxId)).toSet shouldBe feeIds
+    collector.inputs.size shouldBe feeBoxes.size
+    collector.outputs.size shouldBe 1
+    val reward = collector.outputs.head
+    reward.value shouldBe fee
+    reward.creationHeight shouldBe header.height
+    reward.propositionBytes shouldBe expectedScript
+    reward.additionalTokens shouldBe empty
+    val rewardId = Base16.encode(reward.id)
+
+    val emission = ordered.filterNot(t => t.id == tx.id || t.id == collector.id)
+    emission.size shouldBe 1
+    val emissionAmount = orderingMiner.settings.chainSettings.emissionRules.minersRewardAtHeight(header.height)
+    val emissionRewards = emission.head.outputs.filter(b => java.util.Arrays.equals(b.propositionBytes, expectedScript))
+    emissionRewards.size shouldBe 1
+    emissionRewards.head.value shouldBe emissionAmount
+
+    nodeList.foreach { node =>
+      val nodeOrdered = field[Vector[ErgoTransaction]](get(node, s"/blocks/$orderingId/transactions"), "transactions")
+      nodeOrdered.map(_.id) shouldBe ordered.map(_.id)
+      nodeOrdered.count(_.id == collector.id) shouldBe 1
+      feeIds.foreach { id =>
+        await(node.singleGet(s"/utxo/byId/$id", _.setHeader("api_key", "hello"))).getStatusCode shouldBe 404
+      }
+      get(node, s"/utxo/byId/$rewardId").as[ErgoBox].fold(throw _, identity) shouldBe reward
+      walletIds(node) should contain(rewardId)
+      walletBalance(node) shouldBe openingBalance - fee + reward.value + emissionAmount
+    }
+
+    // The fee reward is smaller than payment plus fee, so include a normal funding box.
+    val maturityHeight = reward.creationHeight + rewardDelay
+    height(orderingMiner) should be < maturityHeight
+    while (height(orderingMiner) < maturityHeight) {
+      mine(orderingMiner, input = false)
+      settled()
+    }
+    val funding = spendable(payer).find(b => Base16.encode(b.id) != rewardId).get
+    val spending = payment(payer, Seq(reward, funding), 2000000L)
+    spending.inputs.map(i => Base16.encode(i.boxId)).toSet shouldBe Set(rewardId, Base16.encode(funding.id))
+    spending.inputs.size shouldBe 2
+    spending.outputs.map(_.value).sum shouldBe reward.value + funding.value
+    val beforeSpending = walletBalance(payer)
+    submit(payer, spending)
+    val spendingInput = mine(payer, input = true, txs = Seq(spending))
+    assertAppliedInput(spendingInput, Seq(spending), nodeList)
+    nodeList.foreach(n => walletBalance(n) shouldBe beforeSpending - fee)
+    val spendingOrdering = mine(orderingMiner, input = false)
+    settled()
+    assertConfirmed(spendingOrdering, Seq(spending))
+    nodeList.foreach { node =>
+      await(node.singleGet(s"/utxo/byId/$rewardId", _.setHeader("api_key", "hello"))).getStatusCode shouldBe 404
+      walletIds(node) should not contain rewardId
+      mempool(node) should not contain spending.id
+    }
   }
 
   override protected def afterAll(): Unit = {
