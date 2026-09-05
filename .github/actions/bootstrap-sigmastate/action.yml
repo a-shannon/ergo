@@ -69,7 +69,7 @@ runs:
 
         (
           cd "${sigma_dir}"
-          sbt -batch \
+          sbt -batch -J-Xms512m -J-Xmx4g \
             "++${SIGMASTATE_SCALA_VERSION}!" \
             "set ThisBuild / version := \"${SIGMASTATE_VERSION}\"" \
             "show ThisBuild / version" \
