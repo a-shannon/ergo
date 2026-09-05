@@ -188,7 +188,11 @@ class CandidateGenerator(
     case gen @ GenerateCandidate(txsToInclude, reply, forced, optPk) =>
       val senderOpt = if (reply) Some(sender()) else None
       val effectiveMinerPk = optPk.getOrElse(minerPk)
-      if (!forced && cachedFor(state.cachedCandidate, txsToInclude, effectiveMinerPk)) {
+      val selectedInputBlockId = state.hr.bestBlocks._2.map(_.id)
+      lazy val selectedInputTransactionsDigest = Algos.merkleTreeRoot(
+        state.hr.getBestOrderingCollectedInputBlocksTransactions().map(tx => LeafData @@ tx.serializedId))
+      if (!forced && cachedFor(state.cachedCandidate, txsToInclude, effectiveMinerPk,
+        selectedInputBlockId, selectedInputTransactionsDigest)) {
         senderOpt.foreach(_ ! StatusReply.success(state.cachedCandidate.get))
       } else {
         val start = System.currentTimeMillis()
@@ -356,7 +360,9 @@ object CandidateGenerator extends ScorexLogging {
     )
 
   /**
-   * Checks that current candidate block is cached with given `txs` and `minerPk`.
+   * Checks the request, miner key, selected input tip and processed transaction prefix.
+   * A peer can advance these without this miner solving a local input block, and a body
+   * can extend the processed prefix after its announcement already updated the tip.
    *
    * Note: candidate cache is a single slot keyed by `minerPk`. If multiple miner public keys
    * are used concurrently (e.g. node’s own miner and external `/mining/candidateWithTxsAndPk`
@@ -367,10 +373,15 @@ object CandidateGenerator extends ScorexLogging {
   def cachedFor(
     candidateOpt: Option[Candidate],
     txs: Seq[ErgoTransaction],
-    minerPk: ProveDlog
+    minerPk: ProveDlog,
+    selectedInputBlockId: Option[ModifierId] = None,
+    selectedInputTransactionsDigest: Digest32 = Algos.emptyMerkleTreeRoot
   ): Boolean = {
     candidateOpt.isDefined && candidateOpt.exists { c =>
       c.externalVersion.pk == minerPk &&
+        c.candidateBlock.inputBlockFields.prevInputBlockId.map(bytesToId) == selectedInputBlockId &&
+        (selectedInputBlockId.isEmpty || java.util.Arrays.equals(
+          c.candidateBlock.inputBlockFields.prevTransactionsDigest, selectedInputTransactionsDigest)) &&
         (txs.isEmpty || (txs.size == c.txsToInclude.size && txs.forall(
           c.txsToInclude.contains
         )))
