@@ -1021,6 +1021,8 @@ object CandidateGenerator extends ScorexLogging {
 
     val currentHeight = us.stateContext.currentHeight
     val nextHeight = upcomingContext.currentHeight
+    // Use the candidate header version, including the first block of an activation epoch.
+    val inputBlocksEnabled = upcomingContext.sigmaPreHeader.version >= Header.Interpreter60Version
 
     log.info(
       s"Assembling a block candidate for block #$nextHeight from ${transactions.length} transactions available"
@@ -1147,11 +1149,11 @@ object CandidateGenerator extends ScorexLogging {
             }
 
             // Check validity and calculate transaction cost
-            validateTx(softFieldsAllowed = false) match {
+            validateTx(softFieldsAllowed = !inputBlocksEnabled) match {
               case Success(costConsumed) =>
                 val newTxs = acc :+ (tx -> costConsumed)
-                collectFeeAndCheckLimits(newTxs, inputTx = true, costConsumed)
-              case Failure(e) if e.isInstanceOf[SoftFieldsAccessError] =>
+                collectFeeAndCheckLimits(newTxs, inputTx = inputBlocksEnabled, costConsumed)
+              case Failure(e) if inputBlocksEnabled && e.isInstanceOf[SoftFieldsAccessError] =>
                 log.info(s"Rechecking transaction: $tx.id")
                 validateTx(softFieldsAllowed = true) match {
                   case Success(costConsumed) =>
