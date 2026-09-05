@@ -1,0 +1,154 @@
+name: Matrix combined validation
+
+on:
+  push:
+    branches:
+      - fix/matrix-ci-combined-20260905
+
+permissions:
+  contents: read
+
+concurrency:
+  group: matrix-combined-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    if: github.event.repository.fork
+    name: Node tests (Scala 2.12.20, Java 8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-matrix-sbt-2.12.20-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
+      - name: Build pinned SigmaState dependency
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
+      - uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+      - name: Run node tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p validation-logs
+          sbt -Denv=test clean ++2.12.20 test 2>&1 | tee validation-logs/node.log
+      - name: Upload node results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-node-results
+          path: |
+            validation-logs/
+            target/test-reports/
+          if-no-files-found: warn
+
+  modules:
+    if: github.event.repository.fork
+    name: ${{ matrix.module }} (Scala ${{ matrix.scala }}, Java 8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [ergoWallet, ergoCore]
+        scala: [2.13.16, 2.12.20, 2.11.12]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-matrix-sbt-${{ matrix.scala }}-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
+      - name: Build pinned SigmaState dependency
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: ${{ matrix.scala }}
+      - uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+      - name: Run module tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p validation-logs
+          sbt ++${{ matrix.scala }} ${{ matrix.module }}/test 2>&1 | tee validation-logs/module.log
+      - name: Upload module results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-${{ matrix.module }}-${{ matrix.scala }}-results
+          path: |
+            validation-logs/
+            ergo-core/target/test-reports/
+            ergo-wallet/target/test-reports/
+          if-no-files-found: warn
+
+  lifecycle:
+    if: github.event.repository.fork
+    name: Three-node Matrix lifecycle (Scala 2.12.20, Java 8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ERGO_MATRIX_TEST_IMAGE: ergo-matrix-test:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-matrix-sbt-2.12.20-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
+      - name: Build pinned SigmaState dependency
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
+      - uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+      - name: Assemble node and build test image
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/matrix-image validation-logs
+          sbt -Denv=test ++2.12.20 'set assembly / assemblyOutputPath := file("target/matrix-image/ergo.jar")' assembly 2>&1 | tee validation-logs/assembly.log
+          cp src/it/resources/{devnet,testnet,mainnet}Template.conf target/matrix-image/
+          cat > target/matrix-image/Dockerfile <<'DOCKERFILE'
+          FROM eclipse-temurin:11-jre-jammy@sha256:40f4f041471e1288071281c7723b4706f1bb8f60a04acbf34b6bb84ac064de50
+          LABEL ergo-integration-tests="ergo-integration-tests"
+          COPY ergo.jar /opt/ergo/ergo.jar
+          COPY devnetTemplate.conf testnetTemplate.conf mainnetTemplate.conf /opt/ergo/
+          DOCKERFILE
+          docker build --tag "$ERGO_MATRIX_TEST_IMAGE" target/matrix-image 2>&1 | tee validation-logs/image.log
+      - name: Run normal Matrix lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/matrix-data" validation-logs
+          TMPDIR="$RUNNER_TEMP/matrix-data" sbt -Denv=test ++2.12.20 'it:testOnly org.ergoplatform.it.MatrixLifecycleSpec' 2>&1 | tee validation-logs/lifecycle.log
+      - name: Upload lifecycle results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-lifecycle-results
+          path: |
+            validation-logs/
+            target/logs/
+            target/test-reports/
+          if-no-files-found: warn
