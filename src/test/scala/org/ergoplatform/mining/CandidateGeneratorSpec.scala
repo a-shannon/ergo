@@ -1121,7 +1121,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
 
     // generate block to use reward as our tx input
     candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false, optPk = None), testProbe.ref)
-    testProbe.expectMsgPF(candidateGenDelay) {
+    val bootstrapBlock = testProbe.expectMsgPF(candidateGenDelay) {
       case StatusReply.Success(candidate: Candidate) =>
         val result = powScheme
           .proveCandidate(candidate.candidateBlock, defaultMinerSecret.w, 0, 1000, candidate.parameters)
@@ -1134,12 +1134,17 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
         candidateGenerator.tell(OrderingSolutionFound(block.header.powSolution), testProbe.ref)
 
         expectOrderingBlockApplied(testProbe, blockProbe, block)
+        block
     }
 
-    // Get candidate and solve it
-    candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), testProbe.ref)
-    val candidateToSolve = testProbe.expectMsgPF(candidateGenDelay) {
-      case StatusReply.Success(c: Candidate) => c
+    // The block probe can observe application before the generator updates its cache.
+    val candidateToSolve = eventually(timeout(candidateGenDelay), interval(100.millis)) {
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), testProbe.ref)
+      val candidate = testProbe.expectMsgPF(candidateGenDelay) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      candidate.candidateBlock.parentOpt.map(_.id) shouldBe Some(bootstrapBlock.id)
+      candidate
     }
 
     val solvedBlock = powScheme
