@@ -137,7 +137,8 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     }
   }
 
-  private def settled(): (String, String) = {
+  private def settled(expectedPeerCounts: Vector[Int] = Vector(2, 2, 2)): (String, String) = {
+    expectedPeerCounts.size shouldBe nodeList.size
     val result = until("three nodes agree on a present best block and state root") {
       nodeList.map { node =>
         val info = get(node, "/info")
@@ -151,9 +152,11 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     }(_.forall(_ == expectedHeight))
     // Input-block broadcast selects direct peers whose advertised height is
     // within two blocks. Rapid devnet mining can outrun the sync status timer.
-    until("each node knows both peers at the current ordering checkpoint") {
+    until("each node knows its expected peers at the current ordering checkpoint") {
       nodeList.map(n => get(n, "/peers/syncInfo").asArray.get.map(field[Int](_, "height")))
-    }(_.forall(hs => hs.size >= 2 && hs.forall(h => math.abs(h - expectedHeight) <= 2)))
+    }(_.zip(expectedPeerCounts).forall { case (hs, count) =>
+      hs.size >= count && hs.forall(h => math.abs(h - expectedHeight) <= 2)
+    })
     result.head
   }
 
@@ -218,15 +221,17 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     }
   }
 
-  private def restartReceiver(offline: Boolean = false): Node = {
-    runtime.stopAndRemoveNode(nodeList(2), secondsToWait = 30)
+  private def restartReceiver(offline: Boolean = false): Node = restartNode(2, offline)
+
+  private def restartNode(index: Int, offline: Boolean): Node = {
+    runtime.stopAndRemoveNode(nodeList(index), secondsToWait = 30)
     val extra: Docker.ExtraConfig = if (offline) (_, _) => Some(ConfigFactory.parseString("""
       scorex.network.maxConnections = 0
       scorex.network.knownPeers = []
     """)) else Docker.noExtraConfig
-    val restarted = runtime.startDevNetNode(configs(2), extraConfig = extra,
-      specialVolumeOpt = Some(dataPaths(2) -> "/app")).get
-    nodeList = nodeList.updated(2, restarted)
+    val restarted = runtime.startDevNetNode(configs(index), extraConfig = extra,
+      specialVolumeOpt = Some(dataPaths(index) -> "/app")).get
+    nodeList = nodeList.updated(index, restarted)
     await(restarted.waitForStartup)
     restarted
   }
@@ -692,6 +697,80 @@ class MatrixLifecycleSpec extends AnyFlatSpec
       height(node) shouldBe confirmedHeight
     }
     settled() shouldBe checkpoint
+  }
+
+  it should "propagate a frozen input chain through a preconnected nonproducing relay" in {
+    settled()
+    if (nodeList.exists(n => inputTip(n).nonEmpty)) mine(nodeList.head, input = false)
+    val checkpoint = settled()
+    val confirmedHeight = height(nodeList.head)
+    val openingBoxes = walletIds(nodeList.head)
+    val openingBalance = walletBalance(nodeList.head)
+    nodeList.foreach { node =>
+      inputTip(node) shouldBe empty
+      mempool(node) shouldBe empty
+      walletIds(node) shouldBe openingBoxes
+      walletBalance(node) shouldBe openingBalance
+    }
+    val producer = restartNode(0, offline = true)
+    val receiver = restartNode(2, offline = true)
+    val relay = nodeList(1)
+    Seq(producer, receiver).foreach(n => get(n, "/peers/connected").asArray.get shouldBe empty)
+    connectPeer(producer, relay)
+    connectPeer(receiver, relay)
+    val peerCounts = Vector(1, 2, 1)
+    val expectedNames = Vector(Vector(relay.nodeName), Vector(producer.nodeName, receiver.nodeName).sorted, Vector(relay.nodeName))
+    def assertLineTopology(): Unit = {
+      until("only producer-relay and relay-receiver connections exist") {
+        nodeList.map(n => get(n, "/peers/connected").asArray.get.map(field[String](_, "name")).sorted)
+      }(_ == expectedNames)
+      until("both directions of each relay link know the ordering height") {
+        nodeList.map(n => get(n, "/peers/syncInfo").asArray.get.map(field[Int](_, "height")))
+      }(_.zip(peerCounts).forall { case (heights, count) => heights.size == count && heights.forall(_ == confirmedHeight) })
+    }
+    // Establish topology and bidirectional sync knowledge before any input block exists.
+    assertLineTopology()
+    settled(peerCounts) shouldBe checkpoint
+    nodeList.foreach { node =>
+      inputTip(node) shouldBe empty
+      mempool(node) shouldBe empty
+      walletIds(node) shouldBe openingBoxes
+      walletBalance(node) shouldBe openingBalance
+    }
+    val tx = payment(producer, spendable(producer).head, 2000000L)
+    submit(producer, tx)
+    nodeList.take(2).foreach(n => until("relay receives ordinary payment")(mempool(n))(_.contains(tx.id)))
+    val first = mine(producer, input = true, txs = Seq(tx))
+    assertAppliedInput(first, Seq(tx), nodeList.take(2))
+    val frozenTip = mine(producer, input = true)
+    frozenTip should not be first
+    val chainIds = Vector(frozenTip, first)
+    val expectedBodies = Map(first -> Vector(tx), frozenTip -> Vector.empty[ErgoTransaction])
+    until("producer finishes processing the frozen chain") {
+      field[Vector[String]](get(producer, "/blocks/bestInputChain"), "bestInputBlocks")
+    }(_ == chainIds)
+    val frozenChain = get(producer, "/blocks/bestInputChain")
+    field[String](frozenChain, "bestOrdering") shouldBe checkpoint._1
+    val expectedBoxes = walletIds(producer)
+    // No further production or connections: the relay must replay remotely received processed work.
+    nodeList.foreach { node =>
+      until("frozen tip propagates through the preconnected relay")(inputTip(node))(_ == frozenTip)
+      until("frozen ancestry is fully processed through the relay")(get(node, "/blocks/bestInputChain"))(_ == frozenChain)
+      expectedBodies.foreach { case (id, transactions) =>
+        until(s"relay chain $id has exact transaction IDs") {
+          get(node, s"/blocks/$id/inputBlockTransactionIds").as[Option[Vector[String]]].fold(throw _, identity)
+        }(_.contains(transactions.map(_.id)))
+        until(s"relay chain $id has exact transaction bodies") {
+          get(node, s"/blocks/$id/inputBlockTransactions").as[Option[Vector[ErgoTransaction]]].fold(throw _, identity)
+        }(_.contains(transactions))
+      }
+      until("relay chain wallet converges")(walletIds(node))(_ == expectedBoxes)
+      walletBalance(node) shouldBe openingBalance - fee
+      until("relay chain mempool converges")(mempool(node))(_.isEmpty)
+      height(node) shouldBe confirmedHeight
+    }
+    assertLineTopology()
+    settled(peerCounts) shouldBe checkpoint
   }
 
   override protected def afterAll(): Unit = {
