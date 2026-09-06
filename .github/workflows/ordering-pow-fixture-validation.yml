@@ -1,20 +1,20 @@
-name: Ordering PoW fixture validation
+name: Input PoW assertion validation
 
 on:
   push:
     branches:
-      - fix/matrix-ordering-pow-validation
+      - fix/matrix-input-pow-assertions-validation
 
 permissions:
   contents: read
 
 concurrency:
-  group: ordering-pow-fixture-validation-${{ github.ref }}
+  group: input-pow-assertions-validation-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   core:
-    if: github.event.repository.fork && github.ref == 'refs/heads/fix/matrix-ordering-pow-validation'
+    if: github.event.repository.fork && github.ref == 'refs/heads/fix/matrix-input-pow-assertions-validation'
     name: Core tests (Scala ${{ matrix.scala }}, Java 8)
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -50,7 +50,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ordering-pow-fixture-${{ matrix.scala }}-results
+          name: input-pow-assertions-${{ matrix.scala }}-results
           path: |
             validation-logs/
             ergo-core/target/test-reports/
