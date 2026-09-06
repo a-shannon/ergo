@@ -1,0 +1,57 @@
+name: Ordering PoW fixture validation
+
+on:
+  push:
+    branches:
+      - fix/matrix-ordering-pow-validation
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ordering-pow-fixture-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    if: github.event.repository.fork && github.ref == 'refs/heads/fix/matrix-ordering-pow-validation'
+    name: Core tests (Scala ${{ matrix.scala }}, Java 8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        scala: ['2.11.12', '2.12.20', '2.13.16']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-matrix-sbt-${{ matrix.scala }}-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
+      - name: Build pinned SigmaState dependency
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: ${{ matrix.scala }}
+      - uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+      - name: Run core tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p validation-logs
+          sbt ++${{ matrix.scala }} ergoCore/test 2>&1 | tee validation-logs/core.log
+      - name: Upload validation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ordering-pow-fixture-${{ matrix.scala }}-results
+          path: |
+            validation-logs/
+            ergo-core/target/test-reports/
+          if-no-files-found: warn
