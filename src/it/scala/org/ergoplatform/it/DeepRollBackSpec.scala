@@ -7,9 +7,10 @@ import io.circe.Json
 import org.ergoplatform.it.api.NodeApi.{NodeInfo, nodeInfoDecoder}
 import org.ergoplatform.it.container.{IntegrationSuite, Node}
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils
+import org.ergoplatform.it.util.ConvergenceObservations
 import org.scalatest.freespec.AnyFreeSpec
 import scala.async.Async
-import scala.concurrent.{Await, Future, blocking}
+import scala.concurrent.{Await, Future}
 import scala.concurrent.duration._
 
 class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
@@ -53,35 +54,62 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
     }
   }
 
-  private case class NodeSnapshot(info: NodeInfo, summary: String)
+  private val observations = new ConvergenceObservations
+  private case class NodeSnapshot(info: Option[NodeInfo])
+  private val probes = scala.collection.mutable.Map.empty[
+    Node, (observations.Probe[NodeInfo], observations.Probe[Int])]
 
   @volatile private var lastObservation = "No node pair observed"
+  private var recentObservations = Vector.empty[String]
 
-  private def snapshot(node: Node): Future[NodeSnapshot] = {
-    node.status.zip(node.connectedPeers).map { case (status, peers) =>
-      val json = node.ergoJsonAnswerAs[Json](status.status)
-      val fields = Seq(
-        "headersHeight", "bestHeaderId", "fullHeight", "bestFullHeaderId",
-        "headersScore", "fullBlocksScore", "isMining"
-      ).map(name => name -> json.hcursor.downField(name).focus.getOrElse(Json.Null))
-      val summary = Json.obj((fields :+ ("connectedPeerCount" -> Json.fromInt(peers.size))): _*)
-      NodeSnapshot(node.ergoJsonAnswerAs[NodeInfo](status.status), summary.noSpaces)
+  private def remember(phase: String, label: String, endpoint: String, summary: String): Unit = synchronized {
+    val observation = s"$phase $label $endpoint sampledAt=${System.currentTimeMillis()} $summary"
+    recentObservations = (recentObservations :+ observation).takeRight(12)
+    lastObservation = recentObservations.mkString("; ")
+    log.info(observation)
+  }
+
+  private def snapshot(phase: String, label: String, node: Node, budget: FiniteDuration): Future[NodeSnapshot] = {
+    val (statusProbe, peerProbe) = probes.getOrElseUpdate(node, (
+      observations.probe(node.singleGet("/info", _.setRequestTimeout(5000))
+        .map { r =>
+          require(r.getStatusCode == 200, "Unexpected observation status")
+          node.ergoJsonAnswerAs[NodeInfo](r.getResponseBody)
+        }),
+      observations.probe(node.singleGet("/peers/connected", _.setRequestTimeout(5000)).map { r =>
+        require(r.getStatusCode == 200, "Unexpected observation status")
+        node.ergoJsonAnswerAs[Json](r.getResponseBody).asArray.getOrElse(
+          throw new IllegalArgumentException("Expected peer array")).size
+      })
+    ))
+    val status = statusProbe.sample(budget).map {
+      case Right(info) =>
+        val summary = Json.obj(
+          "headersHeight" -> info.bestHeaderHeightOpt.map(Json.fromInt).getOrElse(Json.Null),
+          "fullHeight" -> info.bestBlockHeightOpt.map(Json.fromInt).getOrElse(Json.Null),
+          "bestHeaderId" -> info.bestHeaderIdOpt.map(ConvergenceObservations.headerId).map(Json.fromString).getOrElse(Json.Null),
+          "bestFullHeaderId" -> info.bestBlockIdOpt.map(ConvergenceObservations.headerId).map(Json.fromString).getOrElse(Json.Null)
+        )
+        remember(phase, label, "status", summary.noSpaces)
+        Some(info)
+      case Left(error) =>
+        remember(phase, label, "status", s"errorClass=$error")
+        None
     }
+    val peers = peerProbe.sample(budget).map { result =>
+      val summary = result.fold(error => s"errorClass=$error", count => s"connectedPeerCount=$count")
+      remember(phase, label, "peers", summary)
+    }
+    status.zip(peers).map { case (info, _) => NodeSnapshot(info) }
   }
 
   private def observeNodes(
     phase: String,
     nodeA: Node,
-    nodeB: Node
+    nodeB: Node,
+    budget: FiniteDuration = 5.seconds
   ): Future[(NodeSnapshot, NodeSnapshot)] = {
-    snapshot(nodeA).zip(snapshot(nodeB)).map { case pair @ (a, b) =>
-      val observation = s"$phase A=${a.summary} B=${b.summary}"
-      if (observation != lastObservation) {
-        lastObservation = observation
-        log.info(observation)
-      }
-      pair
-    }
+    snapshot(phase, "A", nodeA, budget).zip(snapshot(phase, "B", nodeB, budget))
   }
 
   private def waitForSameBestBlock(
@@ -90,37 +118,14 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
     minHeight: Int,
     timeout: FiniteDuration
   ): Future[(NodeInfo, NodeInfo)] = {
-    def sameBestBlock(infoA: NodeInfo, infoB: NodeInfo): Boolean = {
-      val sameHeight =
-        infoA.bestBlockHeightOpt.nonEmpty &&
-          infoA.bestBlockHeightOpt == infoB.bestBlockHeightOpt
-      val sameBlock =
-        infoA.bestBlockIdOpt.nonEmpty && infoA.bestBlockIdOpt == infoB.bestBlockIdOpt
-      val highEnough = infoA.bestBlockHeightOpt.exists(_ >= minHeight)
-      sameHeight && sameBlock && highEnough
-    }
-
-    def retryAfterDelay(deadline: Deadline): Future[(NodeInfo, NodeInfo)] =
-      Future {
-        blocking(Thread.sleep(1000))
-      }.flatMap(_ => loop(deadline))
-
-    def loop(deadline: Deadline): Future[(NodeInfo, NodeInfo)] =
-      observeNodes("convergence", nodeA, nodeB).flatMap { case (a, b) =>
-        val (infoA, infoB) = (a.info, b.info)
-        if (sameBestBlock(infoA, infoB)) {
-          Future.successful((infoA, infoB))
-        } else if (deadline.isOverdue()) {
-          Future.failed(new TimeoutException(
-            s"Nodes did not converge to the same best full block at height >= $minHeight; " +
-              s"last observation: $lastObservation"
-          ))
-        } else {
-          retryAfterDelay(deadline)
-        }
-      }
-
-    loop(timeout.fromNow)
+    observations.until(timeout.fromNow, 1.second, 5.seconds)(
+      budget => observeNodes("convergence", nodeA, nodeB, budget)
+    ) { case (a, b) =>
+      a.info.exists(infoA => b.info.exists(infoB => ConvergenceObservations.sameBestBlock(infoA, infoB, minHeight)))
+    }(
+      s"Nodes did not converge to the same best full block at height >= $minHeight; " +
+        s"recent observations: $lastObservation"
+    ).map { case (a, b) => (a.info.get, b.info.get) }
   }
 
   "Deep rollback handling" in {
@@ -214,6 +219,8 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
       case error: TimeoutException =>
         log.error(s"Deep rollback timed out; last observation: $lastObservation")
         throw error
+    } finally {
+      observations.close()
     }
   }
 
