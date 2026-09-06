@@ -17,7 +17,7 @@ import org.ergoplatform.sdk.SecretString
 import org.ergoplatform.settings.{ErgoValidationSettingsUpdate, NetworkType, Parameters}
 import org.ergoplatform.wallet.Constants.MiningScanId
 import org.ergoplatform.wallet.boxes.ErgoBoxSerializer
-import org.scalatest.BeforeAndAfterAll
+import org.scalatest.{BeforeAndAfterAll, CancelAfterFailure}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import scorex.util.encode.Base16
@@ -30,7 +30,7 @@ import scala.concurrent.duration._
 
 /** Normal, valid Matrix traffic on a private devnet with a shared custom genesis. */
 class MatrixLifecycleSpec extends AnyFlatSpec
-  with Matchers with BeforeAndAfterAll with IntegrationTestConstants with ApiCodecs {
+  with Matchers with BeforeAndAfterAll with CancelAfterFailure with IntegrationTestConstants with ApiCodecs {
 
   private implicit val ec: ExecutionContext = ExecutionContext.global
   private val fee = 1000000L
