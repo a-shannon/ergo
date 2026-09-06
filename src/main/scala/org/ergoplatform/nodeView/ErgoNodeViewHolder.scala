@@ -634,8 +634,9 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
       .fold[Try[ErgoStateContext]](Failure(new Exception("Could not find extension to recover from"))
       )(ext => ErgoStateContext.recover(settings.chainSettings.genesisStateDigest, ext, lastHeaders)(settings.chainSettings))
       .flatMap { ctx =>
-        val recoverVersion = idToVersion(lastHeaders.last.id)
-        val recoverRoot = bestFullBlock.header.stateRoot
+        val recoveredHeader = lastHeaders.last
+        val recoverVersion = idToVersion(recoveredHeader.id)
+        val recoverRoot = recoveredHeader.stateRoot
         DigestState.recover(recoverVersion, recoverRoot, ctx, stateDir(settings), settings)
       }
 
