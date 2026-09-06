@@ -1243,8 +1243,10 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     * re-request modifier from a different random peer, if our node does not know a peer who have it
     */
   protected def checkDelivery(hr: ErgoHistory): Receive = {
-    case CheckDelivery(peer, modifierTypeId, modifierId) =>
-      if (deliveryTracker.status(modifierId, modifierTypeId, Seq.empty) == ModifiersStatus.Requested) {
+    case CheckDelivery(peer, modifierTypeId, modifierId, requestId) =>
+      // Cancellation cannot retract an expiration already queued for an earlier request.
+      if (deliveryTracker.status(modifierId, modifierTypeId, Seq.empty) == ModifiersStatus.Requested &&
+        deliveryTracker.getRequestedInfo(modifierTypeId, modifierId).exists(_.requestId == requestId)) {
         // If transaction not delivered on time, we just forget about it.
         // It could be removed from other peer's mempool, so no reason to penalize the peer.
         if (modifierTypeId == ErgoTransaction.modifierTypeId) {
