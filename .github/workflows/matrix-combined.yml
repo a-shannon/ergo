@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fix/matrix-ci-combined-20260905
+      - fix/matrix-idle-reconnect
 
 permissions:
   contents: read
@@ -53,7 +54,7 @@ jobs:
           if-no-files-found: warn
 
   modules:
-    if: github.event.repository.fork
+    if: github.event.repository.fork && github.ref == 'refs/heads/fix/matrix-ci-combined-20260905'
     name: ${{ matrix.module }} (Scala ${{ matrix.scala }}, Java 8)
     runs-on: ubuntu-latest
     timeout-minutes: 90

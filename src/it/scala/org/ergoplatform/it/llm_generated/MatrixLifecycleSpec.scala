@@ -610,6 +610,90 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     }
   }
 
+  it should "recover an existing input chain on idle reconnection without further production" in {
+    val checkpoint = settled()
+    val producer = nodeList.head
+    val confirmedHeight = height(producer)
+    val openingBoxes = walletIds(producer)
+    val openingBalance = walletBalance(producer)
+    nodeList.foreach { node =>
+      inputTip(node) shouldBe empty
+      mempool(node) shouldBe empty
+      walletIds(node) shouldBe openingBoxes
+      walletBalance(node) shouldBe openingBalance
+    }
+
+    // An orderly offline restart clears old TCP sessions before any input announcement exists.
+    val receiver = restartReceiver(offline = true)
+    until("idle receiver restores its ordering checkpoint") {
+      val info = get(receiver, "/info")
+      (field[Option[String]](info, "bestFullHeaderId").getOrElse(""),
+        field[Option[String]](info, "stateRoot").getOrElse(""))
+    }(_ == checkpoint)
+    until("idle receiver restores its wallet checkpoint") {
+      field[Int](get(receiver, "/wallet/status"), "walletHeight")
+    }(_ == confirmedHeight)
+    get(receiver, "/peers/connected").asArray.get shouldBe empty
+    inputTip(receiver) shouldBe empty
+    walletIds(receiver) shouldBe openingBoxes
+    walletBalance(receiver) shouldBe openingBalance
+
+    val tx = payment(producer, spendable(producer).head, 2000000L)
+    submit(producer, tx)
+    val connected = nodeList.take(2)
+    connected.foreach(n => until("idle test payment propagated")(mempool(n))(_.contains(tx.id)))
+    val first = mine(producer, input = true, txs = Seq(tx))
+    assertAppliedInput(first, Seq(tx), connected)
+    val frozenTip = mine(producer, input = true)
+    frozenTip should not be first
+    connected.foreach(n => until("frozen input tip applied before reconnection")(inputTip(n))(_ == frozenTip))
+    connected.foreach { node =>
+      until("both input blocks processed before reconnection") {
+        field[Vector[String]](get(node, "/blocks/bestInputChain"), "bestInputBlocks")
+      }(_ == Vector(frozenTip, first))
+    }
+    val frozenChain = get(producer, "/blocks/bestInputChain")
+    field[String](frozenChain, "bestOrdering") shouldBe checkpoint._1
+    val chainIds = field[Vector[String]](frozenChain, "bestInputBlocks")
+    chainIds.size shouldBe 2
+    chainIds.toSet shouldBe Set(first, frozenTip)
+    val expectedBodies = Map(first -> Vector(tx), frozenTip -> Vector.empty[ErgoTransaction])
+    val expectedBoxes = walletIds(producer)
+    walletBalance(producer) shouldBe openingBalance - fee
+    get(receiver, "/peers/connected").asArray.get shouldBe empty
+    inputTip(receiver) shouldBe empty
+    mempool(receiver) shouldBe empty
+    walletIds(receiver) shouldBe openingBoxes
+    walletBalance(receiver) shouldBe openingBalance
+    nodeList.foreach(n => height(n) shouldBe confirmedHeight)
+
+    // Only establish ordinary peer connections; do not mine, submit or announce further work.
+    connected.foreach(connectPeer(receiver, _))
+    until("idle receiver connects to both peers")(get(receiver, "/peers/connected").asArray.get.size)(_ == 2)
+    until("idle receiver learns both peers' ordering heights") {
+      get(receiver, "/peers/syncInfo").asArray.get.map(field[Int](_, "height"))
+    }(heights => heights.size == 2 && heights.forall(_ == confirmedHeight))
+    nodeList.foreach { node =>
+      until("existing input tip discovered without new production")(inputTip(node))(_ == frozenTip)
+      until("existing input chain processed after idle reconnection") {
+        get(node, "/blocks/bestInputChain")
+      }(_ == frozenChain)
+      expectedBodies.foreach { case (id, transactions) =>
+        until(s"$id transaction IDs recovered on idle reconnection") {
+          get(node, s"/blocks/$id/inputBlockTransactionIds").as[Option[Vector[String]]].fold(throw _, identity)
+        }(_.contains(transactions.map(_.id)))
+        until(s"$id transaction bodies recovered on idle reconnection") {
+          get(node, s"/blocks/$id/inputBlockTransactions").as[Option[Vector[ErgoTransaction]]].fold(throw _, identity)
+        }(_.contains(transactions))
+      }
+      until("idle receiver wallet converges")(walletIds(node))(_ == expectedBoxes)
+      walletBalance(node) shouldBe openingBalance - fee
+      until("idle receiver mempool converges")(mempool(node))(_.isEmpty)
+      height(node) shouldBe confirmedHeight
+    }
+    settled() shouldBe checkpoint
+  }
+
   override protected def afterAll(): Unit = {
     try {
       if (runtime != null) runtime.close()
