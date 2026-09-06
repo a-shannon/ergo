@@ -1,8 +1,9 @@
 package org.ergoplatform.mining
 
 import com.google.common.primitives.Ints
-import org.ergoplatform.{InputSolutionFound, OrderingSolutionFound}
+import org.ergoplatform.{AutolykosSolution, InputSolutionFound, NoSolutionFound, OrderingSolutionFound, SolutionFound}
 import org.ergoplatform.mining.difficulty.DifficultySerializer
+import org.ergoplatform.mining.llm_generated.OrderingPowFixture
 import org.ergoplatform.modifiers.history.extension.Extension
 import org.ergoplatform.settings.{ErgoValidationSettingsUpdate, Parameters}
 import org.ergoplatform.subblocks.InputBlockAnnouncement
@@ -36,11 +37,15 @@ class AutolykosInputBlockPowSpec extends ErgoCorePropertyTest {
       val hbs = Ints.toByteArray(h.height)
       val N = powScheme.calcN(h)
 
-      powScheme.checkNonces(2, hbs, msg, sk, x, b, N, 0, 10000, defaultParams) match {
-        case InputSolutionFound(as) =>
-          val inputBlockHeader = h.copy(powSolution = as)
-          powScheme.checkInputBlockPoW(inputBlockHeader, defaultParams) shouldBe true
-        case _ => // No solution found in nonce range, test passes by default
+      val solution: Option[AutolykosSolution] =
+        powScheme.checkNonces(2, hbs, msg, sk, x, b, N, 0, 10000, defaultParams) match {
+          case InputSolutionFound(as) => Some(as)
+          case _ => None
+        }
+      whenever(solution.isDefined) {
+        val as = solution.get
+        val inputBlockHeader = h.copy(powSolution = as)
+        powScheme.checkInputBlockPoW(inputBlockHeader, defaultParams) shouldBe true
       }
     }
   }
@@ -61,13 +66,15 @@ class AutolykosInputBlockPowSpec extends ErgoCorePropertyTest {
       val hbs = Ints.toByteArray(h.height)
       val N = powScheme.calcN(h)
 
-      powScheme.checkNonces(2, hbs, msg, sk, x, b, N, 0, 10000, defaultParams) match {
-        case OrderingSolutionFound(as) =>
-          val orderingBlockHeader = h.copy(powSolution = as)
-          // Ordering block solutions (hits below orderingTarget) are also valid input blocks
-          // because they exceed the input block difficulty requirement
-          powScheme.checkInputBlockPoW(orderingBlockHeader, defaultParams) shouldBe true
-        case _ => // No solution found in nonce range
+      val solution = OrderingPowFixture.find(0L, 10000L, _ => true) { (start, end) =>
+        powScheme.checkNonces(2, hbs, msg, sk, x, b, N, start, end, defaultParams)
+      }
+      whenever(solution.isDefined) {
+        val as = solution.get
+        val orderingBlockHeader = h.copy(powSolution = as)
+        // Ordering block solutions (hits below orderingTarget) are also valid input blocks
+        // because they exceed the input block difficulty requirement
+        powScheme.checkInputBlockPoW(orderingBlockHeader, defaultParams) shouldBe true
       }
     }
   }
@@ -87,19 +94,23 @@ class AutolykosInputBlockPowSpec extends ErgoCorePropertyTest {
       val hbs = Ints.toByteArray(h.height)
       val N = powScheme.calcN(h)
 
-      powScheme.checkNonces(2, hbs, msg, sk, x, b, N, 0, 10000, defaultParams) match {
-        case InputSolutionFound(as) =>
-          val inputBlockHeader = h.copy(powSolution = as)
-          // Verify hit is in input block range
-          val hit = powScheme.hitForVersion2(inputBlockHeader)
-          val orderingTarget = powScheme.getB(inputBlockHeader.nBits)
-          val inputTarget = orderingTarget * Parameters.SubsPerBlockDefault
-          
-          hit shouldBe >=(orderingTarget)
-          hit shouldBe <(inputTarget)
-          
-          powScheme.checkInputBlockPoW(inputBlockHeader, defaultParams) shouldBe true
-        case _ => // No solution found in nonce range
+      val solution: Option[AutolykosSolution] =
+        powScheme.checkNonces(2, hbs, msg, sk, x, b, N, 0, 10000, defaultParams) match {
+          case InputSolutionFound(as) => Some(as)
+          case _ => None
+        }
+      whenever(solution.isDefined) {
+        val as = solution.get
+        val inputBlockHeader = h.copy(powSolution = as)
+        // Verify hit is in input block range
+        val hit = powScheme.hitForVersion2(inputBlockHeader)
+        val orderingTarget = powScheme.getB(inputBlockHeader.nBits)
+        val inputTarget = orderingTarget * Parameters.SubsPerBlockDefault
+
+        hit shouldBe >=(orderingTarget)
+        hit shouldBe <(inputTarget)
+
+        powScheme.checkInputBlockPoW(inputBlockHeader, defaultParams) shouldBe true
       }
     }
   }
@@ -122,45 +133,49 @@ class AutolykosInputBlockPowSpec extends ErgoCorePropertyTest {
         val hbs = Ints.toByteArray(h.height)
         val N = powScheme.calcN(h)
 
-        powScheme.checkNonces(2, hbs, msg, sk, x, b, N, 0, 10000, defaultParams) match {
-          case InputSolutionFound(as) =>
-            val inputBlockHeader = h.copy(powSolution = as)
-            
-            // PoW check should pass for input block solution
-            powScheme.checkInputBlockPoW(inputBlockHeader, defaultParams) shouldBe true
-            
-            // Create valid Merkle proof (independent of PoW)
-            val prevInputBlockId: Option[Array[Byte]] = None
-            val extCandidate = InputBlockFields.toExtensionFields(
-              prevInputBlockId,
-              transactionsDigest,
-              prevTransactionsDigest
-            )
-            val extensionRoot = extCandidate.digest
-            val merkleProof = extCandidate.proofForInputBlockData.get
-            
-            val inputBlockFields = new InputBlockFields(
-              prevInputBlockId,
-              transactionsDigest,
-              prevTransactionsDigest,
-              merkleProof
-            )
-            
-            val inputBlockInfo = InputBlockAnnouncement(
-              InputBlockAnnouncement.initialMessageVersion,
-              inputBlockHeader,
-              inputBlockFields,
-              None,
-              Array.emptyByteArray
-            )
-            
-            // Merkle proof validation should succeed (independent of PoW)
-            inputBlockInfo.inputBlockFields.inputBlockFieldsProof.valid(extensionRoot) shouldBe true
-            
-            // Note: inputBlockInfo.valid() checks both PoW and Merkle proof
-            // For a real block, the extension root in header would match the proof
-            // Here we test the components separately
-          case _ => // No solution found in nonce range
+        val solution: Option[AutolykosSolution] =
+          powScheme.checkNonces(2, hbs, msg, sk, x, b, N, 0, 10000, defaultParams) match {
+            case InputSolutionFound(as) => Some(as)
+            case _ => None
+          }
+        whenever(solution.isDefined) {
+          val as = solution.get
+          val inputBlockHeader = h.copy(powSolution = as)
+
+          // PoW check should pass for input block solution
+          powScheme.checkInputBlockPoW(inputBlockHeader, defaultParams) shouldBe true
+
+          // Create valid Merkle proof (independent of PoW)
+          val prevInputBlockId: Option[Array[Byte]] = None
+          val extCandidate = InputBlockFields.toExtensionFields(
+            prevInputBlockId,
+            transactionsDigest,
+            prevTransactionsDigest
+          )
+          val extensionRoot = extCandidate.digest
+          val merkleProof = extCandidate.proofForInputBlockData.get
+
+          val inputBlockFields = new InputBlockFields(
+            prevInputBlockId,
+            transactionsDigest,
+            prevTransactionsDigest,
+            merkleProof
+          )
+
+          val inputBlockInfo = InputBlockAnnouncement(
+            InputBlockAnnouncement.initialMessageVersion,
+            inputBlockHeader,
+            inputBlockFields,
+            None,
+            Array.emptyByteArray
+          )
+
+          // Merkle proof validation should succeed (independent of PoW)
+          inputBlockInfo.inputBlockFields.inputBlockFieldsProof.valid(extensionRoot) shouldBe true
+
+          // Note: inputBlockInfo.valid() checks both PoW and Merkle proof
+          // For a real block, the extension root in header would match the proof
+          // Here we test the components separately
         }
     }
   }
@@ -195,7 +210,7 @@ class AutolykosInputBlockPowSpec extends ErgoCorePropertyTest {
     var inputSolutions = 0
     var orderingSolutions = 0
     
-    // Test with fixed secrets for reproducibility
+    // Reuse one randomly generated secret pair across these ranges.
     val sk = randomSecret()
     val x = randomSecret()
     
@@ -211,6 +226,7 @@ class AutolykosInputBlockPowSpec extends ErgoCorePropertyTest {
     // We should find more input block solutions than ordering solutions
     // (or at least some input block solutions)
     inputSolutions shouldBe >=(orderingSolutions)
+    inputSolutions shouldBe >(0)
   }
 
   /**
@@ -229,26 +245,32 @@ class AutolykosInputBlockPowSpec extends ErgoCorePropertyTest {
       val hbs = Ints.toByteArray(h.height)
       val N = powScheme.calcN(h)
 
-      powScheme.checkNonces(2, hbs, msg, sk, x, b, N, 0, 10000, defaultParams) match {
-        case InputSolutionFound(as) =>
-          val inputBlockHeader = h.copy(powSolution = as)
-          val hit = powScheme.hitForVersion2(inputBlockHeader)
-          
-          val orderingTarget = powScheme.getB(inputBlockHeader.nBits)
-          val inputTarget = orderingTarget * Parameters.SubsPerBlockDefault
-          
-          // Hit should be in input block range
-          hit shouldBe >=(orderingTarget)
-          hit shouldBe <(inputTarget)
-        case OrderingSolutionFound(as) =>
-          val orderingBlockHeader = h.copy(powSolution = as)
-          val hit = powScheme.hitForVersion2(orderingBlockHeader)
-          
-          val orderingTarget = powScheme.getB(orderingBlockHeader.nBits)
-          
-          // Hit should be below ordering target
-          hit shouldBe <(orderingTarget)
-        case _ => // No solution found
+      val solution: Option[SolutionFound] =
+        powScheme.checkNonces(2, hbs, msg, sk, x, b, N, 0, 10000, defaultParams) match {
+          case found: SolutionFound => Some(found)
+          case NoSolutionFound => None
+        }
+      whenever(solution.isDefined) {
+        solution.get match {
+          case InputSolutionFound(as) =>
+            val inputBlockHeader = h.copy(powSolution = as)
+            val hit = powScheme.hitForVersion2(inputBlockHeader)
+
+            val orderingTarget = powScheme.getB(inputBlockHeader.nBits)
+            val inputTarget = orderingTarget * Parameters.SubsPerBlockDefault
+
+            // Hit should be in input block range
+            hit shouldBe >=(orderingTarget)
+            hit shouldBe <(inputTarget)
+          case OrderingSolutionFound(as) =>
+            val orderingBlockHeader = h.copy(powSolution = as)
+            val hit = powScheme.hitForVersion2(orderingBlockHeader)
+
+            val orderingTarget = powScheme.getB(orderingBlockHeader.nBits)
+
+            // Hit should be below ordering target
+            hit shouldBe <(orderingTarget)
+        }
       }
     }
   }
@@ -271,29 +293,33 @@ class AutolykosInputBlockPowSpec extends ErgoCorePropertyTest {
         val hbs = Ints.toByteArray(h.height)
         val N = powScheme.calcN(h)
 
-        powScheme.checkNonces(2, hbs, msg, sk, x, b, N, 0, 10000, defaultParams) match {
-          case InputSolutionFound(as) =>
-            val inputBlockHeader = h.copy(powSolution = as)
-            
-            // Test PoW validation separately from Merkle proof validation
-            // (they are independent checks)
-            
-            // PoW validation should succeed for input block solution
-            powScheme.checkInputBlockPoW(inputBlockHeader, defaultParams) shouldBe true
-            
-            // Create valid extension fields and proof (independent of PoW)
-            val prevInputBlockId: Option[Array[Byte]] = None
-            val extCandidate = InputBlockFields.toExtensionFields(
-              prevInputBlockId,
-              transactionsDigest,
-              prevTransactionsDigest
-            )
-            val extensionRoot = extCandidate.digest
-            val merkleProof = extCandidate.proofForInputBlockData.get
-            
-            // Merkle proof validation should succeed (independent of PoW)
-            merkleProof.valid(extensionRoot) shouldBe true
-          case _ => // No solution found
+        val solution: Option[AutolykosSolution] =
+          powScheme.checkNonces(2, hbs, msg, sk, x, b, N, 0, 10000, defaultParams) match {
+            case InputSolutionFound(as) => Some(as)
+            case _ => None
+          }
+        whenever(solution.isDefined) {
+          val as = solution.get
+          val inputBlockHeader = h.copy(powSolution = as)
+
+          // Test PoW validation separately from Merkle proof validation
+          // (they are independent checks)
+
+          // PoW validation should succeed for input block solution
+          powScheme.checkInputBlockPoW(inputBlockHeader, defaultParams) shouldBe true
+
+          // Create valid extension fields and proof (independent of PoW)
+          val prevInputBlockId: Option[Array[Byte]] = None
+          val extCandidate = InputBlockFields.toExtensionFields(
+            prevInputBlockId,
+            transactionsDigest,
+            prevTransactionsDigest
+          )
+          val extensionRoot = extCandidate.digest
+          val merkleProof = extCandidate.proofForInputBlockData.get
+
+          // Merkle proof validation should succeed (independent of PoW)
+          merkleProof.valid(extensionRoot) shouldBe true
         }
     }
   }
@@ -355,47 +381,51 @@ class AutolykosInputBlockPowSpec extends ErgoCorePropertyTest {
         val hbs = Ints.toByteArray(h.height)
         val N = powScheme.calcN(h)
 
-        powScheme.checkNonces(2, hbs, msg, sk, x, b, N, 0, 10000, defaultParams) match {
-          case InputSolutionFound(as) =>
-            val inputBlockHeader = h.copy(powSolution = as)
-            
-            // Create valid extension fields and proof
-            val prevInputBlockId: Option[Array[Byte]] = Some(Array.fill(32)(0x01.toByte))
-            val extCandidate = InputBlockFields.toExtensionFields(
-              prevInputBlockId,
-              transactionsDigest,
-              prevTransactionsDigest
-            )
-            val extensionRoot = extCandidate.digest
-            val merkleProof = extCandidate.proofForInputBlockData.get
-            
-            // PoW validation should succeed (tests checkInputBlockPoW)
-            powScheme.checkInputBlockPoW(inputBlockHeader, defaultParams) shouldBe true
-            
-            // Create InputBlockAnnouncement with the original header (PoW valid)
-            // and separate Merkle proof (valid for extensionRoot)
-            val inputBlockFields = new InputBlockFields(
-              prevInputBlockId,
-              transactionsDigest,
-              prevTransactionsDigest,
-              merkleProof
-            )
-            
-            val inputBlockInfo = InputBlockAnnouncement(
-              InputBlockAnnouncement.initialMessageVersion,
-              inputBlockHeader,
-              inputBlockFields,
-              None,
-              Array.emptyByteArray
-            )
-            
-            // All property accessors should work
-            inputBlockInfo.transactionsDigest shouldBe transactionsDigest
-            inputBlockInfo.prevInputBlockId shouldBe prevInputBlockId.map(bytesToId)
-            
-            // Merkle proof validation should succeed (independent check)
-            inputBlockInfo.inputBlockFields.inputBlockFieldsProof.valid(extensionRoot) shouldBe true
-          case _ => // No solution found
+        val solution: Option[AutolykosSolution] =
+          powScheme.checkNonces(2, hbs, msg, sk, x, b, N, 0, 10000, defaultParams) match {
+            case InputSolutionFound(as) => Some(as)
+            case _ => None
+          }
+        whenever(solution.isDefined) {
+          val as = solution.get
+          val inputBlockHeader = h.copy(powSolution = as)
+
+          // Create valid extension fields and proof
+          val prevInputBlockId: Option[Array[Byte]] = Some(Array.fill(32)(0x01.toByte))
+          val extCandidate = InputBlockFields.toExtensionFields(
+            prevInputBlockId,
+            transactionsDigest,
+            prevTransactionsDigest
+          )
+          val extensionRoot = extCandidate.digest
+          val merkleProof = extCandidate.proofForInputBlockData.get
+
+          // PoW validation should succeed (tests checkInputBlockPoW)
+          powScheme.checkInputBlockPoW(inputBlockHeader, defaultParams) shouldBe true
+
+          // Create InputBlockAnnouncement with the original header (PoW valid)
+          // and separate Merkle proof (valid for extensionRoot)
+          val inputBlockFields = new InputBlockFields(
+            prevInputBlockId,
+            transactionsDigest,
+            prevTransactionsDigest,
+            merkleProof
+          )
+
+          val inputBlockInfo = InputBlockAnnouncement(
+            InputBlockAnnouncement.initialMessageVersion,
+            inputBlockHeader,
+            inputBlockFields,
+            None,
+            Array.emptyByteArray
+          )
+
+          // All property accessors should work
+          inputBlockInfo.transactionsDigest shouldBe transactionsDigest
+          inputBlockInfo.prevInputBlockId shouldBe prevInputBlockId.map(bytesToId)
+
+          // Merkle proof validation should succeed (independent check)
+          inputBlockInfo.inputBlockFields.inputBlockFieldsProof.valid(extensionRoot) shouldBe true
         }
     }
   }
