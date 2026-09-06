@@ -6,6 +6,7 @@ on:
       - fix/matrix-ci-combined-20260905
       - fix/matrix-idle-reconnect
       - fix/matrix-relay-lifecycle
+      - fix/matrix-pending-restart-lifecycle
 
 permissions:
   contents: read
@@ -16,7 +17,10 @@ concurrency:
 
 jobs:
   node:
-    if: github.event.repository.fork && github.ref != 'refs/heads/fix/matrix-relay-lifecycle'
+    if: >-
+      github.event.repository.fork &&
+      (github.ref == 'refs/heads/fix/matrix-ci-combined-20260905' ||
+       github.ref == 'refs/heads/fix/matrix-idle-reconnect')
     name: Node tests (Scala 2.12.20, Java 8)
     runs-on: ubuntu-latest
     timeout-minutes: 120

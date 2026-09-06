@@ -221,7 +221,32 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     }
   }
 
-  private def restartReceiver(offline: Boolean = false): Node = restartNode(2, offline)
+  private def assertInputBody(node: Node, id: String, transactions: Vector[ErgoTransaction]): Unit = {
+    until(s"$id has exact transaction IDs and bodies") {
+      (get(node, s"/blocks/$id/inputBlockTransactionIds").as[Option[Vector[String]]].fold(throw _, identity),
+        get(node, s"/blocks/$id/inputBlockTransactions").as[Option[Vector[ErgoTransaction]]].fold(throw _, identity))
+    }(_ == ((Some(transactions.map(_.id)), Some(transactions))))
+  }
+
+  private def restartReceiver(offline: Boolean): Node = restartNode(2, offline)
+
+  private def assertOfflineCheckpoint(node: Node, checkpoint: (String, String), confirmedHeight: Int,
+                                      boxes: Set[String], balance: Long): Unit = {
+    get(node, "/peers/connected").asArray.get shouldBe empty
+    until("confirmed checkpoint restored locally") {
+      val info = get(node, "/info")
+      (field[Option[String]](info, "bestFullHeaderId").getOrElse(""),
+        field[Option[String]](info, "stateRoot").getOrElse(""))
+    }(_ == checkpoint)
+    until("wallet checkpoint restored locally")(field[Int](get(node, "/wallet/status"), "walletHeight"))(_ == confirmedHeight)
+    height(node) shouldBe confirmedHeight
+    walletIds(node) shouldBe boxes
+    walletBalance(node) shouldBe balance
+    mempool(node) shouldBe empty
+    inputTip(node) shouldBe empty
+    field[Vector[String]](get(node, "/blocks/bestInputChain"), "bestInputBlocks") shouldBe empty
+    get(node, "/peers/connected").asArray.get shouldBe empty
+  }
 
   private def restartNode(index: Int, offline: Boolean): Node = {
     runtime.stopAndRemoveNode(nodeList(index), secondsToWait = 30)
@@ -402,8 +427,11 @@ class MatrixLifecycleSpec extends AnyFlatSpec
 
   it should "recover an input-block payment after restarting before ordering" in {
     assume(settledRestartComplete, "The preceding settled restart scenario must pass")
+    val checkpoint = settled()
     val producer = nodeList.head
     val confirmedHeight = height(producer)
+    val confirmedBoxes = walletIds(nodeList(2))
+    val confirmedBalance = walletBalance(nodeList(2))
     val source = spendable(producer).head
     val tx = payment(producer, source, 5000000L)
     submit(producer, tx)
@@ -411,13 +439,35 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     assertAppliedInput(paymentBlock, Seq(tx), nodeList)
     val expectedBoxes = walletIds(nodeList(2))
     val expectedBalance = walletBalance(nodeList(2))
+    expectedBalance shouldBe confirmedBalance - fee
+    nodeList.foreach { node =>
+      until("payment input chain processed before restart") {
+        field[Vector[String]](get(node, "/blocks/bestInputChain"), "bestInputBlocks")
+      }(_ == Vector(paymentBlock))
+      walletIds(node) shouldBe expectedBoxes
+      walletBalance(node) shouldBe expectedBalance
+      mempool(node) shouldBe empty
+    }
     nodeList.foreach(n => height(n) shouldBe confirmedHeight)
 
-    val restarted = restartReceiver()
-    connectPeer(restarted, nodeList(1))
-    settled()
-    // Input tips are announced separately from ordering-header synchronization.
-    // Resume valid input production to exercise ordinary missing-parent retrieval.
+    val restarted = restartReceiver(offline = true)
+    assertOfflineCheckpoint(restarted, checkpoint, confirmedHeight, confirmedBoxes, confirmedBalance)
+    walletIds(restarted) should contain(Base16.encode(source.id))
+    tx.outputs.foreach(box => walletIds(restarted) should not contain Base16.encode(box.id))
+    nodeList.take(2).foreach(connectPeer(restarted, _))
+    settled() shouldBe checkpoint
+    // Recover the frozen pending payment through peers before producing any further work.
+    assertAppliedInput(paymentBlock, Seq(tx), nodeList)
+    until("pending input chain recovered without new production") {
+      field[Vector[String]](get(restarted, "/blocks/bestInputChain"), "bestInputBlocks")
+    }(_ == Vector(paymentBlock))
+    assertInputBody(restarted, paymentBlock, Vector(tx))
+    walletIds(restarted) shouldBe expectedBoxes
+    walletBalance(restarted) shouldBe expectedBalance
+    mempool(restarted) shouldBe empty
+    height(restarted) shouldBe confirmedHeight
+    settled() shouldBe checkpoint
+    // Continue ordinary child production, ordering confirmation and duplicate exclusion.
     val resumedTip = mine(producer, input = true)
     nodeList.foreach { n =>
       until("pending chain recovered after restart")(inputTip(n))(_ == resumedTip)
@@ -462,20 +512,7 @@ class MatrixLifecycleSpec extends AnyFlatSpec
       inputTip(n) shouldBe empty
     }
     val restarted = restartReceiver(offline = true)
-    get(restarted, "/peers/connected").asArray.get shouldBe empty
-    until("confirmed checkpoint restored locally") {
-      val info = get(restarted, "/info")
-      (field[Option[String]](info, "bestFullHeaderId").getOrElse(""),
-        field[Option[String]](info, "stateRoot").getOrElse(""))
-    }(_ == checkpoint)
-    until("wallet checkpoint restored locally") {
-      field[Int](get(restarted, "/wallet/status"), "walletHeight")
-    }(_ == confirmedHeight)
-    walletIds(restarted) shouldBe boxes
-    walletBalance(restarted) shouldBe balance
-    mempool(restarted) shouldBe empty
-    inputTip(restarted) shouldBe empty
-    get(restarted, "/peers/connected").asArray.get shouldBe empty
+    assertOfflineCheckpoint(restarted, checkpoint, confirmedHeight, boxes, balance)
 
     // Explicit outgoing connections are enabled even with automatic P2P disabled.
     nodeList.take(2).foreach(connectPeer(restarted, _))
@@ -630,18 +667,7 @@ class MatrixLifecycleSpec extends AnyFlatSpec
 
     // An orderly offline restart clears old TCP sessions before any input announcement exists.
     val receiver = restartReceiver(offline = true)
-    until("idle receiver restores its ordering checkpoint") {
-      val info = get(receiver, "/info")
-      (field[Option[String]](info, "bestFullHeaderId").getOrElse(""),
-        field[Option[String]](info, "stateRoot").getOrElse(""))
-    }(_ == checkpoint)
-    until("idle receiver restores its wallet checkpoint") {
-      field[Int](get(receiver, "/wallet/status"), "walletHeight")
-    }(_ == confirmedHeight)
-    get(receiver, "/peers/connected").asArray.get shouldBe empty
-    inputTip(receiver) shouldBe empty
-    walletIds(receiver) shouldBe openingBoxes
-    walletBalance(receiver) shouldBe openingBalance
+    assertOfflineCheckpoint(receiver, checkpoint, confirmedHeight, openingBoxes, openingBalance)
 
     val tx = payment(producer, spendable(producer).head, 2000000L)
     submit(producer, tx)
@@ -684,12 +710,7 @@ class MatrixLifecycleSpec extends AnyFlatSpec
         get(node, "/blocks/bestInputChain")
       }(_ == frozenChain)
       expectedBodies.foreach { case (id, transactions) =>
-        until(s"$id transaction IDs recovered on idle reconnection") {
-          get(node, s"/blocks/$id/inputBlockTransactionIds").as[Option[Vector[String]]].fold(throw _, identity)
-        }(_.contains(transactions.map(_.id)))
-        until(s"$id transaction bodies recovered on idle reconnection") {
-          get(node, s"/blocks/$id/inputBlockTransactions").as[Option[Vector[ErgoTransaction]]].fold(throw _, identity)
-        }(_.contains(transactions))
+        assertInputBody(node, id, transactions)
       }
       until("idle receiver wallet converges")(walletIds(node))(_ == expectedBoxes)
       walletBalance(node) shouldBe openingBalance - fee
@@ -757,12 +778,7 @@ class MatrixLifecycleSpec extends AnyFlatSpec
       until("frozen tip propagates through the preconnected relay")(inputTip(node))(_ == frozenTip)
       until("frozen ancestry is fully processed through the relay")(get(node, "/blocks/bestInputChain"))(_ == frozenChain)
       expectedBodies.foreach { case (id, transactions) =>
-        until(s"relay chain $id has exact transaction IDs") {
-          get(node, s"/blocks/$id/inputBlockTransactionIds").as[Option[Vector[String]]].fold(throw _, identity)
-        }(_.contains(transactions.map(_.id)))
-        until(s"relay chain $id has exact transaction bodies") {
-          get(node, s"/blocks/$id/inputBlockTransactions").as[Option[Vector[ErgoTransaction]]].fold(throw _, identity)
-        }(_.contains(transactions))
+        assertInputBody(node, id, transactions)
       }
       until("relay chain wallet converges")(walletIds(node))(_ == expectedBoxes)
       walletBalance(node) shouldBe openingBalance - fee
