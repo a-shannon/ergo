@@ -10,9 +10,12 @@ import org.ergoplatform.wallet.mnemonic.Mnemonic
 import org.ergoplatform.wallet.settings.SecretStorageSettings
 import scorex.util.encode.Base16
 
-import java.io.{File, FileNotFoundException, PrintWriter}
+import java.io.{File, FileNotFoundException, Writer}
+import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.{FileAlreadyExistsException, Files, LinkOption, Path, StandardCopyOption}
 import java.util
 import java.util.UUID
+import scala.util.control.NonFatal
 import scala.util.{Failure, Success, Try}
 
 /**
@@ -89,29 +92,60 @@ final class JsonSecretStorage(val secretFile: File, encryptionSettings: Encrypti
 
 object JsonSecretStorage {
 
+  private val StagingPrefix = ".ergo-secret-staging-"
+
   /**
    * Initializes storage instance with new wallet file encrypted with the given `pass`.
-   * @param seed   - seed bytes
+   * @param seed   - seed bytes, erased on both success and failure
    * @param pass   - encryption password
    * @param usePre1627KeyDerivation - use incorrect(previous) BIP32 derivation, expected to be false for new wallets, and true for old pre-1627 wallets (see https://github.com/ergoplatform/ergo/issues/1627 for details)
    */
   def init(seed: Array[Byte], pass: SecretString, usePre1627KeyDerivation: Boolean)(settings: SecretStorageSettings): JsonSecretStorage = {
-    val iv = scorex.utils.Random.randomBytes(crypto.AES.NonceBitsLen / 8)
-    val salt = scorex.utils.Random.randomBytes(32)
-    val (ciphertext, tag) = crypto.AES.encrypt(seed, pass.getData(), salt, iv)(settings.encryption)
-    val encryptedSecret = EncryptedSecret(ciphertext, salt, iv, tag, settings.encryption, Some(usePre1627KeyDerivation))
-    val uuid = UUID.nameUUIDFromBytes(ciphertext)
-    new File(settings.secretDir).mkdirs()
-    val file = new File(s"${settings.secretDir}/$uuid.json")
-    val outWriter = new PrintWriter(file)
-    val jsonRaw = encryptedSecret.asJson.noSpaces
+    try {
+      val iv = scorex.utils.Random.randomBytes(crypto.AES.NonceBitsLen / 8)
+      val salt = scorex.utils.Random.randomBytes(32)
+      val (ciphertext, tag) = crypto.AES.encrypt(seed, pass.getData(), salt, iv)(settings.encryption)
+      val encryptedSecret = EncryptedSecret(ciphertext, salt, iv, tag, settings.encryption, Some(usePre1627KeyDerivation))
+      val uuid = UUID.nameUUIDFromBytes(ciphertext)
+      val file = new File(s"${settings.secretDir}/$uuid.json")
+      persist(file, encryptedSecret.asJson.noSpaces)
+      new JsonSecretStorage(file, settings.encryption)
+    } finally {
+      util.Arrays.fill(seed, 0: Byte)
+    }
+  }
 
-    outWriter.write(jsonRaw)
-    outWriter.close()
-
-    util.Arrays.fill(seed, 0: Byte)
-
-    new JsonSecretStorage(file, settings.encryption)
+  /** Writes and closes a staging file before publishing it atomically. */
+  private[secrets] def persist(file: File, jsonRaw: String,
+                               openWriter: Path => Writer = path => Files.newBufferedWriter(path, UTF_8)): Unit = {
+    val target = file.toPath.toAbsolutePath
+    Files.createDirectories(target.getParent)
+    if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+      throw new FileAlreadyExistsException(target.toString)
+    }
+    val staging = Files.createTempFile(target.getParent, StagingPrefix, ".tmp")
+    try {
+      val writer = openWriter(staging)
+      var writeFailure: Option[Throwable] = None
+      try {
+        writer.write(jsonRaw)
+      } catch {
+        case NonFatal(error) =>
+          writeFailure = Some(error)
+          throw error
+      } finally {
+        writeFailure match {
+          case Some(error) => Try(writer.close()).failed.foreach(error.addSuppressed)
+          case None => writer.close()
+        }
+      }
+      // Do not expose a partial destination when atomic publication is unavailable.
+      Files.move(staging, target, StandardCopyOption.ATOMIC_MOVE)
+    } catch {
+      case NonFatal(error) =>
+        Try(Files.deleteIfExists(staging)).failed.foreach(error.addSuppressed)
+        throw error
+    }
   }
 
   /**
@@ -133,7 +167,7 @@ object JsonSecretStorage {
   def readFile(settings: SecretStorageSettings): Try[JsonSecretStorage] = {
     val dir = new File(settings.secretDir)
     if (dir.exists()) {
-      dir.listFiles().toList match {
+      dir.listFiles().toList.filterNot(_.getName.startsWith(StagingPrefix)) match {
         case files if files.size > 1 =>
           val jsonFiles = files.filter(_.getName.contains(".json"))
           jsonFiles.headOption match {
