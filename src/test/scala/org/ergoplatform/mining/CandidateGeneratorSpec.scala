@@ -892,7 +892,8 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
 
   it should "ignore cached candidate when forced = true" in new TestKit(ActorSystem()) {
     val testProbe = new TestProbe(system)
-    system.eventStream.subscribe(testProbe.ref, newBlockSignal)
+    val blockProbe = new TestProbe(system)
+    system.eventStream.subscribe(blockProbe.ref, newBlockSignal)
 
     val testDir = s"${defaultSettings.directory}-ignore-cache-${System.currentTimeMillis()}"
     val settingsWithShortRegeneration: ErgoSettings =
@@ -927,9 +928,9 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
       .proveCandidate(initCandidate.candidateBlock, defaultMinerSecret.w, 0, 1000)
       .get
     candidateGenerator.tell(initBlock.header.powSolution, testProbe.ref)
-    testProbe.fishForMessage(blockValidationDelay) {
-      case StatusReply.Success(()) => true
-      case FullBlockApplied(header) if header.id != initBlock.header.parentId => true
+    testProbe.expectMsg(blockValidationDelay, StatusReply.success(()))
+    blockProbe.fishForMessage(blockValidationDelay) {
+      case FullBlockApplied(header) if header.id == initBlock.header.id => true
       case _ => false
     }
 
