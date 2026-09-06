@@ -369,7 +369,8 @@ class WalletRegistry(private val store: LDBVersionedStore)(ws: WalletSettings) e
     val oldBox = getBox(box.id) // read old version from the database
     val oldScans = oldBox.map(_.scans).getOrElse(Set.empty)
 
-    val newBox = TrackedBox(box, box.creationHeight, newScans)
+    val newBox = oldBox.map(_.copy(scans = newScans))
+      .getOrElse(TrackedBox(box, box.creationHeight, newScans))
 
     val bag1 = (oldScans.isEmpty, newScans.isEmpty) match {
       case (false, false) =>
@@ -390,10 +391,9 @@ class WalletRegistry(private val store: LDBVersionedStore)(ws: WalletSettings) e
         throw new Exception("Can't remove a box which does not exist")
     }
 
-    // Flag showing that box has been added to the payments app (p2pk-wallet) or removed from it
-    // If true, we need to update wallet digest
-    val digestChanged = (oldScans.contains(Constants.PaymentsScanId) || newScans.contains(Constants.PaymentsScanId)) &&
-                        !(oldScans.contains(Constants.PaymentsScanId) && newScans.contains(Constants.PaymentsScanId))
+    // Only unspent boxes contribute assets when their payment association changes.
+    val digestChanged = !newBox.isSpent &&
+      (oldScans.contains(Constants.PaymentsScanId) != newScans.contains(Constants.PaymentsScanId))
 
     val bag2 = if (digestChanged) {
       val digest = fetchDigest()
