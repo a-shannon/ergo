@@ -705,6 +705,7 @@ object CandidateGenerator extends ScorexLogging {
       }
 
       def deriveWorkMessage(block: CandidateBlock) = {
+        ensureCandidateSize(block, state.stateContext.currentParameters.maxBlockSize)
         ergoSettings.chainSettings.powScheme.deriveExternalCandidate(
           block,
           minerPk,
@@ -917,15 +918,20 @@ object CandidateGenerator extends ScorexLogging {
     Seq(emissionTxOpt, feeTxOpt).flatten
   }
 
-  /**
-    * Helper function which decides whether transactions can fit into a block with given cost and size limits
-    */
-  def correctLimits(
+  /** Check the complete serialized section before returning work, including the emission-only fallback. */
+  private[mining] def ensureCandidateSize(candidate: CandidateBlock, maxBlockSize: Int): Unit = {
+    val section = BlockTransactions(Header.GenesisParentId, candidate.version, candidate.transactions)
+    require(section.bytes.length <= maxBlockSize, "Candidate transaction section exceeds the block size limit")
+  }
+
+  /** Decide whether transactions fit the cost limit and the full serialized section size limit. */
+  private def correctLimits(
     blockTxs: Seq[CostedTransaction],
     maxBlockCost: Long,
-    maxBlockSize: Long
+    maxBlockSize: Long,
+    sectionSize: Long
   ): Boolean = {
-    blockTxs.map(_._2).sum < maxBlockCost && blockTxs.map(_._1.size).sum < maxBlockSize
+    blockTxs.map(_._2).sum < maxBlockCost && sectionSize <= maxBlockSize
   }
 
   /**
@@ -948,6 +954,7 @@ object CandidateGenerator extends ScorexLogging {
 
     val currentHeight = us.stateContext.currentHeight
     val nextHeight = upcomingContext.currentHeight
+    val blockVersion = upcomingContext.sigmaPreHeader.version
 
     log.info(
       s"Assembling a block candidate for block #$nextHeight from ${transactions.length} transactions available"
@@ -959,6 +966,7 @@ object CandidateGenerator extends ScorexLogging {
     def loop(
               mempoolTxs: Iterable[ErgoTransaction],
               acc: Seq[CostedTransaction],
+              accSize: Long,
               lastFeeTx: Option[CostedTransaction],
               invalidTxs: Seq[ModifierId]
             ): (Seq[ErgoTransaction], Seq[ModifierId]) = {
@@ -974,7 +982,7 @@ object CandidateGenerator extends ScorexLogging {
             //mark transaction as invalid if it tries to do double-spending or trying to spend outputs not present
             //do these checks before validating the scripts to save time
             log.debug(s"Transaction ${tx.id} double-spending or spending non-existing inputs")
-            loop(mempoolTxs.tail, acc, lastFeeTx, invalidTxs :+ tx.id)
+            loop(mempoolTxs.tail, acc, accSize, lastFeeTx, invalidTxs :+ tx.id)
           } else {
             // check validity and calculate transaction cost
             stateWithTxs.validateWithCost(
@@ -985,6 +993,7 @@ object CandidateGenerator extends ScorexLogging {
             ) match {
               case Success(costConsumed) =>
                 val newTxs = acc :+ (tx -> costConsumed)
+                val newSize = accSize + BlockTransactionsSerializer.transactionSize(tx, blockVersion)
                 val newBoxes = newTxs.flatMap(_._1.outputs)
 
                 collectFees(currentHeight, newTxs.map(_._1), minerPk, upcomingContext) match {
@@ -995,8 +1004,10 @@ object CandidateGenerator extends ScorexLogging {
                     feeTx.statefulValidity(boxesToSpend, IndexedSeq(), upcomingContext)(verifier) match {
                       case Success(cost) =>
                         val blockTxs: Seq[CostedTransaction] = (feeTx -> cost) +: newTxs
-                        if (correctLimits(blockTxs, maxBlockCost, maxBlockSize)) {
-                          loop(mempoolTxs.tail, newTxs, Some(feeTx -> cost), invalidTxs)
+                        val sectionSize = BlockTransactionsSerializer.sectionSize(blockVersion, blockTxs.size,
+                          newSize + BlockTransactionsSerializer.transactionSize(feeTx, blockVersion))
+                        if (correctLimits(blockTxs, maxBlockCost, maxBlockSize, sectionSize)) {
+                          loop(mempoolTxs.tail, newTxs, newSize, Some(feeTx -> cost), invalidTxs)
                         } else {
                           log.debug(s"Finishing block assembly on limits overflow, " +
                                     s"cost is ${currentCosted.map(_._2).sum}, cost limit: $maxBlockCost")
@@ -1012,15 +1023,18 @@ object CandidateGenerator extends ScorexLogging {
                   case None =>
                     log.info(s"No fee proposition found in txs ${newTxs.map(_._1.id)} ")
                     val blockTxs: Seq[CostedTransaction] = newTxs ++ lastFeeTx.toSeq
-                    if (correctLimits(blockTxs, maxBlockCost, maxBlockSize)) {
-                      loop(mempoolTxs.tail, blockTxs, lastFeeTx, invalidTxs)
+                    val blockPayloadSize = newSize + lastFeeTx.map(t =>
+                      BlockTransactionsSerializer.transactionSize(t._1, blockVersion)).getOrElse(0)
+                    val sectionSize = BlockTransactionsSerializer.sectionSize(blockVersion, blockTxs.size, blockPayloadSize)
+                    if (correctLimits(blockTxs, maxBlockCost, maxBlockSize, sectionSize)) {
+                      loop(mempoolTxs.tail, blockTxs, blockPayloadSize, lastFeeTx, invalidTxs)
                     } else {
                       current -> invalidTxs
                     }
                 }
               case Failure(e) =>
                 log.info(s"Not included transaction ${tx.id} due to ${e.getMessage}: ", e)
-                loop(mempoolTxs.tail, acc, lastFeeTx, invalidTxs :+ tx.id)
+                loop(mempoolTxs.tail, acc, accSize, lastFeeTx, invalidTxs :+ tx.id)
             }
           }
         case None => // mempool is empty
@@ -1028,7 +1042,7 @@ object CandidateGenerator extends ScorexLogging {
       }
     }
 
-    val res = loop(transactions, Seq.empty, None, Seq.empty)
+    val res = loop(transactions, Seq.empty, 0L, None, Seq.empty)
     log.debug(
       s"Collected ${res._1.length} transactions for block #$currentHeight, " +
         s"invalid transaction ids (total:${res._2.length}) for block #$currentHeight : ${res._2}")
