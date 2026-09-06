@@ -8,6 +8,7 @@ on:
       - fix/matrix-relay-lifecycle
       - fix/matrix-pending-restart-lifecycle
       - fix/matrix-lifecycle-failure-isolation
+      - fix/matrix-confirmed-catchup
 
 permissions:
   contents: read

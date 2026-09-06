@@ -6,7 +6,6 @@ import io.circe.parser.parse
 import io.circe.syntax._
 import org.asynchttpclient.Response
 import org.ergoplatform.{ErgoBox, ErgoTreePredef}
-import org.ergoplatform.http.api.ApiCodecs
 import org.ergoplatform.it.container.{Docker, IntegrationTestConstants, Node}
 import org.ergoplatform.mining.AutolykosSolutionJsonCodecs
 import org.ergoplatform.mining.llm_generated.MatrixTestMiner
@@ -19,7 +18,6 @@ import org.ergoplatform.wallet.Constants.MiningScanId
 import org.ergoplatform.wallet.boxes.ErgoBoxSerializer
 import org.scalatest.{BeforeAndAfterAll, CancelAfterFailure}
 import org.scalatest.flatspec.AnyFlatSpec
-import org.scalatest.matchers.should.Matchers
 import scorex.util.encode.Base16
 import sigma.data.ProveDlog
 import sigma.serialization.GroupElementSerializer
@@ -30,7 +28,7 @@ import scala.concurrent.duration._
 
 /** Normal, valid Matrix traffic on a private devnet with a shared custom genesis. */
 class MatrixLifecycleSpec extends AnyFlatSpec
-  with Matchers with BeforeAndAfterAll with CancelAfterFailure with IntegrationTestConstants with ApiCodecs {
+  with BeforeAndAfterAll with CancelAfterFailure with IntegrationTestConstants with MatrixLifecycleAssertions {
 
   private implicit val ec: ExecutionContext = ExecutionContext.global
   private val fee = 1000000L
@@ -57,7 +55,7 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     parse(response.getResponseBody).fold(throw _, identity)
   }
 
-  private def get(node: Node, path: String): Json =
+  protected def get(node: Node, path: String): Json =
     withClue(s"${node.nodeName} GET $path: ") {
       body(await(node.singleGet(path, _.setHeader("api_key", "hello"))))
     }
@@ -67,10 +65,10 @@ class MatrixLifecycleSpec extends AnyFlatSpec
       body(await(node.post(path, value.noSpaces)))
     }
 
-  private def field[A: Decoder](json: Json, name: String): A =
+  protected def field[A: Decoder](json: Json, name: String): A =
     json.hcursor.get[A](name).fold(throw _, identity)
 
-  private def until[A](label: String)(observe: => A)(accept: A => Boolean): A = {
+  protected def until[A](label: String)(observe: => A)(accept: A => Boolean): A = {
     val deadline = convergenceTimeout.fromNow
     var observed = observe
     while (!accept(observed) && deadline.hasTimeLeft()) {
@@ -81,20 +79,20 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     observed
   }
 
-  private def height(node: Node): Int =
+  protected def height(node: Node): Int =
     field[Option[Int]](get(node, "/info"), "fullHeight").getOrElse(0)
 
-  private def inputTip(node: Node): String =
+  protected def inputTip(node: Node): String =
     field[String](get(node, "/blocks/bestInputBlock"), "bestInputBlock")
 
-  private def mempool(node: Node): Set[String] =
+  protected def mempool(node: Node): Set[String] =
     get(node, "/transactions/unconfirmed?limit=100").asArray.get.map(field[String](_, "id")).toSet
 
   private def walletBoxes(node: Node): Vector[ErgoBox] =
     get(node, "/wallet/boxes/unspent?minConfirmations=-1&limit=1000").asArray.get
       .map(j => j.hcursor.downField("box").as[ErgoBox].fold(throw _, identity))
 
-  private def walletIds(node: Node): Set[String] = walletBoxes(node).map(b => Base16.encode(b.id)).toSet
+  protected def walletIds(node: Node): Set[String] = walletBoxes(node).map(b => Base16.encode(b.id)).toSet
 
   private def miningRewards(node: Node): Map[String, (ErgoBox, Int)] =
     get(node, s"/scan/unspentBoxes/$MiningScanId?minConfirmations=0&limit=1000").asArray.get
@@ -103,7 +101,7 @@ class MatrixLifecycleSpec extends AnyFlatSpec
         (Base16.encode(box.id), (box, field[Int](json, "inclusionHeight")))
       }.toMap
 
-  private def walletBalance(node: Node): Long =
+  protected def walletBalance(node: Node): Long =
     field[Long](get(node, "/wallet/balances/withUnconfirmed"), "balance")
 
   private def currentParameters(node: Node): Parameters = {
@@ -137,23 +135,24 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     }
   }
 
-  private def settled(expectedPeerCounts: Vector[Int] = Vector(2, 2, 2)): (String, String) = {
-    expectedPeerCounts.size shouldBe nodeList.size
-    val result = until("three nodes agree on a present best block and state root") {
-      nodeList.map { node =>
+  private def settled(expectedPeerCounts: Vector[Int] = Vector(2, 2, 2),
+                      participants: Vector[Node] = nodeList): (String, String) = {
+    expectedPeerCounts.size shouldBe participants.size
+    val result = until("participants agree on a present best block and state root") {
+      participants.map { node =>
         val info = get(node, "/info")
         (field[Option[String]](info, "bestFullHeaderId").getOrElse(""),
           field[Option[String]](info, "stateRoot").getOrElse(""))
       }
     }(values => values.forall(v => v._1.nonEmpty && v._2.nonEmpty) && values.distinct.size == 1)
-    val expectedHeight = height(nodeList.head)
+    val expectedHeight = height(participants.head)
     until("wallet scans reach the ordering checkpoint") {
-      nodeList.map(n => field[Int](get(n, "/wallet/status"), "walletHeight"))
+      participants.map(n => field[Int](get(n, "/wallet/status"), "walletHeight"))
     }(_.forall(_ == expectedHeight))
     // Input-block broadcast selects direct peers whose advertised height is
     // within two blocks. Rapid devnet mining can outrun the sync status timer.
     until("each node knows its expected peers at the current ordering checkpoint") {
-      nodeList.map(n => get(n, "/peers/syncInfo").asArray.get.map(field[Int](_, "height")))
+      participants.map(n => get(n, "/peers/syncInfo").asArray.get.map(field[Int](_, "height")))
     }(_.zip(expectedPeerCounts).forall { case (hs, count) =>
       hs.size >= count && hs.forall(h => math.abs(h - expectedHeight) <= 2)
     })
@@ -207,46 +206,10 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     }
   }
 
-  private def assertConfirmed(orderingId: String, txs: Seq[ErgoTransaction]): Unit = {
-    nodeList.foreach { node =>
-      val section = get(node, s"/blocks/$orderingId/transactions")
-      field[String](section, "headerId") shouldBe orderingId
-      val ids = field[Vector[Json]](section, "transactions").map(field[String](_, "id"))
-      txs.foreach { tx =>
-        ids.count(_ == tx.id) shouldBe 1
-        val outputId = Base16.encode(tx.outputs.head.id)
-        val confirmed = get(node, s"/utxo/byId/$outputId").as[ErgoBox].fold(throw _, identity)
-        Base16.encode(confirmed.id) shouldBe outputId
-      }
-    }
-  }
-
-  private def assertInputBody(node: Node, id: String, transactions: Vector[ErgoTransaction]): Unit = {
-    until(s"$id has exact transaction IDs and bodies") {
-      (get(node, s"/blocks/$id/inputBlockTransactionIds").as[Option[Vector[String]]].fold(throw _, identity),
-        get(node, s"/blocks/$id/inputBlockTransactions").as[Option[Vector[ErgoTransaction]]].fold(throw _, identity))
-    }(_ == ((Some(transactions.map(_.id)), Some(transactions))))
-  }
+  private def assertConfirmed(orderingId: String, txs: Seq[ErgoTransaction]): Unit =
+    assertConfirmed(orderingId, txs, nodeList)
 
   private def restartReceiver(offline: Boolean): Node = restartNode(2, offline)
-
-  private def assertOfflineCheckpoint(node: Node, checkpoint: (String, String), confirmedHeight: Int,
-                                      boxes: Set[String], balance: Long): Unit = {
-    get(node, "/peers/connected").asArray.get shouldBe empty
-    until("confirmed checkpoint restored locally") {
-      val info = get(node, "/info")
-      (field[Option[String]](info, "bestFullHeaderId").getOrElse(""),
-        field[Option[String]](info, "stateRoot").getOrElse(""))
-    }(_ == checkpoint)
-    until("wallet checkpoint restored locally")(field[Int](get(node, "/wallet/status"), "walletHeight"))(_ == confirmedHeight)
-    height(node) shouldBe confirmedHeight
-    walletIds(node) shouldBe boxes
-    walletBalance(node) shouldBe balance
-    mempool(node) shouldBe empty
-    inputTip(node) shouldBe empty
-    field[Vector[String]](get(node, "/blocks/bestInputChain"), "bestInputBlocks") shouldBe empty
-    get(node, "/peers/connected").asArray.get shouldBe empty
-  }
 
   private def restartNode(index: Int, offline: Boolean): Node = {
     runtime.stopAndRemoveNode(nodeList(index), secondsToWait = 30)
@@ -500,7 +463,7 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     pendingRestartComplete = true
   }
 
-  it should "restore a nonempty confirmed checkpoint before connecting to peers" in {
+  it should "restore an offline checkpoint and catch up to a payment confirmed during its absence" in {
     assume(pendingRestartComplete, "The preceding pending restart scenario must pass")
     val checkpoint = settled()
     val confirmedHeight = height(nodeList(2))
@@ -514,9 +477,59 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     val restarted = restartReceiver(offline = true)
     assertOfflineCheckpoint(restarted, checkpoint, confirmedHeight, boxes, balance)
 
+    val active = nodeList.take(2)
+    val producer = active.head
+    val tx = payment(producer, spendable(producer).head, 2000000L)
+    submit(producer, tx)
+    active.foreach(n => until("offline catch-up payment propagated")(mempool(n))(_.contains(tx.id)))
+    val inputId = mine(producer, input = true, txs = Seq(tx))
+    assertAppliedInput(inputId, Seq(tx), active)
+    val orderingId = mine(producer, input = false)
+    val frozenCheckpoint = settled(Vector(1, 1), active)
+    frozenCheckpoint._1 shouldBe orderingId
+    val frozenHeight = height(producer)
+    frozenHeight shouldBe confirmedHeight + 1
+    assertConfirmed(orderingId, Seq(tx), active)
+    def confirmedHeader(node: Node): Vector[Byte] = {
+      val json = get(node, s"/blocks/$orderingId/header")
+      field[String](json, "id") shouldBe orderingId
+      val header = json.as[Header].fold(throw _, identity)
+      header.version shouldBe 4.toByte
+      header.id shouldBe orderingId
+      header.bytes.toVector
+    }
+    val frozenHeader = confirmedHeader(producer)
+    val ordered = field[Vector[ErgoTransaction]](get(producer, s"/blocks/$orderingId/transactions"), "transactions")
+    ordered.count(_.id == tx.id) shouldBe 1
+    val spentIds = ordered.flatMap(_.inputs.map(i => Base16.encode(i.boxId))).toSet
+    val terminalOutputs = tx.outputs.filterNot(box => spentIds.contains(Base16.encode(box.id)))
+    terminalOutputs should not be empty
+    val frozenBoxes = walletIds(producer)
+    val frozenBalance = walletBalance(producer)
+    def assertFrozenConfirmed(node: Node): Unit = {
+      confirmedHeader(node) shouldBe frozenHeader
+      val received = field[Vector[ErgoTransaction]](get(node, s"/blocks/$orderingId/transactions"), "transactions")
+      received.map(_.bytes.toVector) shouldBe ordered.map(_.bytes.toVector)
+      tx.inputs.foreach { input =>
+        await(node.singleGet(s"/utxo/byId/${Base16.encode(input.boxId)}", _.setHeader("api_key", "hello"))).getStatusCode shouldBe 404
+      }
+      terminalOutputs.foreach { box =>
+        get(node, s"/utxo/byId/${Base16.encode(box.id)}").as[ErgoBox].fold(throw _, identity) shouldBe box
+      }
+      walletIds(node) shouldBe frozenBoxes
+      walletBalance(node) shouldBe frozenBalance
+      height(node) shouldBe frozenHeight
+      mempool(node) shouldBe empty
+      inputTip(node) shouldBe empty
+      field[Vector[String]](get(node, "/blocks/bestInputChain"), "bestInputBlocks") shouldBe empty
+    }
+    active.foreach(assertFrozenConfirmed)
+    assertOfflineCheckpoint(restarted, checkpoint, confirmedHeight, boxes, balance)
     // Explicit outgoing connections are enabled even with automatic P2P disabled.
-    nodeList.take(2).foreach(connectPeer(restarted, _))
-    settled() shouldBe checkpoint
+    active.foreach(connectPeer(restarted, _))
+    settled() shouldBe frozenCheckpoint
+    nodeList.foreach(assertFrozenConfirmed)
+    assertConfirmed(orderingId, Seq(tx))
     val next = mine(nodeList.head, input = false)
     settled()._1 shouldBe next
   }
@@ -704,19 +717,7 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     until("idle receiver learns both peers' ordering heights") {
       get(receiver, "/peers/syncInfo").asArray.get.map(field[Int](_, "height"))
     }(heights => heights.size == 2 && heights.forall(_ == confirmedHeight))
-    nodeList.foreach { node =>
-      until("existing input tip discovered without new production")(inputTip(node))(_ == frozenTip)
-      until("existing input chain processed after idle reconnection") {
-        get(node, "/blocks/bestInputChain")
-      }(_ == frozenChain)
-      expectedBodies.foreach { case (id, transactions) =>
-        assertInputBody(node, id, transactions)
-      }
-      until("idle receiver wallet converges")(walletIds(node))(_ == expectedBoxes)
-      walletBalance(node) shouldBe openingBalance - fee
-      until("idle receiver mempool converges")(mempool(node))(_.isEmpty)
-      height(node) shouldBe confirmedHeight
-    }
+    assertFrozenInputChain(nodeList, frozenTip, frozenChain, expectedBodies, expectedBoxes, openingBalance - fee, confirmedHeight)
     settled() shouldBe checkpoint
   }
 
@@ -774,17 +775,7 @@ class MatrixLifecycleSpec extends AnyFlatSpec
     field[String](frozenChain, "bestOrdering") shouldBe checkpoint._1
     val expectedBoxes = walletIds(producer)
     // No further production or connections: the relay must replay remotely received processed work.
-    nodeList.foreach { node =>
-      until("frozen tip propagates through the preconnected relay")(inputTip(node))(_ == frozenTip)
-      until("frozen ancestry is fully processed through the relay")(get(node, "/blocks/bestInputChain"))(_ == frozenChain)
-      expectedBodies.foreach { case (id, transactions) =>
-        assertInputBody(node, id, transactions)
-      }
-      until("relay chain wallet converges")(walletIds(node))(_ == expectedBoxes)
-      walletBalance(node) shouldBe openingBalance - fee
-      until("relay chain mempool converges")(mempool(node))(_.isEmpty)
-      height(node) shouldBe confirmedHeight
-    }
+    assertFrozenInputChain(nodeList, frozenTip, frozenChain, expectedBodies, expectedBoxes, openingBalance - fee, confirmedHeight)
     assertLineTopology()
     settled(peerCounts) shouldBe checkpoint
   }
