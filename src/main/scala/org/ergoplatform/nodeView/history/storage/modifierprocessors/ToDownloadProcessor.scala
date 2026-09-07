@@ -96,7 +96,8 @@ trait ToDownloadProcessor
         val fromHeight = commonAncestor
           .map(h => Math.max(minimalFullBlockHeight, h.height + 1))
           .getOrElse(fb.height + 1)
-        val maxHeight = Math.min(fromHeight.toLong + FullBlocksToDownloadAhead - 1L, Int.MaxValue.toLong).toInt
+        // Extending the scan backward must preserve forward progress beyond the existing full-chain tip.
+        val maxHeight = Math.min(fb.height.toLong + FullBlocksToDownloadAhead, Int.MaxValue.toLong).toInt
         continuation(fromHeight, Map.empty, maxHeight)
       case Some(fb) =>
         // when blockchain is about to be synced,
