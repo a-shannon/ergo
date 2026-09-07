@@ -2,10 +2,11 @@ package org.ergoplatform.it
 
 import java.io.File
 import java.util.concurrent.TimeoutException
-import com.typesafe.config.Config
+import com.typesafe.config.{Config, ConfigFactory}
 import io.circe.Json
 import org.ergoplatform.it.api.NodeApi.{NodeInfo, nodeInfoDecoder}
 import org.ergoplatform.it.container.{IntegrationSuite, Node}
+import org.ergoplatform.it.container.Docker.ExtraConfig
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils
 import org.ergoplatform.it.util.ConvergenceObservations
 import org.scalatest.freespec.AnyFreeSpec
@@ -175,14 +176,14 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
       docker.stopNode(minerBGen.containerId)
       clearPeerDatabases()
 
-      val minerAIsolated: Node = docker.startDevNetNode(minerAConfig, isolatedPeersConfig,
+      val minerAIsolated: Node = docker.startDevNetNode(minerAConfig, DeepRollBackSpec.isolatedMiningConfig,
         specialVolumeOpt = Some((localVolumeA, remoteVolumeA))).get
       Async.await(waitForNoPeers("isolated miners started", Seq("A" -> minerAIsolated)))
 
       // 1. Let nodeA mine `chainLength + delta` blocks in isolation
       Async.await(minerAIsolated.waitForHeight(chainLength + delta))
 
-      val minerBIsolated: Node = docker.startDevNetNode(minerBConfig, isolatedPeersConfig,
+      val minerBIsolated: Node = docker.startDevNetNode(minerBConfig, DeepRollBackSpec.isolatedMiningConfig,
         specialVolumeOpt = Some((localVolumeB, remoteVolumeB))).get
       Async.await(waitForNoPeers("isolated miners started",
         Seq("A" -> minerAIsolated, "B" -> minerBIsolated)))
@@ -242,4 +243,10 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
     }
   }
 
+}
+
+private[it] object DeepRollBackSpec {
+  val isolatedMiningConfig: ExtraConfig = { (_, _) =>
+    Some(ConfigFactory.parseString("scorex.network { knownPeers = [], maxConnections = 0 }"))
+  }
 }
