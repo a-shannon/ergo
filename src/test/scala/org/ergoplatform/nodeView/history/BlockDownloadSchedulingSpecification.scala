@@ -50,6 +50,7 @@ class BlockDownloadSchedulingSpecification extends ErgoCorePropertyTest {
 
     private val headersById = (bestChain ++ oldChain :+ maximumHeightHeader).map(h => h.id -> h).toMap
     var traversals: Vector[(Int, ModifierId)] = Vector.empty
+    var heightLookups: Vector[Int] = Vector.empty
     override def bestFullBlockOpt: Option[ErgoFullBlock] = Some(ErgoFullBlock(fullHeader,
       BlockTransactions(fullHeader.id, fullHeader.version, Seq(transaction)), Extension(fullHeader.id, Seq.empty), None))
     override def bestHeaderIdOpt: Option[ModifierId] = Some(bestChain(tipHeight - 1).id)
@@ -57,8 +58,10 @@ class BlockDownloadSchedulingSpecification extends ErgoCorePropertyTest {
     override def minimalFullBlockHeight: Int = minimumHeight
     override def isHeadersChainSynced: Boolean = synced
     override def isInBestChain(id: ModifierId): Boolean = bestChain.exists(_.id == id)
-    override def headerIdsAtHeight(height: Int): Seq[ModifierId] =
+    override def headerIdsAtHeight(height: Int): Seq[ModifierId] = {
+      heightLookups :+= height
       (bestChain :+ maximumHeightHeader).find(_.height == height).map(_.id).toSeq
+    }
     override def typedModifierById[T <: BlockSection : ClassTag](id: ModifierId): Option[T] =
       headersById.get(id).filterNot(h => missingHeader.contains(h.id)).collect { case section: T => section }
     override def headerChainBack(limit: Int, startHeader: Header, until: Header => Boolean): HeaderChain = {
@@ -79,9 +82,9 @@ class BlockDownloadSchedulingSpecification extends ErgoCorePropertyTest {
     reader.traversals shouldBe empty
   }
 
-  property("far-behind downloads begin after a confirmed common ancestor within retention") {
+  property("ancestor scheduling extends backward without shortening the forward window") {
     val reader = new SchedulingReader(oldChain.last, retainedVersions = 40)
-    reader.nextModifiersToDownload(1000, acceptAll) shouldBe expected(reader, 21 to 212)
+    reader.nextModifiersToDownload(1000, acceptAll) shouldBe expected(reader, 21 to 252)
     reader.traversals shouldBe Vector(41 -> oldChain.last.id)
   }
 
@@ -106,21 +109,27 @@ class BlockDownloadSchedulingSpecification extends ErgoCorePropertyTest {
   }
 
   property("ancestor scheduling respects the minimum retained full-block height") {
-    val reader = new SchedulingReader(oldChain.last, minimumHeight = 30)
-    reader.nextModifiersToDownload(1000, acceptAll) shouldBe expected(reader, 30 to 221)
+    Seq(30, 253).foreach { minimumHeight =>
+      val reader = new SchedulingReader(oldChain.last, minimumHeight = minimumHeight)
+      reader.nextModifiersToDownload(1000, acceptAll) shouldBe expected(reader, minimumHeight to 252)
+    }
   }
 
   property("maximum retention does not overflow the traversal bound") {
     val reader = new SchedulingReader(oldChain.last, retainedVersions = Int.MaxValue)
-    reader.nextModifiersToDownload(1000, acceptAll) shouldBe expected(reader, 21 to 212)
+    reader.nextModifiersToDownload(1000, acceptAll) shouldBe expected(reader, 21 to 252)
     reader.traversals shouldBe Vector(60 -> oldChain.last.id)
   }
 
   property("a download window ending at the maximum height terminates without wrapping") {
-    val reader = new SchedulingReader(oldChain.last, minimumHeight = Int.MaxValue)
+    val fullHeader = oldChain.last.copy(height = Int.MaxValue - 191)
+    val reader = new SchedulingReader(fullHeader, minimumHeight = Int.MaxValue) {
+      override def estimatedTip(): Option[Int] = Some(Int.MaxValue)
+    }
     val sections = reader.requiredModifiersForHeader(maximumHeightHeader)
     reader.nextModifiersToDownload(1000, acceptAll) shouldBe
       sections.groupBy(_._1).map { case (kind, entries) => kind -> entries.map(_._2) }
+    reader.heightLookups shouldBe Vector(Int.MaxValue)
   }
 
   property("ancestor scheduling preserves per-type caps and the section filter") {
