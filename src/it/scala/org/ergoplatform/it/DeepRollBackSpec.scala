@@ -47,8 +47,15 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
     .withFallback(nonGeneratingPeerConfig)
     .withFallback(allowLocalConfig)
 
+  private def clearPeerDatabases(): Unit = {
+    Seq(localVolumeA -> remoteVolumeA, localVolumeB -> remoteVolumeB).foreach {
+      case (localVolume, remoteVolume) =>
+        docker.removeFromMountedVolume(localVolume, remoteVolume, "peers")
+    }
+  }
+
   private val observations = new ConvergenceObservations
-  private case class NodeSnapshot(info: Option[NodeInfo])
+  private case class NodeSnapshot(info: Option[NodeInfo], connectedPeers: Option[Int])
   private val probes = scala.collection.mutable.Map.empty[
     Node, (observations.Probe[NodeInfo], observations.Probe[Int])]
 
@@ -92,8 +99,9 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
     val peers = peerProbe.sample(budget).map { result =>
       val summary = result.fold(error => s"errorClass=$error", count => s"connectedPeerCount=$count")
       remember(phase, label, "peers", summary)
+      result.toOption
     }
-    status.zip(peers).map { case (info, _) => NodeSnapshot(info) }
+    status.zip(peers).map { case (info, count) => NodeSnapshot(info, count) }
   }
 
   private def observeNodes(
@@ -103,6 +111,20 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
     budget: FiniteDuration = 5.seconds
   ): Future[(NodeSnapshot, NodeSnapshot)] = {
     snapshot(phase, "A", nodeA, budget).zip(snapshot(phase, "B", nodeB, budget))
+  }
+
+  private def waitForNoPeers(phase: String, nodes: Seq[(String, Node)]): Future[Unit] = {
+    observations.until(30.seconds.fromNow, 1.second, 5.seconds) { budget =>
+      Future.traverse(nodes) { case (label, node) =>
+        snapshot(phase, label, node, budget).map { observed =>
+          require(observed.connectedPeers.forall(_ == 0),
+            s"Isolated miner $label has connected peers; recent observations: $lastObservation")
+          observed
+        }
+      }
+    }(_.forall(_.connectedPeers.contains(0)))(
+      s"Isolated miners did not report zero connected peers; recent observations: $lastObservation"
+    ).map(_ => ())
   }
 
   private def waitForSameBestBlock(
@@ -151,16 +173,19 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
       // 2. Stop all nodes
       docker.stopNode(minerAGen.containerId)
       docker.stopNode(minerBGen.containerId)
+      clearPeerDatabases()
 
       val minerAIsolated: Node = docker.startDevNetNode(minerAConfig, isolatedPeersConfig,
         specialVolumeOpt = Some((localVolumeA, remoteVolumeA))).get
+      Async.await(waitForNoPeers("isolated miners started", Seq("A" -> minerAIsolated)))
 
       // 1. Let nodeA mine `chainLength + delta` blocks in isolation
       Async.await(minerAIsolated.waitForHeight(chainLength + delta))
 
       val minerBIsolated: Node = docker.startDevNetNode(minerBConfig, isolatedPeersConfig,
         specialVolumeOpt = Some((localVolumeB, remoteVolumeB))).get
-      Async.await(observeNodes("isolated miners started", minerAIsolated, minerBIsolated))
+      Async.await(waitForNoPeers("isolated miners started",
+        Seq("A" -> minerAIsolated, "B" -> minerBIsolated)))
 
       // 2. Let nodeB mine `chainLength` blocks in isolation
       Async.await(minerBIsolated.waitForHeight(chainLength, 100.millis))
@@ -169,10 +194,12 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
 
       val minerABestHeight = Async.await(minerAIsolated.fullHeight)
       val minerBBestHeight = Async.await(minerBIsolated.fullHeight)
-      Async.await(observeNodes("isolated mining complete", minerAIsolated, minerBIsolated))
+      Async.await(waitForNoPeers("isolated mining complete",
+        Seq("A" -> minerAIsolated, "B" -> minerBIsolated)))
 
       docker.stopNode(minerAIsolated.containerId)
       docker.stopNode(minerBIsolated.containerId)
+      clearPeerDatabases()
 
       log.info("heightA: " + minerABestHeight)
       log.info("heightB: " + minerBBestHeight)
