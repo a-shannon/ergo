@@ -892,8 +892,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
 
   it should "ignore cached candidate when forced = true" in new TestKit(ActorSystem()) {
     val testProbe = new TestProbe(system)
-    val blockProbe = new TestProbe(system)
-    system.eventStream.subscribe(blockProbe.ref, newBlockSignal)
+    val viewHolderProbe = new TestProbe(system)
 
     val testDir = s"${defaultSettings.directory}-ignore-cache-${System.currentTimeMillis()}"
     val settingsWithShortRegeneration: ErgoSettings =
@@ -906,61 +905,53 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
           directory = testDir
         )
 
-    val viewHolderRef: ActorRef = ErgoNodeViewRef(settingsWithShortRegeneration)
-    val readersHolderRef: ActorRef = ErgoReadersHolderRef(viewHolderRef)
+    // Keep readers fixed: a later ChangedMempool event may legitimately regenerate the cache.
+    val (initialState, boxes) = createUtxoState(settingsWithShortRegeneration)
+    val block = validFullBlock(None, initialState, boxes)
+    val state = initialState.applyModifier(block, None)(_ => ()).get
+    // Initialization computes mining-time averages from pairs of headers.
+    val history = historyWithBestFullBlock(Seq(block))
+    val readers = Readers(history, state, ErgoMemPool.empty(settingsWithShortRegeneration), walletStub)
+    val readersHolderRef = system.actorOf(Props(new FixedReadersHolder(readers)))
 
     val candidateGenerator: ActorRef =
       CandidateGenerator(
         defaultMinerSecret.publicImage,
         readersHolderRef,
-        viewHolderRef,
+        viewHolderProbe.ref,
         settingsWithShortRegeneration
       )
 
-    val powScheme = settingsWithShortRegeneration.chainSettings.powScheme
+    try {
+      // Get first candidate from the coherent, already applied block snapshot.
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), testProbe.ref)
+      val candidate1 = testProbe.expectMsgPF(candidateGenDelay) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      candidate1.candidateBlock.parentOpt.map(_.id) shouldBe Some(block.header.id)
 
-    // First mine a block to establish chain (needed for avg mining time calculation)
-    candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), testProbe.ref)
-    val initCandidate = testProbe.expectMsgPF(candidateGenDelay) {
-      case StatusReply.Success(c: Candidate) => c
+      // Request with forced = false should return cached candidate immediately.
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), testProbe.ref)
+      val candidate2 = testProbe.expectMsgPF(100.millis) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      candidate2 should be theSameInstanceAs candidate1
+      candidate2.candidateBlock.timestamp shouldBe candidate1.candidateBlock.timestamp
+
+      // Request with forced = true should bypass cache and regenerate.
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = true), testProbe.ref)
+      val candidate3 = testProbe.expectMsgPF(candidateGenDelay) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+
+      // Identity proves regeneration even when the clock has not advanced.
+      candidate3 should not be theSameInstanceAs(candidate1)
+      candidate3.candidateBlock.parentOpt.map(_.id) shouldBe Some(block.header.id)
+    } finally {
+      TestKit.shutdownActorSystem(system)
+      history.closeStorage()
+      state.closeStorage()
     }
-    val initBlock = powScheme
-      .proveCandidate(initCandidate.candidateBlock, defaultMinerSecret.w, 0, 1000)
-      .get
-    candidateGenerator.tell(initBlock.header.powSolution, testProbe.ref)
-    testProbe.expectMsg(blockValidationDelay, StatusReply.success(()))
-    blockProbe.fishForMessage(blockValidationDelay) {
-      case FullBlockApplied(header) if header.id == initBlock.header.id => true
-      case _ => false
-    }
-
-    // Get first candidate after chain is established
-    candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), testProbe.ref)
-    val candidate1 = testProbe.expectMsgPF(candidateGenDelay) {
-      case StatusReply.Success(c: Candidate) => c
-    }
-
-    // Request with forced = false should return cached candidate immediately
-    candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), testProbe.ref)
-    val candidate2 = testProbe.expectMsgPF(100.millis) {
-      case StatusReply.Success(c: Candidate) => c
-    }
-    // Should be the exact same cached candidate
-    candidate2.candidateBlock.timestamp shouldBe candidate1.candidateBlock.timestamp
-
-    // Request with forced = true should bypass cache and regenerate
-    candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = true), testProbe.ref)
-    val candidate3 = testProbe.fishForMessage(candidateGenDelay) {
-      case StatusReply.Success(_: Candidate) => true
-      case _: FullBlockApplied => false
-    } match {
-      case StatusReply.Success(c: Candidate) => c
-    }
-
-    // candidate3 should have timestamp >= candidate1 (regenerated, possibly same or newer)
-    candidate3.candidateBlock.timestamp should be >= candidate1.candidateBlock.timestamp
-
-    system.terminate()
   }
 
   it should "preserve previous candidate when forced regeneration occurs" in new TestKit(ActorSystem()) {
