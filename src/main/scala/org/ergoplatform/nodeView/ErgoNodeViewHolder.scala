@@ -686,6 +686,10 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
       txModify(unconfirmedTx) match {
         case _: ProcessingOutcome.Accepted =>
           log.info(s"Unconfirmed wallet transaction ${unconfirmedTx.id} is back in the memory pool")
+        case _: ProcessingOutcome.Declined | _: ProcessingOutcome.DoubleSpendingLoser =>
+          // Local admission policy can change; keep the original record for a later startup.
+          log.info(s"Deferring restoration of unconfirmed wallet transaction ${unconfirmedTx.id}; " +
+            "keeping it for a later startup")
         case outcome =>
           // the transaction can not be brought back, e.g. it got on the blockchain while the node
           // was down, or a conflicting one did. There is no point in keeping it for the next restart
