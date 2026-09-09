@@ -38,18 +38,14 @@ object ErgoWalletActorMessages {
   // Publicly available signals for the wallet actor
 
   /**
-   * Command to scan offchain transaction
-   *
-   * @param tx - offchain transaction
-   */
-  final case class ScanOffChain(tx: ErgoTransaction)
-
-  /**
    * Command to scan a block
    *
    * @param block - block to scan
    */
   final case class ScanOnChain(block: ErgoFullBlock)
+
+  /** Record an accepted wallet-related transaction without adding projected outputs. */
+  final case class ScanOffChain(tx: ErgoTransaction)
 
   /**
    * Read wallet-related transactions which were not on the blockchain yet when the node was stopped,

@@ -126,7 +126,7 @@ class ErgoWalletActor(settings: ErgoSettings,
       val walletDigest = if (chainStatus.onChain) {
         state.registry.fetchDigest()
       } else {
-        state.offChainRegistry.digest
+        state.offChainDigest
       }
       val res = if (settings.walletSettings.checkEIP27) {
         // If re-emission token in the wallet, subtract it from ERG balance
@@ -225,24 +225,25 @@ class ErgoWalletActor(settings: ErgoSettings,
       }
 
     /* SCAN COMMANDS */
-    //scan mempool transaction
+    // Persist accepted transactions independently of the current-mempool projection.
     case ScanOffChain(tx) =>
       val (newState, walletAffected) = ergoWalletService.scanOffChainUpdate(state, tx)
       if (walletAffected) {
         // the transaction is kept until it gets on the blockchain, so that a restart in the meantime
         // does not make the wallet consider its inputs spendable again
         state.storage.addUnconfirmedTransaction(tx, state.fullHeight) match {
-          case Success(_) =>
+          case Success(_) => context.become(loadedWallet(newState.copy()))
           case Failure(t) => log.error(s"Could not store unconfirmed transaction ${tx.id}: ", t)
         }
       }
-      context.become(loadedWallet(newState))
 
     case ReadUnconfirmedTransactions =>
-      sender() ! unconfirmedTransactionsToRestore(state)
+      val (transactions, refreshed) = unconfirmedTransactionsToRestore(state)
+      context.become(loadedWallet(refreshed))
+      sender() ! transactions
 
     case ForgetUnconfirmedTransactions(ids) =>
-      forgetUnconfirmedTransactions(state, ids)
+      context.become(loadedWallet(forgetUnconfirmedTransactions(state, ids)))
 
     // rescan=true means we serve a user request for rescan from arbitrary height
     case ScanInThePast(blockHeight, rescan) =>
@@ -260,7 +261,6 @@ class ErgoWalletActor(settings: ErgoSettings,
                   state.copy(error = Some(errorMsg))
                 case Success(updatedState) =>
                   forgetConfirmedAndExpired(updatedState, block)
-                  updatedState
               }
             case None =>
               state // We may do not have a block if, for example, the blockchain is pruned. This is okay, just skip it.
@@ -288,7 +288,6 @@ class ErgoWalletActor(settings: ErgoSettings,
                 state.copy(error = Some(errorMsg))
               case Success(updatedState) =>
                 forgetConfirmedAndExpired(updatedState, newBlock)
-                updatedState
             }
           context.become(loadedWallet(newState))
         } else if (nextBlockHeight < newBlock.height) {
@@ -309,7 +308,6 @@ class ErgoWalletActor(settings: ErgoSettings,
             context.become(loadedWallet(state.copy(error = Some(errorMsg))))
           case _: Success[Unit] =>
             // Reset outputs Bloom filter to have it initialized again on next block scanned
-            // todo: for offchain registry, refresh is also needed, https://github.com/ergoplatform/ergo/issues/1180
             context.become(loadedWallet(state.copy(outputsFilter = None)))
         }
       } else {
@@ -508,21 +506,21 @@ class ErgoWalletActor(settings: ErgoSettings,
     * Stored unconfirmed transactions worth putting back into the memory pool. Transactions which did
     * not make it onto the blockchain for too long are dropped instead of being re-submitted forever.
     */
-  private def unconfirmedTransactionsToRestore(state: ErgoWalletState): Seq[ErgoTransaction] = {
+  private def unconfirmedTransactionsToRestore(state: ErgoWalletState): (Seq[ErgoTransaction], ErgoWalletState) = {
     val (fresh, expired) = state.storage.readUnconfirmedTransactions().partition { case (_, seenAt) =>
       state.fullHeight - seenAt <= WalletStorage.UnconfirmedTxLifetimeInBlocks
     }
-    if (expired.nonEmpty) {
+    val refreshed = if (expired.nonEmpty) {
       forgetUnconfirmedTransactions(state, expired.map(_._1.id))
-    }
-    ErgoWalletActor.orderByDependency(fresh.map(_._1))
+    } else state
+    (ErgoWalletActor.orderByDependency(fresh.map(_._1)), refreshed)
   }
 
   /**
     * Drop the transactions of a just applied block from the store, and give up on the ones which
     * stayed unconfirmed for longer than [[WalletStorage.UnconfirmedTxLifetimeInBlocks]] blocks.
     */
-  private def forgetConfirmedAndExpired(state: ErgoWalletState, block: ErgoFullBlock): Unit = {
+  private def forgetConfirmedAndExpired(state: ErgoWalletState, block: ErgoFullBlock): ErgoWalletState = {
     val seenAtHeights = state.storage.unconfirmedTransactionHeights
     if (seenAtHeights.nonEmpty) {
       val confirmed = block.transactions.map(_.id).filter(seenAtHeights.contains)
@@ -535,14 +533,16 @@ class ErgoWalletActor(settings: ErgoSettings,
       val toForget = (confirmed ++ expired).distinct
       if (toForget.nonEmpty) {
         forgetUnconfirmedTransactions(state, toForget)
-      }
-    }
+      } else state
+    } else state
   }
 
-  private def forgetUnconfirmedTransactions(state: ErgoWalletState, ids: Seq[ModifierId]): Unit = {
+  private def forgetUnconfirmedTransactions(state: ErgoWalletState, ids: Seq[ModifierId]): ErgoWalletState = {
     state.storage.removeUnconfirmedTransactions(ids) match {
-      case Success(_) =>
-      case Failure(t) => log.error("Could not forget unconfirmed transactions: ", t)
+      case Success(_) => state.copy()
+      case Failure(t) =>
+        log.error("Could not forget unconfirmed transactions: ", t)
+        state
     }
   }
 
@@ -563,9 +563,8 @@ object ErgoWalletActor extends ScorexLogging {
   /**
     * Order transactions so that a transaction spending an output of another one comes after it.
     *
-    * Unconfirmed transactions do form such chains, and both consumers of this ordering need it: the
-    * off-chain registry only nets a spending out if it has seen the box being spent already, and the
-    * memory pool refuses a transaction whose inputs it does not know yet.
+    * Unconfirmed transactions do form such chains: the memory pool refuses a transaction whose
+    * inputs it does not know yet. Input reservations themselves are independent of replay order.
     *
     * Transactions with no producer among `txs` keep their relative order. A cycle is impossible
     * between valid transactions, but should one be given, its members are appended unordered rather
