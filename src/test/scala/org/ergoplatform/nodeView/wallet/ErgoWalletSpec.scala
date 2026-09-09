@@ -1965,6 +1965,10 @@ class ErgoWalletSpec extends ErgoCorePropertyTest with WalletTestOps with Mempoo
       scanner.expectNoMessage(300.millis)
       client.send(actor, ScanOffChain(spendingTx))
       client.send(actor, ReadBalances(ChainStatus.OffChain))
+      client.expectMsgType[WalletDigest].walletBalance shouldBe 0L
+      client.send(actor, ChangedMempool(new FakeMempool(Seq(
+        UnconfirmedTransaction(spendingTx, None)))))
+      client.send(actor, ReadBalances(ChainStatus.OffChain))
       client.expectMsgType[WalletDigest].walletBalance shouldBe changeValue
 
       client.send(actor, ChangedMempool(new FakeMempool(Seq.empty)))
@@ -6286,6 +6290,8 @@ class ErgoWalletSpec extends ErgoCorePropertyTest with WalletTestOps with Mempoo
       directory,
       strictHistoryReader(),
       sourceIdentity = Some(_ => Success(source)),
+      // This metadata-only reader has no concrete UTXO overlay; retain a fresh final state.
+      utxoStateUpdate = Some((state, _) => state.copy()),
       registryTip = Some(_ => Success(status.snapshotHeight -> Some(snapshotId))),
       currentStateTip = Some(_ => Success(status.snapshotHeight -> Some(snapshotId))),
       bestHeaderId = Some(_ => Success(Some(snapshotId))),
