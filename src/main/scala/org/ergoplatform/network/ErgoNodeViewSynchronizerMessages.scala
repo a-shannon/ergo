@@ -54,11 +54,11 @@ object ErgoNodeViewSynchronizerMessages {
     case class ChangedState(reader: ErgoStateReader) extends NodeViewChange
 
     /**
-     * Event emitted after UTXO state has been reconstructed from a local UTXO set snapshot.
+     * Event emitted after the configured state has been reconstructed from a local UTXO set snapshot.
      */
     case class UtxoSnapshotAppliedToState(blockHeight: Height,
                                            blockId: ModifierId,
-                                           stateReader: UtxoStateReader) extends NodeViewHolderEvent
+                                           stateReader: ErgoStateReader) extends NodeViewHolderEvent
 
     /**
       * Event emitted when a fully downloaded UTXO snapshot cannot be restored into state.

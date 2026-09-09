@@ -697,7 +697,7 @@ class ErgoWalletActor(settings: ErgoSettings,
     val preparedState: ErgoWalletState,
     val expected: UtxoSnapshotScanInvalidation,
     val freshStatus: UtxoSnapshotScanStatus,
-    val stateReader: UtxoStateReader)
+    val stateReader: ErgoStateReader)
 
   private def requireUtxoSnapshotRecovery(condition: Boolean,
                                           message: => String): Try[Unit] =
@@ -707,7 +707,7 @@ class ErgoWalletActor(settings: ErgoSettings,
     state: ErgoWalletState,
     snapshotHeight: Height,
     snapshotBlockId: ModifierId,
-    stateReader: UtxoStateReader): Try[UtxoSnapshotRecoveryPlan] = {
+    stateReader: ErgoStateReader): Try[UtxoSnapshotRecoveryPlan] = {
     for {
       quarantine <- utxoSnapshotQuarantine match {
         case Some(current) => Success(current)
@@ -785,7 +785,7 @@ class ErgoWalletActor(settings: ErgoSettings,
       preparedState = state.copy(
         walletVars = updatedWalletVars,
         stateReaderOpt = Some(reader),
-        utxoStateReaderOpt = Some(reader),
+        utxoStateReaderOpt = Option(reader).collect { case utxo: UtxoStateReader => utxo },
         parameters = currentParameters,
         rescanInProgress = false)
       freshStatus = UtxoSnapshotScanStatus(
@@ -834,7 +834,7 @@ class ErgoWalletActor(settings: ErgoSettings,
         outputsFilter = None,
         walletVars = plan.preparedState.walletVars,
         stateReaderOpt = Some(plan.stateReader),
-        utxoStateReaderOpt = Some(plan.stateReader),
+        utxoStateReaderOpt = Option(plan.stateReader).collect { case utxo: UtxoStateReader => utxo },
         parameters = plan.preparedState.parameters).materializeOffChainState()
     }
   }
@@ -861,7 +861,7 @@ class ErgoWalletActor(settings: ErgoSettings,
     state: ErgoWalletState,
     snapshotHeight: Height,
     snapshotBlockId: ModifierId,
-    stateReader: UtxoStateReader,
+    stateReader: ErgoStateReader,
     replyTo: ActorRef): Unit = {
     prepareUtxoSnapshotRecovery(state, snapshotHeight, snapshotBlockId, stateReader) match {
       case Failure(t) =>
@@ -945,9 +945,8 @@ class ErgoWalletActor(settings: ErgoSettings,
         state.storage.readUtxoSnapshotWalletOriginTry() == Success(None)
 
     if (eligible) {
-      state.utxoStateReaderOpt
-        .orElse(state.stateReaderOpt.collect { case reader: UtxoStateReader => reader })
-        .foreach { reader =>
+      state.stateReaderOpt.orElse(state.utxoStateReaderOpt)
+        .foreach { _ =>
           state.registry.isPristineForUtxoSnapshot match {
             case Failure(t) =>
               enterUtxoSnapshotQuarantine(
