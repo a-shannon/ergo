@@ -41,6 +41,15 @@ case class ErgoWalletState(
   }
 
   /**
+    * Inputs reserved by durable transactions awaiting a later admission attempt. These records do
+    * not contribute outputs or balances. A fresh state after an acknowledged record mutation
+    * recomputes this set once, rather than reading the transaction bucket for every candidate box.
+    */
+  lazy val persistedInputIds: Set[ModifierId] =
+    storage.readUnconfirmedTransactions().iterator.flatMap(_._1.inputs.iterator)
+      .map(input => bytesToId(input.boxId)).toSet
+
+  /**
     * Wallet- and external-scan outputs created by current mempool transactions, excluding boxes that
     * are already confirmed on-chain (so a transaction being included in a block is not counted both as
     * confirmed and off-chain). Boxes already spent by other mempool transactions are retained here,
@@ -119,7 +128,10 @@ case class ErgoWalletState(
     val bid = trackedBox.box.id
 
     // box is not spent yet by inputs of mempool transactions
-    def notInInputs: Boolean = !mempoolSpentIds.contains(bytesToId(bid))
+    def notInInputs: Boolean = {
+      val id = bytesToId(bid)
+      !mempoolSpentIds.contains(id) && !persistedInputIds.contains(id)
+    }
 
     // box exists in UTXO set or in outputs of an off-chain transaction
     def inOutputs: Boolean = {

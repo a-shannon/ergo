@@ -220,6 +220,19 @@ trait ErgoWalletService {
   def scanBlockUpdate(state: ErgoWalletState, block: ErgoFullBlock, dustLimit: Option[Long]): Try[ErgoWalletState]
 
   /**
+    * Identify an accepted transaction for durable recording. The projected state is unchanged.
+    *
+    * @return the same state, and whether the transaction is of any interest to the wallet, that
+    *         is whether it pays the wallet or spends one of its boxes
+    */
+  def scanOffChainUpdate(state: ErgoWalletState, tx: ErgoTransaction): (ErgoWalletState, Boolean)
+
+  /**
+    * Refresh persisted input reservations on startup without projecting absent mempool outputs.
+    */
+  def restoreOffChainState(state: ErgoWalletState): ErgoWalletState
+
+  /**
     * Sign a transaction
     */
   def signTransaction(proverOpt: Option[ErgoProvingInterpreter],
@@ -596,6 +609,26 @@ class ErgoWalletServiceImpl(override val ergoSettings: ErgoSettings) extends Erg
         ergoSettings.walletSettings.walletProfile).map { case (reg, updatedOutputsFilter) =>
         state.copy(registry = reg, outputsFilter = Some(updatedOutputsFilter))
       }
+
+  override def scanOffChainUpdate(state: ErgoWalletState, tx: ErgoTransaction): (ErgoWalletState, Boolean) = {
+    val dustLimit = ergoSettings.walletSettings.dustLimit
+    val newWalletBoxes = WalletScanLogic.extractWalletOutputs(tx, None, state.walletVars, dustLimit)
+    val inputs = WalletScanLogic.extractInputBoxes(tx)
+
+    def spendsWalletBox: Boolean =
+      tx.inputs.exists(input => state.registry.getBox(input.boxId).isDefined) ||
+        state.rawOffChainBoxes.exists(box => inputs.contains(box.boxId)) ||
+        state.storage.readUnconfirmedTransactions().exists { case (parent, _) =>
+          WalletScanLogic.extractWalletOutputs(parent, None, state.walletVars, dustLimit)
+            .exists(box => inputs.contains(box.boxId))
+        }
+
+    (state, newWalletBoxes.nonEmpty || spendsWalletBox)
+  }
+
+  override def restoreOffChainState(state: ErgoWalletState): ErgoWalletState = {
+    state.copy()
+  }
 
   override def updateUtxoState(state: ErgoWalletState): ErgoWalletState = {
     (state.mempoolReaderOpt, state.stateReaderOpt) match {

@@ -575,4 +575,121 @@ class ErgoWalletServiceSpec
     }
   }
 
+  /**
+    * An on-chain, unspent box of the wallet, and a transaction spending it which stays unconfirmed.
+    */
+  private def walletBoxAndSpendingTx(registry: WalletRegistry): (TrackedBox, ErgoTransaction) = {
+    val walletBox = TrackedBox(
+      creationTxId = modifierIdGen.sample.get,
+      creationOutIndex = 0,
+      inclusionHeightOpt = Some(100),
+      spendingTxIdOpt = None,
+      spendingHeightOpt = None,
+      box = testBox(1000000000L, pks.head.script, 100),
+      scans = Set(PaymentsScanId)
+    )
+    registry.updateOnBlock(
+      ScanResults(Seq(walletBox), ArraySeq.empty, ArraySeq.empty), modifierIdGen.sample.get, blockHeight = 100).get
+
+    val spendingTx = ErgoTransaction(
+      IndexedSeq(Input(walletBox.box.id, emptyProverResult)),
+      IndexedSeq(new ErgoBoxCandidate(walletBox.box.value, TrueTree, creationHeight = 100))
+    )
+    walletBox -> spendingTx
+  }
+
+  property("a box spent by an unconfirmed transaction is not offered for spending again") {
+    withVersionedStore(2) { versionedStore =>
+      withStore { store =>
+        val walletService = new ErgoWalletServiceImpl(settings)
+        val wState = initialState(store, versionedStore)
+        val (walletBox, spendingTx) = walletBoxAndSpendingTx(wState.registry)
+
+        val onChain = wState
+        onChain.walletFilter(walletBox) shouldBe true
+
+        // the spending transaction pays a script the wallet does not track, so the only reason for
+        // the wallet to care about it is that it spends one of its boxes
+        val (offChain, walletAffected) = walletService.scanOffChainUpdate(onChain, spendingTx)
+        walletAffected shouldBe true
+        // Relevance detection does not publish either a projection or a durable reservation.
+        offChain.walletFilter(walletBox) shouldBe true
+        offChain.storage.addUnconfirmedTransaction(spendingTx, seenAtHeight = 100).get
+        offChain.copy().walletFilter(walletBox) shouldBe false
+        offChain.rawOffChainBoxes shouldBe empty
+      }
+    }
+  }
+
+  property("stored unconfirmed transactions reserve inputs on restart without projected outputs") {
+    withVersionedStore(2) { versionedStore =>
+      withStore { store =>
+        val walletService = new ErgoWalletServiceImpl(settings)
+        val wState = initialState(store, versionedStore)
+        val (walletBox, spendingTx) = walletBoxAndSpendingTx(wState.registry)
+
+        wState.storage.addUnconfirmedTransaction(spendingTx, seenAtHeight = 100).get
+
+        // The persisted input reservation applies even before a current mempool reader arrives.
+        val restarted = initialState(store, versionedStore)
+        restarted.walletFilter(walletBox) shouldBe false
+        restarted.rawOffChainBoxes shouldBe empty
+
+        walletService.restoreOffChainState(restarted).walletFilter(walletBox) shouldBe false
+      }
+    }
+  }
+
+  property("a restored unconfirmed transaction is dropped once it gets on the blockchain") {
+    withVersionedStore(2) { versionedStore =>
+      withStore { store =>
+        val walletService = new ErgoWalletServiceImpl(settings)
+        val wState = initialState(store, versionedStore)
+        val (_, spendingTx) = walletBoxAndSpendingTx(wState.registry)
+
+        wState.storage.addUnconfirmedTransaction(spendingTx, seenAtHeight = 100).get
+        wState.storage.unconfirmedTransactionHeights shouldBe Map(spendingTx.id -> 100)
+
+        wState.storage.removeUnconfirmedTransactions(Seq(spendingTx.id)).get
+        wState.storage.readUnconfirmedTransactions() shouldBe empty
+
+        // nothing left to replay, so the state comes back untouched
+        val restarted = initialState(store, versionedStore)
+        walletService.restoreOffChainState(restarted) shouldBe restarted
+      }
+    }
+  }
+
+  property("chained unconfirmed transactions are replayed parent first") {
+    withVersionedStore(2) { versionedStore =>
+      withStore { store =>
+        val walletService = new ErgoWalletServiceImpl(settings)
+        val wState = initialState(store, versionedStore)
+        val (walletBox, parentTx) = walletBoxAndSpendingTx(wState.registry)
+
+        // a child spending the output of the parent, stored - and hence read back - in the wrong order
+        val childTx = ErgoTransaction(
+          IndexedSeq(Input(parentTx.outputs.head.id, emptyProverResult)),
+          IndexedSeq(new ErgoBoxCandidate(parentTx.outputs.head.value, TrueTree, creationHeight = 100))
+        )
+        ErgoWalletActor.orderByDependency(Seq(childTx, parentTx)).map(_.id) shouldBe Seq(parentTx.id, childTx.id)
+
+        wState.storage.addUnconfirmedTransaction(childTx, seenAtHeight = 100).get
+        wState.storage.addUnconfirmedTransaction(parentTx, seenAtHeight = 100).get
+
+        val restarted = initialState(store, versionedStore)
+        walletService.restoreOffChainState(restarted).walletFilter(walletBox) shouldBe false
+      }
+    }
+  }
+
+  property("orderByDependency keeps independent transactions in order and tolerates cycles") {
+    forAll(Gen.nonEmptyListOf(validErgoTransactionGen)) { generated =>
+      // transactions generated independently spend boxes none of them creates
+      val txs = generated.map(_._2)
+      ErgoWalletActor.orderByDependency(txs).map(_.id) shouldBe txs.map(_.id)
+      ErgoWalletActor.orderByDependency(Seq.empty) shouldBe Seq.empty
+    }
+  }
+
 }
