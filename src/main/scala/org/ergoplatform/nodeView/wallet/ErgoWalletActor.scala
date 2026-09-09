@@ -259,6 +259,7 @@ class ErgoWalletActor(settings: ErgoSettings,
                   log.error(errorMsg, ex)
                   state.copy(error = Some(errorMsg))
                 case Success(updatedState) =>
+                  forgetConfirmedAndExpired(updatedState, block)
                   updatedState
               }
             case None =>
@@ -286,9 +287,9 @@ class ErgoWalletActor(settings: ErgoSettings,
                 log.error(errorMsg, ex)
                 state.copy(error = Some(errorMsg))
               case Success(updatedState) =>
+                forgetConfirmedAndExpired(updatedState, newBlock)
                 updatedState
             }
-          forgetConfirmedAndExpired(newState, newBlock)
           context.become(loadedWallet(newState))
         } else if (nextBlockHeight < newBlock.height) {
           log.warn(s"Wallet: skipped blocks found starting from $nextBlockHeight, going back to scan them")
