@@ -95,7 +95,9 @@ class UtxoBootstrapToDownloadSpecification extends ErgoCorePropertyTest with Fil
       val directory = createTempDir
       val stateSettings = org.ergoplatform.utils.ErgoNodeTestConstants.settings.copy(directory = directory.getAbsolutePath)
       val boxes = boxesHolderGenOfSize(1024).sample.get
-      val state = UtxoState.fromBoxHolder(boxes, None, new File(directory, "state"), stateSettings, parameters)
+      val stateDirectory = new File(directory, "state")
+      stateDirectory.mkdir() shouldBe true
+      val state = UtxoState.fromBoxHolder(boxes, None, stateDirectory, stateSettings, parameters)
       try {
         state.dumpSnapshot(header.height, state.rootDigest.dropRight(1))
         val manifestId = state.snapshotsDb.readSnapshotsInfo.availableManifests(header.height)
