@@ -14,7 +14,7 @@ import org.ergoplatform.nodeView.mempool.ErgoMemPoolReader
 import org.ergoplatform.nodeView.state.{ErgoStateContext, ErgoStateReader, UtxoStateReader}
 import org.ergoplatform.nodeView.wallet.ErgoWalletService._
 import org.ergoplatform.nodeView.wallet.ErgoWalletServiceUtils.DeriveNextKeyResult
-import org.ergoplatform.nodeView.wallet.persistence.{OffChainRegistry, UtxoSnapshotChunkIntegrityException, UtxoSnapshotScanInvalidation, UtxoSnapshotScanStatus, UtxoSnapshotWalletOrigin, WalletRollbackIntent, WalletStorage}
+import org.ergoplatform.nodeView.wallet.persistence.{UtxoSnapshotChunkIntegrityException, UtxoSnapshotScanInvalidation, UtxoSnapshotScanStatus, UtxoSnapshotWalletOrigin, WalletRollbackIntent, WalletStorage}
 import org.ergoplatform.sdk.wallet.secrets.DerivationPath
 import org.ergoplatform.settings._
 import org.ergoplatform.wallet.Constants.ScanId
@@ -348,8 +348,7 @@ class ErgoWalletActor(settings: ErgoSettings,
           log.info(s"Wallet is scanning mandatory post-snapshot block ${block.id} at height ${block.height}")
           Try(ergoWalletService.scanBlockUpdate(state, block, settings.walletSettings.dustLimit)).flatten.flatMap { updatedState =>
             if (updatedState.getWalletHeight >= height) {
-              forgetConfirmedAndExpired(updatedState, block)
-              Success(updatedState)
+              Success(forgetConfirmedAndExpired(updatedState, block))
             } else fail(
               s"Mandatory wallet catch-up at height $height left the wallet at " +
                 s"height ${updatedState.getWalletHeight}")
@@ -459,16 +458,18 @@ class ErgoWalletActor(settings: ErgoSettings,
     state.registry.rollbackVersionIds
 
   private def reconcileAfterWalletRollback(state: ErgoWalletState): Try[ErgoWalletState] =
-    Try(ergoWalletService.reconcileOffChainRegistry(
-      state.copy(outputsFilter = None, error = None),
-      settings.walletSettings.dustLimit))
+    Try {
+      val reconciled = ergoWalletService.reconcileOffChainRegistry(
+        state.copy(outputsFilter = None, error = None), settings.walletSettings.dustLimit)
+      ergoWalletService.updateUtxoState(reconciled).materializeOffChainState()
+    }
 
   private def reconcileAfterMandatoryWalletCatchUp(
     state: ErgoWalletState): Try[ErgoWalletState] =
     Try {
       val reconciledState = ergoWalletService.reconcileOffChainRegistry(
         state, settings.walletSettings.dustLimit)
-      ergoWalletService.updateUtxoState(reconciledState)
+      ergoWalletService.updateUtxoState(reconciledState).materializeOffChainState()
     }
 
   protected[wallet] def removeUtxoSnapshotScanStatus(state: ErgoWalletState): Try[Unit] =
@@ -830,12 +831,11 @@ class ErgoWalletActor(settings: ErgoSettings,
       require(!(transferredState.registry eq plan.preparedState.registry),
         "UTXO snapshot registry recreation did not replace the consumed registry")
       installedState.copy(
-        offChainRegistry = OffChainRegistry.init(transferredState.registry),
         outputsFilter = None,
         walletVars = plan.preparedState.walletVars,
         stateReaderOpt = Some(plan.stateReader),
         utxoStateReaderOpt = Some(plan.stateReader),
-        parameters = plan.preparedState.parameters)
+        parameters = plan.preparedState.parameters).materializeOffChainState()
     }
   }
 
@@ -1464,9 +1464,10 @@ class ErgoWalletActor(settings: ErgoSettings,
     cleanupAttempt: Int): Unit = {
     val completionTry = for {
       reconciledState <- reconcileAfterMandatoryWalletCatchUp(state)
-      _ <- reconciledState.storage.completeUtxoSnapshotScan(status)
-      _ <- Try(removeUtxoSnapshotScanStatus(reconciledState)).flatten
-    } yield reconciledState
+      completedState <- Try(reconciledState.copy(error = None, rescanInProgress = false).materializeOffChainState())
+      _ <- completedState.storage.completeUtxoSnapshotScan(status)
+      _ <- Try(removeUtxoSnapshotScanStatus(completedState)).flatten
+    } yield completedState
 
     completionTry match {
       case Failure(t) =>
@@ -1490,11 +1491,10 @@ class ErgoWalletActor(settings: ErgoSettings,
         blockedUtxoSnapshotCatchUp = None
         deferredSnapshotBlock = None
         deferredRollbackReconciliationBlocks = Map.empty
-        val completedState = reconciledState.copy(error = None, rescanInProgress = false)
         val origin = UtxoSnapshotWalletOrigin(
           status.snapshotHeight, status.snapshotBlockId, status.scanDefinition)
         startUtxoSnapshotSourceCleanup(origin)
-        context.become(loadedWallet(completedState))
+        context.become(loadedWallet(reconciledState))
     }
   }
 
@@ -1784,7 +1784,6 @@ class ErgoWalletActor(settings: ErgoSettings,
     pendingWalletCatchUpTarget = None
     log.error(reason, cause)
     context.become(loadedWallet(state.copy(
-      offChainRegistry = OffChainRegistry.empty,
       outputsFilter = None,
       mempoolReaderOpt = if (clearFreshMempool) None else state.mempoolReaderOpt,
       error = Some(reason),
@@ -1924,7 +1923,6 @@ class ErgoWalletActor(settings: ErgoSettings,
     pendingWalletCatchUpTarget = None
     log.warn(reason)
     context.become(loadedWallet(state.copy(
-      offChainRegistry = OffChainRegistry.empty,
       outputsFilter = None,
       mempoolReaderOpt = request.freshMempoolReader,
       error = Some(reason),
@@ -1944,7 +1942,6 @@ class ErgoWalletActor(settings: ErgoSettings,
     rollbackFailureRequiresRestart = false
     log.warn(quarantineReason)
     context.become(loadedWallet(state.copy(
-      offChainRegistry = OffChainRegistry.empty,
       outputsFilter = None,
       mempoolReaderOpt = None,
       error = Some(quarantineReason),
@@ -2147,7 +2144,8 @@ class ErgoWalletActor(settings: ErgoSettings,
   private def finishWalletRollbackRecovery(
     state: ErgoWalletState,
     intent: WalletRollbackIntent): Unit = {
-    val recoveredState = ergoWalletService.updateUtxoState(state.copy(error = None))
+    // This exact instance was reconciled and materialized before clearing the durable intent.
+    val recoveredState = state
     val pendingBlocks = deferredRollbackReconciliationBlocks
       .filter { case (height, _) => height > recoveredState.getWalletHeight }
     val highestPendingBlock = pendingBlocks.toSeq.sortBy(_._1).lastOption
@@ -2292,7 +2290,7 @@ class ErgoWalletActor(settings: ErgoSettings,
     Try {
       val reconciled = ergoWalletService.reconcileOffChainRegistry(
         candidate, settings.walletSettings.dustLimit)
-      ergoWalletService.updateUtxoState(reconciled)
+      ergoWalletService.updateUtxoState(reconciled).materializeOffChainState()
     } match {
       case Success(reconciled) =>
         operationalMempoolReconciliationQuarantine = None
@@ -2303,7 +2301,6 @@ class ErgoWalletActor(settings: ErgoSettings,
         operationalMempoolReconciliationQuarantine = Some(reason)
         log.error(reason, t)
         context.become(loadedWallet(state.copy(
-          offChainRegistry = OffChainRegistry.empty,
           outputsFilter = None,
           mempoolReaderOpt = Some(mempoolReader),
           utxoStateReaderOpt = None,
@@ -2362,7 +2359,11 @@ class ErgoWalletActor(settings: ErgoSettings,
     if (pendingCurrentWalletViewRequest.isEmpty && !currentWalletViewApplicationInProgress) {
       walletRestorationRegistration.collect { case (requestId, holder, false) =>
         walletRestorationRegistration = Some((requestId, holder, true))
-        holder.tell(WalletTransactionsForRestoration(requestId, Try(unconfirmedTransactionsToRestore(state))), self)
+        val result = Try(unconfirmedTransactionsToRestore(state)).map { case (transactions, refreshed) =>
+          context.become(loadedWallet(refreshed.materializeOffChainState()))
+          transactions
+        }
+        holder.tell(WalletTransactionsForRestoration(requestId, result), self)
       }
       ()
     }
@@ -2769,7 +2770,7 @@ class ErgoWalletActor(settings: ErgoSettings,
       val walletDigest = if (chainStatus.onChain) {
         state.registry.fetchDigest()
       } else {
-        state.offChainRegistry.digest
+        state.offChainDigest
       }
       val res = if (settings.walletSettings.checkEIP27) {
         // If re-emission token in the wallet, subtract it from ERG balance
@@ -2862,12 +2863,21 @@ class ErgoWalletActor(settings: ErgoSettings,
               state.walletVars
           }
           val updState = state.copy(stateReaderOpt = Some(s), parameters = cp, walletVars = newWalletVars)
-          val newState = ergoWalletService.updateUtxoState(updState)
-          if (startupNoIntentAlignmentPending) {
-            alignWalletAtStartup(newState)
-          } else {
-            resumeOrStartUtxoSnapshotScan(newState)
-            if (utxoSnapshotQuarantine.isEmpty) context.become(loadedWallet(newState))
+          Try(ergoWalletService.updateUtxoState(updState).materializeOffChainState()) match {
+            case Success(newState) =>
+              if (startupNoIntentAlignmentPending) {
+                alignWalletAtStartup(newState)
+              } else {
+                resumeOrStartUtxoSnapshotScan(newState)
+                if (utxoSnapshotQuarantine.isEmpty) context.become(loadedWallet(newState))
+              }
+            case Failure(t) if startupNoIntentAlignmentPending =>
+              enterWalletStartupAlignmentQuarantine(updState, t)
+            case Failure(t) =>
+              val reason = s"Wallet is quarantined because state projection reconciliation failed: ${t.getMessage}"
+              operationalMempoolReconciliationQuarantine = Some(reason)
+              log.error(reason, t)
+              context.become(loadedWallet(updState.copy(utxoStateReaderOpt = None, error = Some(reason))))
           }
         case Failure(t) =>
           if (startupNoIntentAlignmentPending) {
@@ -3174,17 +3184,18 @@ class ErgoWalletActor(settings: ErgoSettings,
         // the transaction is kept until it gets on the blockchain, so that a restart in the meantime
         // does not make the wallet consider its inputs spendable again
         state.storage.addUnconfirmedTransaction(tx, state.fullHeight) match {
-          case Success(_) =>
+          case Success(_) => context.become(loadedWallet(newState.copy()))
           case Failure(t) => log.error(s"Could not store unconfirmed transaction ${tx.id}: ", t)
         }
       }
-      context.become(loadedWallet(newState))
 
     case ReadUnconfirmedTransactions =>
-      sender() ! unconfirmedTransactionsToRestore(state)
+      val (transactions, refreshed) = unconfirmedTransactionsToRestore(state)
+      context.become(loadedWallet(refreshed))
+      sender() ! transactions
 
     case ForgetUnconfirmedTransactions(ids) =>
-      forgetUnconfirmedTransactions(state, ids)
+      context.become(loadedWallet(forgetUnconfirmedTransactions(state, ids)))
 
     // rescan=true means we serve a user request for rescan from arbitrary height
     case ContinueUtxoSnapshotCatchUp(run, blockHeight, cleanupAttempt)
@@ -3268,8 +3279,7 @@ class ErgoWalletActor(settings: ErgoSettings,
                   Try(ergoWalletService.scanBlockUpdate(
                     state, block, settings.walletSettings.dustLimit)).flatten.flatMap { updatedState =>
                     if (rescan || updatedState.getWalletHeight >= blockHeight) {
-                      forgetConfirmedAndExpired(updatedState, block)
-                      Success(updatedState)
+                      Success(forgetConfirmedAndExpired(updatedState, block))
                     }
                     else fail(
                       s"Mandatory wallet catch-up at height $blockHeight left the wallet at " +
@@ -3384,7 +3394,6 @@ class ErgoWalletActor(settings: ErgoSettings,
                   state.copy(error = Some(errorMsg))
                 case Success(updatedState) =>
                   forgetConfirmedAndExpired(updatedState, newBlock)
-                  updatedState
               }
             context.become(loadedWallet(newState))
           } else if (nextBlockHeight < newBlock.height) {
@@ -3595,7 +3604,6 @@ class ErgoWalletActor(settings: ErgoSettings,
           ergoWalletService.recreateRegistry(state, settings) match {
             case Success(newState) =>
               val resetState = newState.copy(
-                offChainRegistry = OffChainRegistry.init(newState.registry),
                 outputsFilter = None,
                 rescanInProgress = true
               )
@@ -3774,21 +3782,21 @@ class ErgoWalletActor(settings: ErgoSettings,
     * Stored unconfirmed transactions worth putting back into the memory pool. Transactions which did
     * not make it onto the blockchain for too long are dropped instead of being re-submitted forever.
     */
-  private def unconfirmedTransactionsToRestore(state: ErgoWalletState): Seq[ErgoTransaction] = {
+  private def unconfirmedTransactionsToRestore(state: ErgoWalletState): (Seq[ErgoTransaction], ErgoWalletState) = {
     val (fresh, expired) = state.storage.readUnconfirmedTransactions().partition { case (_, seenAt) =>
       state.fullHeight - seenAt <= WalletStorage.UnconfirmedTxLifetimeInBlocks
     }
-    if (expired.nonEmpty) {
+    val refreshed = if (expired.nonEmpty) {
       forgetUnconfirmedTransactions(state, expired.map(_._1.id))
-    }
-    ErgoWalletActor.orderByDependency(fresh.map(_._1))
+    } else state
+    (ErgoWalletActor.orderByDependency(fresh.map(_._1)), refreshed)
   }
 
   /**
     * Drop the transactions of a just applied block from the store, and give up on the ones which
     * stayed unconfirmed for longer than [[WalletStorage.UnconfirmedTxLifetimeInBlocks]] blocks.
     */
-  private def forgetConfirmedAndExpired(state: ErgoWalletState, block: ErgoFullBlock): Unit = {
+  private def forgetConfirmedAndExpired(state: ErgoWalletState, block: ErgoFullBlock): ErgoWalletState = {
     val seenAtHeights = state.storage.unconfirmedTransactionHeights
     if (seenAtHeights.nonEmpty) {
       val confirmed = block.transactions.map(_.id).filter(seenAtHeights.contains)
@@ -3801,14 +3809,16 @@ class ErgoWalletActor(settings: ErgoSettings,
       val toForget = (confirmed ++ expired).distinct
       if (toForget.nonEmpty) {
         forgetUnconfirmedTransactions(state, toForget)
-      }
-    }
+      } else state
+    } else state
   }
 
-  private def forgetUnconfirmedTransactions(state: ErgoWalletState, ids: Seq[ModifierId]): Unit = {
+  private def forgetUnconfirmedTransactions(state: ErgoWalletState, ids: Seq[ModifierId]): ErgoWalletState = {
     state.storage.removeUnconfirmedTransactions(ids) match {
-      case Success(_) =>
-      case Failure(t) => log.error("Could not forget unconfirmed transactions: ", t)
+      case Success(_) => state.copy()
+      case Failure(t) =>
+        log.error("Could not forget unconfirmed transactions: ", t)
+        state
     }
   }
 
@@ -3887,9 +3897,8 @@ object ErgoWalletActor extends ScorexLogging {
   /**
     * Order transactions so that a transaction spending an output of another one comes after it.
     *
-    * Unconfirmed transactions do form such chains, and both consumers of this ordering need it: the
-    * off-chain registry only nets a spending out if it has seen the box being spent already, and the
-    * memory pool refuses a transaction whose inputs it does not know yet.
+    * Unconfirmed transactions do form such chains: the memory pool refuses a transaction whose
+    * inputs it does not know yet. Input reservations themselves are independent of replay order.
     *
     * Transactions with no producer among `txs` keep their relative order. A cycle is impossible
     * between valid transactions, but should one be given, its members are appended unordered rather

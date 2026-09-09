@@ -29,7 +29,7 @@ import org.ergoplatform.wallet.settings.SecretStorageSettings
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.propspec.AnyPropSpec
 import scorex.db.LDBFactory
-import scorex.util.ModifierId
+import scorex.util.{ModifierId, bytesToId}
 import scorex.util.ScorexLogging
 
 import scala.concurrent.Await
@@ -62,6 +62,7 @@ class WalletScanTransactionCleanupSpec extends AnyPropSpec with Matchers {
 
   private final class ScanService(config: ErgoSettings, val resultStorage: WalletStorage) extends ErgoWalletServiceImpl(config) {
     val originalState = new AtomicReference[ErgoWalletState]()
+    val observedState = new AtomicReference[ErgoWalletState]()
     val scans = new AtomicInteger()
     val failed = new AtomicBoolean(false)
     val acknowledgeHeight = new AtomicBoolean(true)
@@ -90,6 +91,12 @@ class WalletScanTransactionCleanupSpec extends AnyPropSpec with Matchers {
 
     override def restoreOffChainState(state: ErgoWalletState): ErgoWalletState = state
 
+    override def getWalletBoxes(state: ErgoWalletState, unspentOnly: Boolean,
+                                considerUnconfirmed: Boolean): Seq[WalletBox] = {
+      observedState.set(state)
+      Seq.empty
+    }
+
     override def scanBlockUpdate(state: ErgoWalletState, scanned: ErgoFullBlock, dustLimit: Option[Long]): Try[ErgoWalletState] = {
       require(scanned.id == block.id)
       scans.incrementAndGet()
@@ -102,7 +109,9 @@ class WalletScanTransactionCleanupSpec extends AnyPropSpec with Matchers {
             block.id, block.height).get
         }
         returnedResultStorage.set(acknowledgeHeight.get())
-        Success(state.copy(storage = resultStorage, error = None))
+        val result = state.copy(storage = resultStorage, error = None)
+        result.persistedInputIds.size should be > 0
+        Success(result)
       }
     }
   }
@@ -232,6 +241,10 @@ class WalletScanTransactionCleanupSpec extends AnyPropSpec with Matchers {
         service.scans.get() shouldBe 1
         persistentRecords(service.resultStorage) shouldBe retainedRecords
         persistentRecords(service.originalState.get().storage) shouldBe allRecords
+        probe.send(actor, GetWalletBoxes(unspentOnly = true, considerUnconfirmed = true))
+        probe.expectMsg(Seq.empty[WalletBox])
+        service.observedState.get().persistedInputIds shouldBe
+          records.drop(2).flatMap(_._1.inputs.map(input => bytesToId(input.boxId))).toSet
       }
     }
 
