@@ -137,6 +137,7 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
     with Timers
     with Stash
     with UtxoSnapshotFinalizationSupport
+    with WalletTransactionRestorationSupport
     with ScorexLogging
     with ScorexEncoding
     with FileUtils {
@@ -226,6 +227,7 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
   override def preStart(): Unit = {
     super.preStart()
     context.system.eventStream.subscribe(self, classOf[RequestCurrentWalletView])
+    beginWalletTransactionRestoration()
   }
 
   override def postStop(): Unit = {
@@ -233,6 +235,11 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
     history().closeStorage()
     minimalState().closeStorage()
   }
+
+  override protected def currentRestorationWalletActor: ActorRef = vault().walletActor
+
+  override protected def registerWalletTransactionRestoration(requestId: java.util.UUID): Unit =
+    vault().registerWalletTransactionRestoration(requestId, self)
 
   /**
     * Update NodeView with new components and notify subscribers of changed components
@@ -863,6 +870,21 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
       txModify(unconfirmedTx)
     case LocallyGeneratedTransaction(unconfirmedTx) =>
       sender() ! txModify(unconfirmedTx)
+    case RestoredTransaction(unconfirmedTx) =>
+      txModify(unconfirmedTx) match {
+        case _: ProcessingOutcome.Accepted =>
+          log.info(s"Unconfirmed wallet transaction ${unconfirmedTx.id} is back in the memory pool")
+        case _: ProcessingOutcome.Declined | _: ProcessingOutcome.DoubleSpendingLoser =>
+          // Local admission policy can change; keep the original record for a later startup.
+          log.info(s"Deferring restoration of unconfirmed wallet transaction ${unconfirmedTx.id}; " +
+            "keeping it for a later startup")
+        case outcome =>
+          // the transaction can not be brought back, e.g. it got on the blockchain while the node
+          // was down, or a conflicting one did. There is no point in keeping it for the next restart
+          log.info(s"Unconfirmed wallet transaction ${unconfirmedTx.id} was not accepted back " +
+            s"into the memory pool ($outcome), forgetting it")
+          vault().forgetUnconfirmedTransactions(Seq(unconfirmedTx.id))
+      }
     case RecheckedTransactions(unconfirmedTxs) =>
       val updatedPool = memoryPool().put(unconfirmedTxs)
       updateNodeView(updatedMempool = Some(updatedPool))
@@ -897,6 +919,7 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
   protected def walletViewRequests: Receive = {
     case RequestCurrentWalletView(requestId, replyTo) =>
       notifyWalletOfCurrentView(requestId, replyTo)
+      refreshWalletTransactionRestoration(replyTo)
   }
 
   private def handleHealthCheck: Receive = {
@@ -915,6 +938,7 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
       getCurrentInfo orElse
       getNodeViewChanges orElse
       walletViewRequests orElse
+      walletTransactionRestorationResponses orElse
       processStateSnapshot orElse
       handleHealthCheck orElse {
         case a: Any => log.error("Strange input: " + a)
@@ -1096,6 +1120,12 @@ object ErgoNodeViewHolder {
       * Wrapper for transaction coming from P2P network
       */
     case class TransactionFromRemote(unconfirmedTx: UnconfirmedTransaction)
+
+    /**
+      * Wrapper for a wallet transaction which was unconfirmed when the node was stopped and is being
+      * put back into the memory pool now
+      */
+    case class RestoredTransaction(unconfirmedTx: UnconfirmedTransaction)
 
     /**
       * Wrapper for transactions which sit in mempool for long enough time, so `CleanWorker` is re-checking their

@@ -7,13 +7,14 @@ import org.ergoplatform.ErgoBox._
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{ChangedMempool, ChangedState, CurrentWalletView, RequestCurrentWalletView, UtxoSnapshotAppliedToState}
 import org.ergoplatform.modifiers.ErgoFullBlock
 import org.ergoplatform.modifiers.history.header.PreGenesisHeader
+import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.nodeView.history.ErgoHistoryReader
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils.{EmptyHistoryHeight, Height}
 import org.ergoplatform.nodeView.mempool.ErgoMemPoolReader
 import org.ergoplatform.nodeView.state.{ErgoStateContext, ErgoStateReader, UtxoStateReader}
 import org.ergoplatform.nodeView.wallet.ErgoWalletService._
 import org.ergoplatform.nodeView.wallet.ErgoWalletServiceUtils.DeriveNextKeyResult
-import org.ergoplatform.nodeView.wallet.persistence.{OffChainRegistry, UtxoSnapshotChunkIntegrityException, UtxoSnapshotScanInvalidation, UtxoSnapshotScanStatus, UtxoSnapshotWalletOrigin, WalletRollbackIntent}
+import org.ergoplatform.nodeView.wallet.persistence.{OffChainRegistry, UtxoSnapshotChunkIntegrityException, UtxoSnapshotScanInvalidation, UtxoSnapshotScanStatus, UtxoSnapshotWalletOrigin, WalletRollbackIntent, WalletStorage}
 import org.ergoplatform.sdk.wallet.secrets.DerivationPath
 import org.ergoplatform.settings._
 import org.ergoplatform.wallet.Constants.ScanId
@@ -24,9 +25,10 @@ import org.ergoplatform.core.{VersionTag, idToVersion, versionToId}
 import org.ergoplatform.sdk.SecretString
 import org.ergoplatform.utils.ScorexEncoding
 import scorex.crypto.authds.ADDigest
-import scorex.util.{ModifierId, ScorexLogging}
+import scorex.util.{ModifierId, ScorexLogging, bytesToId}
 
 import java.util.UUID
+import scala.annotation.tailrec
 import scala.concurrent.duration._
 import scala.util.{Failure, Success, Try}
 
@@ -37,7 +39,7 @@ class ErgoWalletActor(settings: ErgoSettings,
                       historyReader: ErgoHistoryReader)
   extends Actor with Stash with Timers with ScorexLogging with ScorexEncoding {
 
-  import ErgoWalletActor.{ApplyCurrentWalletMempool, ApplyCurrentWalletSnapshot,
+  import ErgoWalletActor.{ApplyCurrentWalletMempool, ApplyCurrentWalletSnapshot, AttemptWalletTransactionRestoration,
     ApplyCurrentWalletState, ContinueCurrentWalletViewApplication,
     CurrentWalletViewApplicationStep, CurrentWalletViewRetryDelay,
     CurrentWalletViewRetryTimerKey, ExecuteCurrentWalletSnapshot,
@@ -68,6 +70,8 @@ class ErgoWalletActor(settings: ErgoSettings,
   private var startupCanonicalStateTip: Option[(Height, Option[ModifierId])] = None
   private var pendingCurrentWalletViewRequest: Option[UUID] = Some(UUID.randomUUID())
   private var currentWalletViewApplicationInProgress: Boolean = false
+  private var walletRestorationRegistration: Option[(UUID, ActorRef, Boolean)] = None
+  private var queuedWalletRestorationAttempt: Option[UUID] = None
   private var currentWalletViewApplicationSteps: Vector[CurrentWalletViewApplicationStep] =
     Vector.empty
   private var deferredRollbackReconciliationBlocks: Map[Height, ErgoFullBlock] = Map.empty
@@ -342,7 +346,14 @@ class ErgoWalletActor(settings: ErgoSettings,
           canonicalValidation
         }.flatMap { _ =>
           log.info(s"Wallet is scanning mandatory post-snapshot block ${block.id} at height ${block.height}")
-          Try(ergoWalletService.scanBlockUpdate(state, block, settings.walletSettings.dustLimit)).flatten
+          Try(ergoWalletService.scanBlockUpdate(state, block, settings.walletSettings.dustLimit)).flatten.flatMap { updatedState =>
+            if (updatedState.getWalletHeight >= height) {
+              forgetConfirmedAndExpired(updatedState, block)
+              Success(updatedState)
+            } else fail(
+              s"Mandatory wallet catch-up at height $height left the wallet at " +
+                s"height ${updatedState.getWalletHeight}")
+          }
         }
       case None =>
         Failure(WalletCatchUpBlockUnavailable(height))
@@ -497,7 +508,7 @@ class ErgoWalletActor(settings: ErgoSettings,
       val ws = settings.walletSettings
       // Try to read wallet from json file or test mnemonic provided in a config file
       val newState = ergoWalletService.readWallet(state, ws.testMnemonic.map(SecretString.create(_)), ws.testKeysQty, ws.secretStorage)
-      initializeWalletRollbackRecovery(newState)
+      initializeWalletRollbackRecovery(ergoWalletService.restoreOffChainState(newState))
       unstashAll()
     case _ => // stashing all messages until wallet is setup
       stash()
@@ -2337,11 +2348,51 @@ class ErgoWalletActor(settings: ErgoSettings,
     } else operationalWallet(state)
   }
 
+  private def scheduleWalletTransactionRestoration(): Unit = {
+    if (queuedWalletRestorationAttempt.isEmpty) {
+      walletRestorationRegistration.collect { case (requestId, _, false) =>
+        queuedWalletRestorationAttempt = Some(requestId)
+        self.tell(AttemptWalletTransactionRestoration(requestId), self)
+      }
+      ()
+    }
+  }
+
+  private def fulfillWalletTransactionRestoration(state: ErgoWalletState): Unit = {
+    if (pendingCurrentWalletViewRequest.isEmpty && !currentWalletViewApplicationInProgress) {
+      walletRestorationRegistration.collect { case (requestId, holder, false) =>
+        walletRestorationRegistration = Some((requestId, holder, true))
+        holder.tell(WalletTransactionsForRestoration(requestId, Try(unconfirmedTransactionsToRestore(state))), self)
+      }
+      ()
+    }
+  }
+
+  private def walletTransactionRestorationRegistration(state: ErgoWalletState): Receive = {
+    case attempt@AttemptWalletTransactionRestoration(requestId)
+      if sender() == self && queuedWalletRestorationAttempt.contains(requestId) =>
+      queuedWalletRestorationAttempt = None
+      // Dispatch only after the enclosing transition has completed, through its current guards.
+      walletMode(state)(attempt)
+
+    case _: AttemptWalletTransactionRestoration =>
+      log.debug("Ignoring a stale wallet restoration attempt")
+
+    case RegisterWalletTransactionRestoration(requestId) =>
+      walletRestorationRegistration match {
+        case None => walletRestorationRegistration = Some((requestId, sender(), false))
+        case Some((`requestId`, holder, _)) if holder == sender() => ()
+        case _ => log.debug("Ignoring a conflicting wallet restoration registration")
+      }
+      context.become(loadedWallet(state))
+  }
+
   private def currentWalletViewApplication(state: ErgoWalletState): Receive = {
     case ContinueCurrentWalletViewApplication if currentWalletViewApplicationInProgress =>
       currentWalletViewApplicationSteps.headOption match {
         case None =>
           currentWalletViewApplicationInProgress = false
+          context.become(loadedWallet(state))
           unstashAll()
         case Some(step) =>
           currentWalletViewApplicationSteps = currentWalletViewApplicationSteps.tail
@@ -2368,10 +2419,13 @@ class ErgoWalletActor(settings: ErgoSettings,
       stash()
   }
 
-  private def loadedWallet(state: ErgoWalletState): Receive =
+  private def loadedWallet(state: ErgoWalletState): Receive = {
+    scheduleWalletTransactionRestoration()
     currentWalletViewApplication(state)
       .orElse(currentWalletViewHandshake(state))
+      .orElse(walletTransactionRestorationRegistration(state))
       .orElse(walletMode(state))
+  }
 
   private def startupAlignmentPendingWallet(state: ErgoWalletState): Receive = ({
     case GetWalletStatus =>
@@ -2661,6 +2715,10 @@ class ErgoWalletActor(settings: ErgoSettings,
   }
 
   private def operationalWallet(state: ErgoWalletState): Receive = {
+    case AttemptWalletTransactionRestoration(requestId)
+      if walletRestorationRegistration.exists { case (id, _, delivered) => id == requestId && !delivered } =>
+      fulfillWalletTransactionRestoration(state)
+
     case InitWallet(walletPass, mnemonicPassOpt) if hasPendingUtxoSnapshotScan(state) =>
       walletPass.erase()
       mnemonicPassOpt.foreach(_.erase())
@@ -3111,13 +3169,22 @@ class ErgoWalletActor(settings: ErgoSettings,
 
     //scan mempool transaction
     case ScanOffChain(tx) =>
-      val dustLimit = settings.walletSettings.dustLimit
-      val newWalletBoxes = WalletScanLogic.extractWalletOutputs(tx, None, state.walletVars, dustLimit)
-      val inputs = WalletScanLogic.extractInputBoxes(tx)
-      val newState = state.copy(offChainRegistry =
-        state.offChainRegistry.updateOnTransaction(newWalletBoxes, inputs, state.walletVars.externalScans)
-      )
+      val (newState, walletAffected) = ergoWalletService.scanOffChainUpdate(state, tx)
+      if (walletAffected) {
+        // the transaction is kept until it gets on the blockchain, so that a restart in the meantime
+        // does not make the wallet consider its inputs spendable again
+        state.storage.addUnconfirmedTransaction(tx, state.fullHeight) match {
+          case Success(_) =>
+          case Failure(t) => log.error(s"Could not store unconfirmed transaction ${tx.id}: ", t)
+        }
+      }
       context.become(loadedWallet(newState))
+
+    case ReadUnconfirmedTransactions =>
+      sender() ! unconfirmedTransactionsToRestore(state)
+
+    case ForgetUnconfirmedTransactions(ids) =>
+      forgetUnconfirmedTransactions(state, ids)
 
     // rescan=true means we serve a user request for rescan from arbitrary height
     case ContinueUtxoSnapshotCatchUp(run, blockHeight, cleanupAttempt)
@@ -3200,7 +3267,10 @@ class ErgoWalletActor(settings: ErgoSettings,
                   log.info(s"Wallet is $operation a block ${block.id} in the past at height ${block.height}")
                   Try(ergoWalletService.scanBlockUpdate(
                     state, block, settings.walletSettings.dustLimit)).flatten.flatMap { updatedState =>
-                    if (rescan || updatedState.getWalletHeight >= blockHeight) Success(updatedState)
+                    if (rescan || updatedState.getWalletHeight >= blockHeight) {
+                      forgetConfirmedAndExpired(updatedState, block)
+                      Success(updatedState)
+                    }
                     else fail(
                       s"Mandatory wallet catch-up at height $blockHeight left the wallet at " +
                         s"height ${updatedState.getWalletHeight}")
@@ -3313,6 +3383,7 @@ class ErgoWalletActor(settings: ErgoSettings,
                   log.error(errorMsg, ex)
                   state.copy(error = Some(errorMsg))
                 case Success(updatedState) =>
+                  forgetConfirmedAndExpired(updatedState, newBlock)
                   updatedState
               }
             context.become(loadedWallet(newState))
@@ -3699,6 +3770,48 @@ class ErgoWalletActor(settings: ErgoSettings,
     sender() ! txsToSend
   }
 
+  /**
+    * Stored unconfirmed transactions worth putting back into the memory pool. Transactions which did
+    * not make it onto the blockchain for too long are dropped instead of being re-submitted forever.
+    */
+  private def unconfirmedTransactionsToRestore(state: ErgoWalletState): Seq[ErgoTransaction] = {
+    val (fresh, expired) = state.storage.readUnconfirmedTransactions().partition { case (_, seenAt) =>
+      state.fullHeight - seenAt <= WalletStorage.UnconfirmedTxLifetimeInBlocks
+    }
+    if (expired.nonEmpty) {
+      forgetUnconfirmedTransactions(state, expired.map(_._1.id))
+    }
+    ErgoWalletActor.orderByDependency(fresh.map(_._1))
+  }
+
+  /**
+    * Drop the transactions of a just applied block from the store, and give up on the ones which
+    * stayed unconfirmed for longer than [[WalletStorage.UnconfirmedTxLifetimeInBlocks]] blocks.
+    */
+  private def forgetConfirmedAndExpired(state: ErgoWalletState, block: ErgoFullBlock): Unit = {
+    val seenAtHeights = state.storage.unconfirmedTransactionHeights
+    if (seenAtHeights.nonEmpty) {
+      val confirmed = block.transactions.map(_.id).filter(seenAtHeights.contains)
+      val expired = seenAtHeights.collect {
+        case (id, seenAt) if block.height - seenAt > WalletStorage.UnconfirmedTxLifetimeInBlocks => id
+      }.toSeq
+      if (expired.nonEmpty) {
+        log.warn(s"Wallet gave up on ${expired.size} transaction(s) still unconfirmed at height ${block.height}")
+      }
+      val toForget = (confirmed ++ expired).distinct
+      if (toForget.nonEmpty) {
+        forgetUnconfirmedTransactions(state, toForget)
+      }
+    }
+  }
+
+  private def forgetUnconfirmedTransactions(state: ErgoWalletState, ids: Seq[ModifierId]): Unit = {
+    state.storage.removeUnconfirmedTransactions(ids) match {
+      case Success(_) =>
+      case Failure(t) => log.error("Could not forget unconfirmed transactions: ", t)
+    }
+  }
+
   override def receive: Receive = emptyWallet
 
   private def wrapLegalExc[T](e: Throwable): Failure[T] =
@@ -3712,6 +3825,7 @@ class ErgoWalletActor(settings: ErgoSettings,
 }
 
 object ErgoWalletActor extends ScorexLogging {
+  private final case class AttemptWalletTransactionRestoration(requestId: UUID)
 
   private sealed trait CurrentWalletViewApplicationStep
   private final case class ApplyCurrentWalletState(stateReader: ErgoStateReader)
@@ -3769,6 +3883,42 @@ object ErgoWalletActor extends ScorexLogging {
     minFullBlockAvailable: Height,
     requestedHeight: Height): Boolean =
     fullBlocksPruned && requestedHeight < minFullBlockAvailable
+
+  /**
+    * Order transactions so that a transaction spending an output of another one comes after it.
+    *
+    * Unconfirmed transactions do form such chains, and both consumers of this ordering need it: the
+    * off-chain registry only nets a spending out if it has seen the box being spent already, and the
+    * memory pool refuses a transaction whose inputs it does not know yet.
+    *
+    * Transactions with no producer among `txs` keep their relative order. A cycle is impossible
+    * between valid transactions, but should one be given, its members are appended unordered rather
+    * than dropped.
+    */
+  def orderByDependency(txs: Seq[ErgoTransaction]): Seq[ErgoTransaction] = {
+    val producerOf: Map[ModifierId, ModifierId] =
+      txs.flatMap(tx => tx.outputs.map(out => bytesToId(out.id) -> tx.id)).toMap
+
+    @tailrec
+    def loop(remaining: Seq[ErgoTransaction],
+             ordered: Set[ModifierId],
+             acc: Seq[ErgoTransaction]): Seq[ErgoTransaction] = {
+      if (remaining.isEmpty) {
+        acc
+      } else {
+        val (ready, blocked) = remaining.partition { tx =>
+          tx.inputs.forall(in => producerOf.get(bytesToId(in.boxId)).forall(ordered.contains))
+        }
+        if (ready.isEmpty) {
+          acc ++ blocked
+        } else {
+          loop(blocked, ordered ++ ready.map(_.id), acc ++ ready)
+        }
+      }
+    }
+
+    loop(txs, Set.empty, Seq.empty)
+  }
 
   /** Start actor and register its proper closing into coordinated shutdown */
   def apply(settings: ErgoSettings,

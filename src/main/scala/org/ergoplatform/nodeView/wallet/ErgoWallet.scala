@@ -9,7 +9,7 @@ import org.ergoplatform.nodeView.wallet.ErgoWalletActorMessages._
 import org.ergoplatform.settings.{ErgoSettings, Parameters}
 import org.ergoplatform.wallet.boxes.{ReemissionData, ReplaceCompactCollectBoxSelector}
 import org.ergoplatform.core.VersionTag
-import scorex.util.ScorexLogging
+import scorex.util.{ModifierId, ScorexLogging}
 
 import scala.util.{Failure, Success, Try}
 
@@ -45,6 +45,17 @@ class ErgoWallet(historyReader: ErgoHistoryReader, settings: ErgoSettings, param
     txs.foreach(tx => scanOffchain(tx))
     this
   }
+
+  /**
+    * Tell the wallet to stop keeping the given unconfirmed transactions across restarts, e.g.
+    * because the memory pool refused them when they were re-submitted.
+    */
+  def forgetUnconfirmedTransactions(ids: Seq[ModifierId]): Unit = {
+    walletActor ! ForgetUnconfirmedTransactions(ids)
+  }
+
+  private[nodeView] def registerWalletTransactionRestoration(requestId: java.util.UUID, holder: ActorRef): Unit =
+    walletActor.tell(RegisterWalletTransactionRestoration(requestId), holder)
 
   def scanPersistent(modifier: BlockSection): ErgoWallet = {
     modifier match {
