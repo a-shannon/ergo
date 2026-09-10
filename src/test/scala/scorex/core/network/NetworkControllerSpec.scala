@@ -345,6 +345,43 @@ class NetworkControllerSpec extends ErgoCorePropertyTest {
     }
   }
 
+  property("rejected handshake should preserve an established peer with a different declared identity") {
+    withFixture { f =>
+      val (controller, peerManagerProbe, _) = f.createController(maxConnections = 30)
+
+      val victimAddress = new InetSocketAddress("192.168.1.1", 9001)
+      val declaredIdentity = new InetSocketAddress("192.168.1.3", 9003)
+      val attackerAddress = new InetSocketAddress("192.168.1.2", 9002)
+      val victimConnection = f.establishIncomingConnectionWithHandler(controller, peerManagerProbe, victimAddress)
+      val victimSpec = defaultPeerSpec.copy(declaredAddress = Some(declaredIdentity))
+      victimConnection.connectionProbe.send(
+        victimConnection.handlerRef,
+        Tcp.Received(ByteString(HandshakeSerializer.toBytes(Handshake(victimSpec, System.currentTimeMillis()))))
+      )
+      victimConnection.connectionProbe.expectMsg(Tcp.ResumeReading)
+      peerManagerProbe.expectMsgPF() {
+        case AddOrUpdatePeer(peerInfo) => peerInfo.peerSpec shouldBe victimSpec
+      }
+
+      val attackerConnection = f.establishIncomingConnectionWithHandler(controller, peerManagerProbe, attackerAddress)
+      attackerConnection.connectionProbe.send(
+        attackerConnection.handlerRef,
+        Tcp.Received(ByteString(HandshakeSerializer.toBytes(Handshake(victimSpec, System.currentTimeMillis()))))
+      )
+      attackerConnection.connectionProbe.expectMsg(Tcp.ResumeReading)
+      peerManagerProbe.expectMsg(RemovePeer(attackerAddress))
+      attackerConnection.connectionProbe.expectMsg(Tcp.Abort)
+      peerManagerProbe.expectNoMessage(200.millis)
+
+      val observer = TestProbe("ConnectedPeers")(f.system)
+      observer.send(controller, NetworkController.ReceivableMessages.GetConnectedPeers)
+      val remaining = observer.expectMsgType[Iterable[ConnectedPeer]].toSeq
+      remaining.map(_.connectionId.remoteAddress) shouldBe Seq(victimAddress)
+      remaining.head.peerInfo.map(_.peerSpec) shouldBe Some(victimSpec)
+      victimConnection.connectionProbe.expectNoMessage(200.millis)
+    }
+  }
+
   property("outgoing connection should bypass incoming limit check") {
     withFixture { f =>
       val (controller, peerManagerProbe, tcpManagerProbe) = f.createController(maxConnections = 30)
