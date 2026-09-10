@@ -67,7 +67,15 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
     }
   }
 
-  class NodeViewHolderMock extends ErgoNodeViewHolder[UtxoState](settings)
+  private def isolatedNodeSettings(prototype: ErgoSettings): ErgoSettings = {
+    val directory = createTempDir
+    prototype.copy(directory = directory.getAbsolutePath,
+      walletSettings = prototype.walletSettings.copy(secretStorage =
+        prototype.walletSettings.secretStorage.copy(
+          secretDir = new java.io.File(directory, "keystore").getAbsolutePath)))
+  }
+
+  class NodeViewHolderMock(nodeSettings: ErgoSettings) extends ErgoNodeViewHolder[UtxoState](nodeSettings)
 
   class SynchronizerMock(networkControllerRef: ActorRef,
                          viewHolderRef: ActorRef,
@@ -129,7 +137,7 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
     val h = localHistoryGen.sample.get
     @SuppressWarnings(Array("org.wartremover.warts.OptionPartial"))
     val s = localStateGen.sample.get
-    val settings = ErgoSettingsReader.read()
+    val settings = isolatedNodeSettings(ErgoSettingsReader.read())
     val pool = ErgoMemPool.empty(settings)
     implicit val ec: ExecutionContextExecutor = system.dispatcher
     val ncProbe = TestProbe("NetworkControllerProbe")
@@ -138,9 +146,7 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
     val syncTracker = ErgoSyncTracker(settings.scorexSettings.network)
     val deliveryTracker: DeliveryTracker = DeliveryTracker.empty(settings)
 
-    // each test should always start with empty history
-    deleteRecursive(ErgoHistory.historyDir(settings))
-    val nodeViewHolderMockRef = system.actorOf(Props(new NodeViewHolderMock))
+    val nodeViewHolderMockRef = system.actorOf(Props(new NodeViewHolderMock(settings)))
 
     val synchronizerMockRef = system.actorOf(Props(
       new SynchronizerMock(
@@ -174,15 +180,14 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
   }
 
   class Synchronizer2Fixture extends AkkaFixture {
+    val settings: ErgoSettings = isolatedNodeSettings(org.ergoplatform.utils.ErgoNodeTestConstants.settings)
     implicit val ec: ExecutionContextExecutor = system.dispatcher
     val ncProbe = TestProbe("NetworkControllerProbe")
     val pchProbe = TestProbe("PeerHandlerProbe")
     val syncTracker = ErgoSyncTracker(settings.scorexSettings.network)
     val deliveryTracker: DeliveryTracker = DeliveryTracker.empty(settings)
 
-    // each test should always start with empty history
-    deleteRecursive(ErgoHistory.historyDir(settings))
-    val nodeViewHolderMockRef = system.actorOf(Props(new NodeViewHolderMock))
+    val nodeViewHolderMockRef = system.actorOf(Props(new NodeViewHolderMock(settings)))
 
     val synchronizerMockRef = system.actorOf(Props(
       new SynchronizerMock(
