@@ -46,13 +46,14 @@ class BlockTransactionsSpec extends ErgoCorePropertyTest {
     w.result().toBytes
   }
 
-  private def transaction(index: Int, versionedRegister: Boolean): ErgoTransaction = {
+  private def transaction(index: Int, versionedRegister: Boolean, treeVersion: Byte = 0): ErgoTransaction = {
     val registers: ErgoBox.AdditionalRegisters = if (versionedRegister) {
       Map(ErgoBox.R4 -> Constant[SOption[SInt.type]](Some(index), SOption(SInt)))
     } else {
       Map(ErgoBox.R4 -> Constant[SInt.type](index, SInt))
     }
-    val box = new ErgoBoxCandidate(10000000L, ErgoTree.fromSigmaBoolean(TrueProp), index)
+    val tree = ErgoTree.fromSigmaBoolean(ErgoTree.defaultHeaderWithVersion(treeVersion), TrueProp)
+    val box = new ErgoBoxCandidate(10000000L, tree, index)
       .toBox(Header.GenesisParentId, 0.toShort)
     ErgoTransaction(IndexedSeq(Input(box.id, ProverResult.empty)), IndexedSeq.empty,
       IndexedSeq(new ErgoBoxCandidate(box.value, box.ergoTree, index, additionalRegisters = registers)))
@@ -66,6 +67,11 @@ class BlockTransactionsSpec extends ErgoCorePropertyTest {
       section.bytes shouldBe original
       val payloadSize = txs.map(BlockTransactionsSerializer.transactionSize(_, version).toLong).sum
       BlockTransactionsSerializer.sectionSize(version, count, payloadSize) shouldBe original.length.toLong
+      BlockTransactions.sizeOf(txs, version) shouldBe original.length
+      val parsed = BlockTransactionsSerializer.parseBytesTry(original).get
+      parsed.blockVersion shouldBe version
+      parsed.txs.map(_.id) shouldBe txs.map(_.id)
+      parsed.bytes shouldBe original
     }
   }
 
@@ -79,7 +85,30 @@ class BlockTransactionsSpec extends ErgoCorePropertyTest {
       section.bytes shouldBe original
       val payloadSize = BlockTransactionsSerializer.transactionSize(tx, version)
       BlockTransactionsSerializer.sectionSize(version, 1, payloadSize) shouldBe original.length.toLong
+      BlockTransactions.sizeOf(Seq(tx), version) shouldBe original.length
     }
+  }
+
+  property("version four tree and register values round trip through the activated parser") {
+    val tx = VersionContext.withVersions(3, 3) { transaction(1, versionedRegister = false, treeVersion = 3) }
+    val section = BlockTransactions(Header.GenesisParentId, 4.toByte, Seq(tx))
+    val parsed = BlockTransactionsSerializer.parseBytesTry(section.bytes).get
+    parsed.blockVersion shouldBe 4.toByte
+    parsed.txs.head.outputCandidates.head.additionalRegisters shouldBe tx.outputCandidates.head.additionalRegisters
+    parsed.bytes shouldBe section.bytes
+  }
+
+  property("version four still rejects V6-only types in registers") {
+    val tx = VersionContext.withVersions(3, 3) { transaction(1, versionedRegister = true, treeVersion = 3) }
+    val section = BlockTransactions(Header.GenesisParentId, 4.toByte, Seq(tx))
+    BlockTransactionsSerializer.parseBytesTry(section.bytes).isFailure shouldBe true
+  }
+
+  property("section sizing does not force an uncached standalone size in the default version context") {
+    val tx = VersionContext.withVersions(3, 3) { transaction(2, versionedRegister = true) }
+    scala.util.Try(tx.size).isFailure shouldBe true
+    BlockTransactions.sizeOf(Seq(tx), 4.toByte) shouldBe originalBytes(
+      BlockTransactions(Header.GenesisParentId, 4.toByte, Seq(tx))).length
   }
 
 }
