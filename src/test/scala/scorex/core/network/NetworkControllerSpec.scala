@@ -6,7 +6,7 @@ import akka.testkit.{TestActorRef, TestProbe}
 import akka.util.ByteString
 import org.ergoplatform.network.{Handshake, HandshakeSerializer}
 import org.ergoplatform.network.message.MessageConstants.MessageCode
-import org.ergoplatform.network.peer.PeerInfo
+import org.ergoplatform.network.peer.{PeerInfo, SessionIdPeerFeature}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.scalacheck.Gen
 import scorex.core.app.ScorexContext
@@ -20,6 +20,9 @@ class NetworkControllerSpec extends ErgoCorePropertyTest {
 
   import org.ergoplatform.network.peer.PeerManager.ReceivableMessages._
   import org.ergoplatform.utils.ErgoNodeTestConstants._
+
+  // Additional silence observation after expected messages, not a synchronization delay.
+  private val noUnexpectedMessageWindow = 200.millis
 
   private class ControllerFixture extends AkkaFixture {
     implicit val ec = system.dispatcher
@@ -328,8 +331,10 @@ class NetworkControllerSpec extends ErgoCorePropertyTest {
       attackerConnection.connectionProbe.expectMsg(Tcp.ResumeReading)
       peerManagerProbe.expectMsg(RemovePeer(attackerAddress))
       attackerConnection.connectionProbe.expectMsg(Tcp.Abort)
-      peerManagerProbe.expectNoMessage(200.millis)
+      peerManagerProbe.expectNoMessage(noUnexpectedMessageWindow)
 
+      // Invariant guard: the established transport must survive rejection.
+      // The RemovePeer assertion above detects the incorrect cleanup operand.
       val localAddress = settings.scorexSettings.network.bindAddress
       val duplicateVictimProbe = TestProbe("DuplicateVictim")
       duplicateVictimProbe.send(controller, Tcp.Connected(victimAddress, localAddress))
@@ -371,14 +376,44 @@ class NetworkControllerSpec extends ErgoCorePropertyTest {
       attackerConnection.connectionProbe.expectMsg(Tcp.ResumeReading)
       peerManagerProbe.expectMsg(RemovePeer(attackerAddress))
       attackerConnection.connectionProbe.expectMsg(Tcp.Abort)
-      peerManagerProbe.expectNoMessage(200.millis)
+      peerManagerProbe.expectNoMessage(noUnexpectedMessageWindow)
 
+      // Invariant guard; this established connection was also preserved before the fix.
       val observer = TestProbe("ConnectedPeers")(f.system)
       observer.send(controller, NetworkController.ReceivableMessages.GetConnectedPeers)
       val remaining = observer.expectMsgType[Iterable[ConnectedPeer]].toSeq
       remaining.map(_.connectionId.remoteAddress) shouldBe Seq(victimAddress)
       remaining.head.peerInfo.map(_.peerSpec) shouldBe Some(victimSpec)
-      victimConnection.connectionProbe.expectNoMessage(200.millis)
+      victimConnection.connectionProbe.expectNoMessage(noUnexpectedMessageWindow)
+    }
+  }
+
+  property("foreign-network handshake should not remove an unconnected declared identity") {
+    withFixture { f =>
+      val (controller, peerManagerProbe, _) = f.createController(maxConnections = 30)
+      val remoteAddress = new InetSocketAddress("192.0.2.1", 40001)
+      val declaredAddress = new InetSocketAddress("192.0.2.2", 9030)
+      val connection = f.establishIncomingConnectionWithHandler(controller, peerManagerProbe, remoteAddress)
+      val foreignMagic = settings.scorexSettings.network.magicBytes.clone()
+      foreignMagic(0) = (foreignMagic(0) ^ 1).toByte
+      val foreignSpec = defaultPeerSpec.copy(
+        declaredAddress = Some(declaredAddress),
+        features = Seq(SessionIdPeerFeature(foreignMagic, 1L))
+      )
+
+      // No prior connection is needed: the serialized foreign-network feature causes rejection.
+      connection.connectionProbe.send(
+        connection.handlerRef,
+        Tcp.Received(ByteString(HandshakeSerializer.toBytes(Handshake(foreignSpec, System.currentTimeMillis()))))
+      )
+      connection.connectionProbe.expectMsg(Tcp.ResumeReading)
+      peerManagerProbe.expectMsg(RemovePeer(remoteAddress))
+      connection.connectionProbe.expectMsg(Tcp.Abort)
+      peerManagerProbe.expectNoMessage(noUnexpectedMessageWindow)
+
+      val observer = TestProbe("ConnectedPeers")(f.system)
+      observer.send(controller, NetworkController.ReceivableMessages.GetConnectedPeers)
+      observer.expectMsgType[Iterable[ConnectedPeer]] shouldBe empty
     }
   }
 
