@@ -56,7 +56,11 @@ private[wallet] class WalletInitialization extends ScorexLogging {
   def initialize(state: ErgoWalletState, settings: ErgoSettings,
                   createSecret: SecretStorageSettings => JsonSecretStorage): Try[ErgoWalletState] = Try {
     require(state.secretStorageOpt.isEmpty && selected(settings).isEmpty, "Wallet is already initialized")
-    require(JsonSecretStorage.readFile(settings.walletSettings.secretStorage).isFailure, "Wallet secret already exists")
+    JsonSecretStorage.readFile(settings.walletSettings.secretStorage) match {
+      case Failure(_: JsonSecretStorage.SecretFileNotFoundException) => ()
+      case Failure(error) => throw error
+      case Success(_) => throw new IllegalStateException("Wallet secret already exists")
+    }
     val id = UUID.randomUUID().toString
     val folder = dataFolder(settings, id)
     var registry: Option[WalletRegistry] = None

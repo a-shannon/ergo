@@ -2,6 +2,7 @@ package org.ergoplatform.nodeView.wallet
 
 import java.io.{File, IOException}
 import java.nio.file.{Files, Path}
+import java.nio.file.attribute.PosixFileAttributeView
 import java.nio.charset.StandardCharsets.UTF_8
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -214,6 +215,85 @@ class WalletInitializationSpec extends AnyPropSpec with Matchers {
         loaded.secretStorageOpt.get.unlock(password).get
         loaded.secretStorageOpt.get.lock()
       } finally close(reopened)
+    }
+  }
+
+  for (inventory <- Seq("ambiguous", "mixed-legacy", "not-directory", "unrecognized")) {
+    property(s"initialization rejects $inventory secret inventory before preparing any generation") {
+      withSettings { settings =>
+        val old = populated(settings)
+        val root = new File(settings.walletSettings.secretStorage.secretDir).toPath
+        val bytes = "retained wallet material".getBytes(UTF_8)
+        val retained = if (inventory == "not-directory") {
+          Files.createDirectories(root.getParent)
+          Seq(Files.write(root, bytes))
+        } else {
+          Files.createDirectories(root)
+          val names = inventory match {
+            case "ambiguous" => Seq("first.json", "second.json")
+            case "mixed-legacy" => Seq("legacy-wallet", "current.json")
+            case _ => Seq("first", "second")
+          }
+          names.map(name => Files.write(root.resolve(name), bytes))
+        }
+        var openedRegistries = 0
+        var openedStores = 0
+        var createdSecrets = 0
+        val calls = new WalletInitialization {
+          override protected def openRegistry(s: ErgoSettings, folder: File): WalletRegistry = {
+            openedRegistries += 1
+            super.openRegistry(s, folder)
+          }
+          override protected def openStorage(s: ErgoSettings, folder: File): WalletStorage = {
+            openedStores += 1
+            super.openStorage(s, folder)
+          }
+        }
+        try {
+          val result = calls.initialize(old, settings, s => {
+            createdSecrets += 1
+            createSecret(s)
+          })
+          result shouldBe 'failure
+          result.failed.get shouldBe a[IOException]
+          openedRegistries shouldBe 0
+          openedStores shouldBe 0
+          createdSecrets shouldBe 0
+          WalletInitialization.selected(settings) shouldBe None
+          retained.foreach(path => Files.readAllBytes(path) shouldBe bytes)
+          assertPopulated(old)
+        } finally close(old)
+      }
+    }
+  }
+
+  property("initialization rejects a dangling secret directory link before preparing stores") {
+    withSettings { settings =>
+      val root = new File(settings.walletSettings.secretStorage.secretDir).toPath
+      if (Files.getFileAttributeView(root.getParent, classOf[PosixFileAttributeView]) != null) {
+        val old = populated(settings)
+        val missing = root.getParent.resolve("missing-secret-directory")
+        Files.createSymbolicLink(root, missing)
+        var opened = false
+        var created = false
+        val calls = new WalletInitialization {
+          override protected def openRegistry(s: ErgoSettings, folder: File): WalletRegistry = {
+            opened = true
+            super.openRegistry(s, folder)
+          }
+        }
+        try {
+          val result = calls.initialize(old, settings, s => { created = true; createSecret(s) })
+          result shouldBe 'failure
+          result.failed.get should not be a[JsonSecretStorage.SecretFileNotFoundException]
+          opened shouldBe false
+          created shouldBe false
+          Files.isSymbolicLink(root) shouldBe true
+          Files.exists(missing) shouldBe false
+          WalletInitialization.selected(settings) shouldBe None
+          assertPopulated(old)
+        } finally close(old)
+      }
     }
   }
 
