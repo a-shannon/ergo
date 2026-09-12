@@ -10,9 +10,10 @@ import org.ergoplatform.wallet.mnemonic.Mnemonic
 import org.ergoplatform.wallet.settings.SecretStorageSettings
 import scorex.util.encode.Base16
 
-import java.io.{File, FileNotFoundException, Writer}
+import java.io.{File, FileNotFoundException, IOException, Writer}
 import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{FileAlreadyExistsException, Files, LinkOption, Path, StandardCopyOption}
+import java.nio.file.{FileAlreadyExistsException, Files, LinkOption, NoSuchFileException, Path, StandardCopyOption}
+import java.nio.file.attribute.{BasicFileAttributes, PosixFileAttributeView, PosixFilePermissions}
 import java.util
 import java.util.UUID
 import scala.util.control.NonFatal
@@ -94,6 +95,29 @@ object JsonSecretStorage {
 
   private val StagingPrefix = ".ergo-secret-staging-"
 
+  /** Absence only; invalid or unreadable inventories use other failures. */
+  final class SecretFileNotFoundException extends FileNotFoundException("Wallet secret file not found")
+
+  private def storageEntries(settings: SecretStorageSettings): Seq[File] = {
+    val dir = new File(settings.secretDir)
+    val attributes = try {
+      Some(Files.readAttributes(dir.toPath, classOf[BasicFileAttributes], LinkOption.NOFOLLOW_LINKS))
+    } catch {
+      case _: NoSuchFileException => None
+    }
+    attributes match {
+      case None => Seq.empty
+      case Some(attrs) =>
+        // An existing broken link is an invalid inventory, not an absent wallet directory.
+        val isDirectory = if (attrs.isSymbolicLink) {
+          Files.readAttributes(dir.toPath, classOf[BasicFileAttributes]).isDirectory
+        } else attrs.isDirectory
+        if (!isDirectory) throw new IOException("Wallet secret directory is not a directory")
+        Option(dir.listFiles()).getOrElse(throw new IOException("Cannot list wallet secret directory"))
+          .toSeq.filterNot(_.getName.startsWith(StagingPrefix))
+    }
+  }
+
   /**
    * Initializes storage instance with new wallet file encrypted with the given `pass`.
    * @param seed   - seed bytes, erased on both success and failure
@@ -102,6 +126,10 @@ object JsonSecretStorage {
    */
   def init(seed: Array[Byte], pass: SecretString, usePre1627KeyDerivation: Boolean)(settings: SecretStorageSettings): JsonSecretStorage = {
     try {
+      // A fresh encryption produces a new filename; checking only that target cannot prevent reinitialization.
+      if (storageEntries(settings).nonEmpty) {
+        throw new FileAlreadyExistsException("Wallet secret directory is not empty")
+      }
       val iv = scorex.utils.Random.randomBytes(crypto.AES.NonceBitsLen / 8)
       val salt = scorex.utils.Random.randomBytes(32)
       val (ciphertext, tag) = crypto.AES.encrypt(seed, pass.getData(), salt, iv)(settings.encryption)
@@ -116,14 +144,22 @@ object JsonSecretStorage {
   }
 
   /** Writes and closes a staging file before publishing it atomically. */
+  private[secrets] def persist(file: File, jsonRaw: String): Unit =
+    persist(file, jsonRaw, path => Files.newBufferedWriter(path, UTF_8))
+
   private[secrets] def persist(file: File, jsonRaw: String,
-                               openWriter: Path => Writer = path => Files.newBufferedWriter(path, UTF_8)): Unit = {
+                               openWriter: Path => Writer): Unit = {
     val target = file.toPath.toAbsolutePath
     Files.createDirectories(target.getParent)
     if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
       throw new FileAlreadyExistsException(target.toString)
     }
-    val staging = Files.createTempFile(target.getParent, StagingPrefix, ".tmp")
+    val staging = if (Files.getFileAttributeView(target.getParent, classOf[PosixFileAttributeView]) != null) {
+      Files.createTempFile(target.getParent, StagingPrefix, ".tmp",
+        PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")))
+    } else {
+      Files.createTempFile(target.getParent, StagingPrefix, ".tmp")
+    }
     try {
       val writer = openWriter(staging)
       var writeFailure: Option[Throwable] = None
@@ -164,23 +200,11 @@ object JsonSecretStorage {
     init(seed, encryptionPass, usePre1627KeyDerivation)(settings)
   }
 
-  def readFile(settings: SecretStorageSettings): Try[JsonSecretStorage] = {
-    val dir = new File(settings.secretDir)
-    if (dir.exists()) {
-      dir.listFiles().toList.filterNot(_.getName.startsWith(StagingPrefix)) match {
-        case files if files.size > 1 =>
-          val jsonFiles = files.filter(_.getName.contains(".json"))
-          jsonFiles.headOption match {
-            case Some(headFile) => Success(new JsonSecretStorage(headFile, settings.encryption))
-            case None => Failure(new Exception(s"No json files found in dir '$dir'"))
-          }
-        case headFile :: _ =>
-          Success(new JsonSecretStorage(headFile, settings.encryption))
-        case Nil =>
-          Failure(new Exception(s"Cannot readSecretStorage: Secret file not found in dir '$dir'"))
-      }
-    } else {
-      Failure(new FileNotFoundException(s"Cannot readSecretStorage: dir '$dir' doesn't exist"))
+  def readFile(settings: SecretStorageSettings): Try[JsonSecretStorage] = Try {
+    storageEntries(settings) match {
+      case Seq(file) if file.isFile => new JsonSecretStorage(file, settings.encryption)
+      case Seq() => throw new SecretFileNotFoundException
+      case _ => throw new IOException("Wallet secret directory does not contain one unambiguous wallet file")
     }
   }
 

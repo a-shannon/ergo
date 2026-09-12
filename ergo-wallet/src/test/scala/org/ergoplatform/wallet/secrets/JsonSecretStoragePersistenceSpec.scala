@@ -10,6 +10,7 @@ import org.scalatest.propspec.AnyPropSpec
 import java.io.{File, IOException, Writer}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{FileAlreadyExistsException, Files, Path}
+import java.nio.file.attribute.{PosixFileAttributeView, PosixFilePermissions}
 
 class JsonSecretStoragePersistenceSpec extends AnyPropSpec with Matchers with FileUtils {
   private val encryption = EncryptionSettings("HmacSHA256", 1, 256)
@@ -139,7 +140,7 @@ class JsonSecretStoragePersistenceSpec extends AnyPropSpec with Matchers with Fi
     }
   }
 
-  property("persistence does not overwrite an existing destination") {
+  property("low-level persistence refuses an already occupied exact destination") {
     val dir = createTempDir
     val file = Files.write(dir.toPath.resolve("wallet.json"), contents.getBytes(UTF_8)).toFile
 
@@ -149,6 +150,110 @@ class JsonSecretStoragePersistenceSpec extends AnyPropSpec with Matchers with Fi
 
     new String(Files.readAllBytes(file.toPath), UTF_8) shouldBe contents
     entries(dir) shouldBe Set("wallet.json")
+  }
+
+  property("a second initialization refuses an existing wallet and erases the new seed") {
+    val dir = createTempDir
+    val settings = SecretStorageSettings(dir.getAbsolutePath, encryption)
+    val first = JsonSecretStorage.init(Array.fill[Byte](32)(1), SecretString.create("first password"), false)(settings)
+    val original = Files.readAllBytes(first.secretFile.toPath)
+    val nextSeed = Array.fill[Byte](32)(2)
+
+    intercept[FileAlreadyExistsException] {
+      JsonSecretStorage.init(nextSeed, SecretString.create("second password"), false)(settings)
+    }
+    nextSeed shouldBe Array.fill[Byte](32)(0)
+    entries(dir) shouldBe Set(first.secretFile.getName)
+    Files.readAllBytes(first.secretFile.toPath) shouldBe original
+    first.unlock(SecretString.create("first password")) shouldBe 'success
+    first.lock()
+  }
+
+  property("initialization refuses a legacy filename and leaves it unchanged") {
+    val dir = createTempDir
+    val legacy = Files.write(dir.toPath.resolve("legacy-wallet"), contents.getBytes(UTF_8))
+    val settings = SecretStorageSettings(dir.getAbsolutePath, encryption)
+    val seed = Array.fill[Byte](32)(1)
+    intercept[FileAlreadyExistsException] {
+      JsonSecretStorage.init(seed, SecretString.create("test password"), false)(settings)
+    }
+    Files.readAllBytes(legacy) shouldBe contents.getBytes(UTF_8)
+    seed shouldBe Array.fill[Byte](32)(0)
+    JsonSecretStorage.readFile(settings).get.secretFile.toPath shouldBe legacy
+  }
+
+  property("wallet discovery rejects ambiguous files instead of choosing directory order") {
+    val dir = createTempDir
+    Files.write(dir.toPath.resolve("first.json"), contents.getBytes(UTF_8))
+    Files.write(dir.toPath.resolve("second.json"), contents.getBytes(UTF_8))
+    val settings = SecretStorageSettings(dir.getAbsolutePath, encryption)
+    JsonSecretStorage.readFile(settings) shouldBe 'failure
+    val seed = Array.fill[Byte](32)(1)
+    intercept[FileAlreadyExistsException] {
+      JsonSecretStorage.init(seed, SecretString.create("test password"), false)(settings)
+    }
+    seed shouldBe Array.fill[Byte](32)(0)
+    entries(dir) shouldBe Set("first.json", "second.json")
+  }
+
+  property("initialization preserves unrelated staging material and explicitly restricts POSIX permissions") {
+    val dir = createTempDir
+    val staged = Files.write(dir.toPath.resolve(".ergo-secret-staging-other.tmp"), contents.getBytes(UTF_8))
+    val inactive = Files.createDirectory(dir.toPath.resolve(".ergo-secret-staging-wallet-example"))
+    val settings = SecretStorageSettings(dir.getAbsolutePath, encryption)
+    val storage = JsonSecretStorage.init(Array.fill[Byte](32)(1), SecretString.create("test password"), false)(settings)
+    entries(dir) shouldBe Set(staged.getFileName.toString, inactive.getFileName.toString, storage.secretFile.getName)
+    Files.readAllBytes(staged) shouldBe contents.getBytes(UTF_8)
+    JsonSecretStorage.readFile(settings).get.secretFile shouldBe storage.secretFile
+    if (Files.getFileAttributeView(storage.secretFile.toPath, classOf[PosixFileAttributeView]) != null) {
+      Files.getPosixFilePermissions(storage.secretFile.toPath) shouldBe PosixFilePermissions.fromString("rw-------")
+    }
+  }
+
+  property("wallet discovery rejects a legacy wallet alongside a JSON wallet") {
+    val dir = createTempDir
+    val legacy = Files.write(dir.toPath.resolve("legacy-wallet"), contents.getBytes(UTF_8))
+    val json = Files.write(dir.toPath.resolve("current.json"), contents.getBytes(UTF_8))
+    val settings = SecretStorageSettings(dir.getAbsolutePath, encryption)
+    JsonSecretStorage.readFile(settings) shouldBe 'failure
+    JsonSecretStorage.readFile(settings).failed.get should not be a[JsonSecretStorage.SecretFileNotFoundException]
+    Files.readAllBytes(legacy) shouldBe contents.getBytes(UTF_8)
+    Files.readAllBytes(json) shouldBe contents.getBytes(UTF_8)
+  }
+
+  property("wallet discovery reports a file used as the secret directory as an error") {
+    val dir = createTempDir
+    val occupied = Files.write(dir.toPath.resolve("occupied"), contents.getBytes(UTF_8))
+    val settings = SecretStorageSettings(occupied.toString, encryption)
+    JsonSecretStorage.readFile(settings) shouldBe 'failure
+    JsonSecretStorage.readFile(settings).failed.get should not be a[JsonSecretStorage.SecretFileNotFoundException]
+    Files.readAllBytes(occupied) shouldBe contents.getBytes(UTF_8)
+  }
+
+  property("wallet discovery distinguishes absence from invalid and ambiguous inventory") {
+    val dir = createTempDir
+    val settings = SecretStorageSettings(dir.toPath.resolve("missing").toString, encryption)
+    JsonSecretStorage.readFile(settings).failed.get shouldBe a[JsonSecretStorage.SecretFileNotFoundException]
+    Files.createDirectory(new File(settings.secretDir).toPath)
+    JsonSecretStorage.readFile(settings).failed.get shouldBe a[JsonSecretStorage.SecretFileNotFoundException]
+    Files.write(new File(settings.secretDir).toPath.resolve("one.json"), contents.getBytes(UTF_8))
+    Files.write(new File(settings.secretDir).toPath.resolve("two.json"), contents.getBytes(UTF_8))
+    JsonSecretStorage.readFile(settings).failed.get should not be a[JsonSecretStorage.SecretFileNotFoundException]
+  }
+
+  property("wallet discovery rejects a dangling directory symlink while preserving valid directory links") {
+    val dir = createTempDir
+    if (Files.getFileAttributeView(dir.toPath, classOf[PosixFileAttributeView]) != null) {
+      val missing = dir.toPath.resolve("missing")
+      val link = Files.createSymbolicLink(dir.toPath.resolve("keystore"), missing)
+      val settings = SecretStorageSettings(link.toString, encryption)
+      JsonSecretStorage.readFile(settings) shouldBe 'failure
+      JsonSecretStorage.readFile(settings).failed.get should not be a[JsonSecretStorage.SecretFileNotFoundException]
+      Files.createDirectory(missing)
+      JsonSecretStorage.readFile(settings).failed.get shouldBe a[JsonSecretStorage.SecretFileNotFoundException]
+      val wallet = Files.write(missing.resolve("wallet.json"), contents.getBytes(UTF_8))
+      JsonSecretStorage.readFile(settings).get.secretFile.toPath.toRealPath() shouldBe wallet.toRealPath()
+    }
   }
 
   property("a publication error propagates and removes the owned staging file") {
