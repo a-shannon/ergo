@@ -25,6 +25,7 @@ import org.ergoplatform.sdk.wallet.Constants.MaxAssetsPerBox
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, ErgoTreePredef, Input}
 import scorex.crypto.hash.Digest32
+import scorex.db.ByteArrayWrapper
 import scorex.util.encode.Base16
 import scorex.util.{ModifierId, ScorexLogging}
 import sigma.ast.syntax.ErgoBoxRType
@@ -993,7 +994,8 @@ object CandidateGenerator extends ScorexLogging {
               accSize: Long,
               lastFeeTx: Option[CostedTransaction],
               invalidTxs: Seq[ModifierId],
-              previousCandidates: List[(Seq[CostedTransaction], Seq[ModifierId])]
+              previousCandidates: List[(Seq[CostedTransaction], Seq[ModifierId])],
+              deferredOutputs: Set[ByteArrayWrapper]
             ): (Seq[ErgoTransaction], Seq[ModifierId]) = {
       // transactions from mempool and fee txs from the previous step
       val currentCosted = acc ++ lastFeeTx
@@ -1003,15 +1005,22 @@ object CandidateGenerator extends ScorexLogging {
           case (txs, invalid) => txs.map(_._1) -> invalid
         }, blockVersion, maxBlockSize)
 
-      val stateWithTxs = us.withTransactions(current)
+      lazy val stateWithTxs = us.withTransactions(current)
 
       mempoolTxs.headOption match {
         case Some(tx) =>
-          if (!inputsNotSpent(tx, stateWithTxs) || doublespend(current, tx)) {
-            //mark transaction as invalid if it tries to do double-spending or trying to spend outputs not present
-            //do these checks before validating the scripts to save time
-            log.debug(s"Transaction ${tx.id} double-spending or spending non-existing inputs")
-            loop(mempoolTxs.tail, acc, accSize, lastFeeTx, invalidTxs :+ tx.id, previousCandidates)
+          val dependsOnDeferredOutput = deferredOutputs.nonEmpty && (
+            tx.inputs.exists(input => deferredOutputs.contains(ByteArrayWrapper(input.boxId))) ||
+            tx.dataInputs.exists(input => deferredOutputs.contains(ByteArrayWrapper(input.boxId)))
+          )
+          lazy val deferredWithTxOutputs =
+            deferredOutputs ++ tx.outputs.iterator.map(box => ByteArrayWrapper(box.id))
+          if (dependsOnDeferredOutput) {
+            loop(mempoolTxs.tail, acc, accSize, lastFeeTx, invalidTxs, previousCandidates, deferredWithTxOutputs)
+          } else if (doublespend(current, tx)) {
+            loop(mempoolTxs.tail, acc, accSize, lastFeeTx, invalidTxs :+ tx.id, previousCandidates, deferredOutputs)
+          } else if (!inputsNotSpent(tx, stateWithTxs)) {
+            loop(mempoolTxs.tail, acc, accSize, lastFeeTx, invalidTxs :+ tx.id, previousCandidates, deferredOutputs)
           } else {
             // check validity and calculate transaction cost
             stateWithTxs.validateWithCost(
@@ -1041,11 +1050,10 @@ object CandidateGenerator extends ScorexLogging {
                               newSize + BlockTransactionsSerializer.transactionSize(feeTx, blockVersion))
                             if (correctLimits(blockTxs, maxBlockCost, maxBlockSize, sectionSize)) {
                               loop(mempoolTxs.tail, newTxs, newSize, Some(feeTx -> cost), invalidTxs,
-                                (currentCosted -> invalidTxs) :: previousCandidates)
+                                (currentCosted -> invalidTxs) :: previousCandidates, deferredOutputs)
                             } else {
-                              log.debug(s"Finishing block assembly on limits overflow, " +
-                                        s"cost is ${currentCosted.map(_._2).sum}, cost limit: $maxBlockCost")
-                              finish
+                              loop(mempoolTxs.tail, acc, accSize, lastFeeTx, invalidTxs,
+                                previousCandidates, deferredWithTxOutputs)
                             }
                           case Failure(e) =>
                             log.warn(
@@ -1062,15 +1070,16 @@ object CandidateGenerator extends ScorexLogging {
                         def sectionSize: Long = BlockTransactionsSerializer.sectionSize(blockVersion, blockTxs.size, blockPayloadSize)
                         if (correctLimits(blockTxs, maxBlockCost, maxBlockSize, sectionSize)) {
                           loop(mempoolTxs.tail, blockTxs, blockPayloadSize, lastFeeTx, invalidTxs,
-                            (currentCosted -> invalidTxs) :: previousCandidates)
+                            (currentCosted -> invalidTxs) :: previousCandidates, deferredOutputs)
                         } else {
-                          finish
+                          loop(mempoolTxs.tail, acc, accSize, lastFeeTx, invalidTxs,
+                            previousCandidates, deferredWithTxOutputs)
                         }
                     }
                 }
               case Failure(e) =>
                 log.info(s"Not included transaction ${tx.id} due to ${e.getMessage}: ", e)
-                loop(mempoolTxs.tail, acc, accSize, lastFeeTx, invalidTxs :+ tx.id, previousCandidates)
+                loop(mempoolTxs.tail, acc, accSize, lastFeeTx, invalidTxs :+ tx.id, previousCandidates, deferredOutputs)
             }
           }
         case None => // mempool is empty
@@ -1079,7 +1088,7 @@ object CandidateGenerator extends ScorexLogging {
     }
 
     // Vector prefixes share their storage; retaining fallback snapshots must not retain quadratic copies.
-    val res = loop(transactions, Vector.empty, 0L, None, Seq.empty, Nil)
+    val res = loop(transactions, Vector.empty, 0L, None, Seq.empty, Nil, Set.empty)
     log.debug(
       s"Collected ${res._1.length} transactions for block #$currentHeight, " +
         s"invalid transaction ids (total:${res._2.length}) for block #$currentHeight : ${res._2}")
