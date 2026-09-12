@@ -12,6 +12,7 @@ import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.utils.HistoryTestHelpers.generateHistory
 import org.ergoplatform.utils.generators.ChainGenerator.{applyHeaderChain, genHeaderChain}
 import org.ergoplatform.utils.generators.ErgoCoreGenerators.defaultHeaderGen
+import scorex.crypto.hash.Digest32
 
 import scala.util.Try
 
@@ -142,5 +143,51 @@ class SyncInfoV2HistorySpecification extends ErgoCorePropertyTest {
     val reduced = reader.syncInfoV2(full = false)
     reduced.lastHeaders.map(_.id) shouldBe Seq(headers.head.id)
     checkRoundtrip(reduced)
+  }
+
+  Seq((3, 9, 13), (18, 249, 70)).foreach { case (sharedHeight, heightA, heightB) =>
+    property(s"full summaries recover both fork continuations after shared height $sharedHeight at tips $heightA/$heightB") {
+      var historyA = newHistory()
+      var historyB = newHistory()
+      try {
+        // Exercise stored header histories and the actual summary/continuation methods.
+        // Full block application and network delivery are separate integration contracts.
+        val shared = genHeaderChain(sharedHeight, historyA, diffBitsOpt = None, useRealTs = false)
+        val branchA = genHeaderChain(heightA - sharedHeight, prefixOpt = Some(shared.last),
+          control = historyA.difficultyCalculator, extensionHash = Digest32 @@ Array.fill[Byte](32)(1),
+          diffBitsOpt = None, useRealTs = false).headers.tail
+        val branchB = genHeaderChain(heightB - sharedHeight, prefixOpt = Some(shared.last),
+          control = historyB.difficultyCalculator, extensionHash = Digest32 @@ Array.fill[Byte](32)(2),
+          diffBitsOpt = None, useRealTs = false).headers.tail
+        val chainA = shared.headers ++ branchA
+        val chainB = shared.headers ++ branchB
+        historyA = applyHeaderChain(historyA, HeaderChain(chainA))
+        historyB = applyHeaderChain(historyB, HeaderChain(chainB))
+        historyA.headersHeight shouldBe heightA
+        historyB.headersHeight shouldBe heightB
+        branchA.head.id should not be branchB.head.id
+        historyA.contains(branchB.head.id) shouldBe false
+        historyB.contains(branchA.head.id) shouldBe false
+
+        Seq((historyA, historyB, chainA), (historyB, historyA, chainB)).foreach {
+          case (local, peer, localChain) =>
+            val sparseHeaders = ErgoHistoryReader.FullV2SyncOffsets.toSeq
+              .flatMap(offset => peer.bestHeaderAtHeight(peer.headersHeight - offset))
+            sparseHeaders should not be empty
+            sparseHeaders.exists(header => local.contains(header.id)) shouldBe false
+            local.continuationIdsV2(ErgoSyncInfoV2(sparseHeaders), size = 400) shouldBe empty
+
+            val full = peer.syncInfoV2(full = true)
+            checkRoundtrip(full)
+            val continuation = local.continuationIdsV2(full, size = 400)
+            continuation.map(_._2) shouldBe localChain.tail.map(_.id)
+            continuation.map(_._1).distinct shouldBe Seq(Header.modifierTypeId)
+            continuation.map(_._2) should contain(localChain(sharedHeight).id)
+            full.lastHeaders.last.id shouldBe shared.head.id
+        }
+      } finally {
+        try historyA.closeStorage() finally historyB.closeStorage()
+      }
+    }
   }
 }
