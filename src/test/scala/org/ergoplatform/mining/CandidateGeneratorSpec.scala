@@ -904,10 +904,14 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
     candidateGenerator.tell(OrderingSolutionFound(initBlock.header.powSolution), testProbe.ref)
     expectOrderingBlockApplied(testProbe, blockProbe, initBlock)
 
-    // Get first candidate after chain is established
-    candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), testProbe.ref)
-    val candidate1 = testProbe.expectMsgPF(candidateGenDelay) {
-      case StatusReply.Success(c: Candidate) => c
+    // The block probe can observe application before the generator updates its cache.
+    val candidate1 = eventually(timeout(candidateGenDelay), interval(100.millis)) {
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), testProbe.ref)
+      val candidate = testProbe.expectMsgPF(candidateGenDelay) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      candidate.candidateBlock.parentOpt.map(_.id) shouldBe Some(initBlock.id)
+      candidate
     }
 
     // Force regeneration - this should preserve candidate1 as cachedPreviousCandidate
