@@ -13,7 +13,7 @@ import org.ergoplatform.utils.ErgoCoreTestConstants.parameters
 import org.ergoplatform.utils.HistoryTestHelpers.generateHistory
 import org.ergoplatform.utils.generators.ChainGenerator.{applyChain, genChain}
 import org.ergoplatform.utils.generators.ValidBlocksGenerators.validTransactionsFromBoxHolder
-import scorex.crypto.authds.ADDigest
+import scorex.crypto.authds.{ADDigest, LeafData}
 import scorex.crypto.authds.merkle.BatchMerkleProof
 import scorex.crypto.hash.Digest32
 import scorex.util.{bytesToId, idToBytes}
@@ -67,6 +67,13 @@ class InputBlockProcessorSpecification extends ErgoCorePropertyTest with ErgoCom
       Digest32 @@ Array.fill(32)(0.toByte),
       Digest32 @@ Array.fill(32)(0.toByte),
       BatchMerkleProof(Seq.empty, Seq.empty)(Algos.hash))
+  }
+
+  private def provedFieldsForTransactions(transactions: Seq[ErgoTransaction]): InputBlockFields = {
+    val digest = Algos.merkleTreeRoot(transactions.map(tx => LeafData @@ tx.serializedId))
+    val prevDigest = Digest32 @@ Array.fill(32)(0.toByte)
+    val extCandidate = InputBlockFields.toExtensionFields(None, digest, prevDigest)
+    new InputBlockFields(None, digest, prevDigest, extCandidate.proofForInputBlockData.get)
   }
 
   property("apply first input block after ordering block") {
@@ -393,6 +400,25 @@ class InputBlockProcessorSpecification extends ErgoCorePropertyTest with ErgoCom
     h.bestInputBlocksChain() shouldBe Seq()
     h.applyInputBlockTransactions(ib.id, Seq(tx), us) shouldBe (Seq.empty -> Seq.empty)
     h.bestInputBlocksChain() shouldBe Seq()
+  }
+
+  property("reject input block transactions that do not match the announced digest") {
+    val bh = BoxHolder(Seq(eb1))
+    val us = UtxoState.fromBoxHolder(bh, None, createTempDir, settings, parameters)
+    val tx1 = validTransactionsFromBoxHolder(bh, new RandomWrapper(Some(1)), 201)._1
+
+    val h = generateHistory(verifyTransactions = true, StateType.Utxo, PoPoWBootstrap = false, blocksToKeep = -1,
+      epochLength = 10000, useLastEpochs = 3, initialDiffOpt = None, None)
+    val c1 = genChain(2, h, stateOpt = Some(us))
+    applyChain(h, c1)
+
+    val c2 = genChain(2, h, stateOpt = Some(us)).tail
+    val ib = InputBlockAnnouncement(1, c2(0).header, provedFieldsForTransactions(Seq.empty), None)
+    h.applyInputBlock(ib) shouldBe None
+
+    h.applyInputBlockTransactions(ib.id, tx1, us) shouldBe (Seq.empty -> Seq.empty)
+    h.getInputBlockTransactionIds(ib.id) shouldBe None
+    h.getInputBlockTransactions(ib.id) shouldBe None
   }
 
   property("apply input block with parent ordering block not available") {
@@ -1374,6 +1400,8 @@ class InputBlockProcessorSpecification extends ErgoCorePropertyTest with ErgoCom
 
     // Test transaction retrieval
     h.getInputBlockTransactions(ib1.id) shouldBe Some(tx1)
+    h.getCollectedInputBlocksTransactions(h.bestFullBlockOpt.get.id) shouldBe Some(tx1)
+    h.getCollectedInputBlocksTransactions(bytesToId(Algos.hash("other-ordering-block"))) shouldBe None
 
     // Test weak ID retrieval
     h.getInputBlockTransactionWeakIds(ib1.id) shouldBe Some(tx1.map(_.weakId))
@@ -2949,6 +2977,228 @@ class InputBlockProcessorSpecification extends ErgoCorePropertyTest with ErgoCom
     // Should succeed - no double spending
     h.applyInputBlockTransactions(ib1.id, Seq(tx1, tx2), us) shouldBe (Seq(ib1.id) -> Seq.empty)
     h.bestInputBlocksChain() shouldBe Seq(ib1.id)
+  }
+
+  property("InputBlocksChain.registerCompletion should reject an unexpected block id") {
+    val us = UtxoState.fromBoxHolder(BoxHolder(Seq(eb1, eb2)), None, createTempDir, settings, parameters)
+    val h = generateHistory(verifyTransactions = true, StateType.Utxo, PoPoWBootstrap = false, blocksToKeep = -1,
+      epochLength = 10000, useLastEpochs = 3, initialDiffOpt = None, None)
+    val c1 = genChain(2, h, stateOpt = Some(us))
+    applyChain(h, c1)
+
+    val c2 = genChain(2, h, stateOpt = Some(us)).tail
+    val c3 = genChain(2, h, stateOpt = Some(us)).tail
+    val ib1 = InputBlockAnnouncement(1, c2(0).header, InputBlockFields.empty, None)
+    val ib2 = InputBlockAnnouncement(1, c3(0).header, parentOnly(idToBytes(ib1.id)), None)
+
+    h.applyInputBlock(ib1) shouldBe None
+    h.applyInputBlock(ib2) shouldBe None
+
+    val chain = h.inputBlocksTree().get.forks.head
+    chain.processedIndex shouldBe -1
+    chain.registerCompletion(ib2.id, 0L).isFailure shouldBe true
+  }
+
+  property("prune should remove input-block records behind the best chain") {
+    val us = UtxoState.fromBoxHolder(BoxHolder(Seq(eb1, eb2)), None, createTempDir, settings, parameters)
+    val h = generateHistory(verifyTransactions = true, StateType.Utxo, PoPoWBootstrap = false, blocksToKeep = -1,
+      epochLength = 10000, useLastEpochs = 3, initialDiffOpt = None, None)
+    val c1 = genChain(2, h, stateOpt = Some(us))
+    applyChain(h, c1)
+
+    val c2 = genChain(2, h, stateOpt = Some(us)).tail
+    val ib1 = InputBlockAnnouncement(1, c2(0).header, InputBlockFields.empty, None)
+    h.applyInputBlock(ib1)
+    h.applyInputBlockTransactions(ib1.id, Seq.empty, us)
+
+    h.getInputBlock(ib1.id) shouldBe Some(ib1)
+
+    val c3 = genChain(4, h, stateOpt = Some(us)).tail
+    applyChain(h, c3)
+
+    invokePrune(h)
+
+    h.getInputBlock(ib1.id) shouldBe None
+  }
+
+  property("prune should drop old input-block records and clean the disconnected waitlist") {
+    val us = UtxoState.fromBoxHolder(BoxHolder(Seq(eb1, eb2)), None, createTempDir, settings, parameters)
+    val h = generateHistory(verifyTransactions = true, StateType.Utxo, PoPoWBootstrap = false, blocksToKeep = -1,
+      epochLength = 10000, useLastEpochs = 3, initialDiffOpt = None, None)
+    val c1 = genChain(2, h, stateOpt = Some(us))
+    applyChain(h, c1)
+
+    val c2 = genChain(2, h, stateOpt = Some(us)).tail
+    val parentIb = InputBlockAnnouncement(1, c2(0).header, InputBlockFields.empty, None)
+
+    val c3 = genChain(2, h, stateOpt = Some(us)).tail
+    val childIb = InputBlockAnnouncement(1, c3(0).header, parentOnly(idToBytes(parentIb.id)), None)
+
+    h.applyInputBlock(childIb) shouldBe Some(parentIb.id)
+    h.disconnectedWaitlist shouldBe Set(childIb)
+
+    val c4 = genChain(4, h, stateOpt = Some(us)).tail
+    applyChain(h, c4)
+
+    invokePrune(h)
+
+    h.getInputBlock(parentIb.id) shouldBe None
+    h.getInputBlock(childIb.id) shouldBe None
+    h.disconnectedWaitlist shouldBe empty
+  }
+
+  property("processInputBlockTransactions should switch to a longer competing fork") {
+    val us = UtxoState.fromBoxHolder(BoxHolder(Seq(eb1, eb2)), None, createTempDir, settings, parameters)
+    val h = generateHistory(verifyTransactions = true, StateType.Utxo, PoPoWBootstrap = false, blocksToKeep = -1,
+      epochLength = 10000, useLastEpochs = 3, initialDiffOpt = None, None)
+    val c1 = genChain(2, h, stateOpt = Some(us))
+    applyChain(h, c1)
+
+    val c2 = genChain(2, h, stateOpt = Some(us)).tail
+    val ib1 = InputBlockAnnouncement(1, c2(0).header, InputBlockFields.empty, None)
+    h.applyInputBlock(ib1)
+    h.applyInputBlockTransactions(ib1.id, Seq.empty, us)
+
+    val c3 = genChain(2, h, stateOpt = Some(us)).tail
+    val c4 = genChain(2, h, stateOpt = Some(us)).tail
+
+    val ib2 = InputBlockAnnouncement(1, c3(0).header, InputBlockFields.empty, None)
+    val ib3 = InputBlockAnnouncement(1, c4(0).header, parentOnly(idToBytes(ib2.id)), None)
+
+    h.applyInputBlock(ib2)
+    h.applyInputBlock(ib3)
+
+    h.applyInputBlockTransactions(ib2.id, Seq.empty, us) shouldBe (Seq.empty -> Seq.empty)
+    h.bestInputBlocksChain() shouldBe Seq(ib1.id)
+
+    val result = h.applyInputBlockTransactions(ib3.id, Seq.empty, us)
+    result._1 shouldBe Seq(ib2.id, ib3.id)
+    result._2 shouldBe Seq.empty
+
+    h.bestInputBlocksChain() shouldBe Seq(ib3.id, ib2.id)
+  }
+
+  // --------------------------------------------------------------------------
+  // Deduplication tests
+  // --------------------------------------------------------------------------
+  property("applyInputBlock should ignore duplicate input block with no parent") {
+    val us = UtxoState.fromBoxHolder(BoxHolder(Seq(eb1, eb2)), None, createTempDir, settings, parameters)
+    val h = generateHistory(
+      verifyTransactions = true, StateType.Utxo, PoPoWBootstrap = false, blocksToKeep = -1,
+      epochLength = 10000, useLastEpochs = 3, initialDiffOpt = None, None
+    )
+    val c1 = genChain(2, h, stateOpt = Some(us))
+    applyChain(h, c1)
+
+    val c2 = genChain(2, h, stateOpt = Some(us)).tail
+    val ib = InputBlockAnnouncement(1, c2(0).header, InputBlockFields.empty, None)
+
+    h.applyInputBlock(ib) shouldBe None
+    h.getInputBlock(ib.id) shouldBe Some(ib)
+
+    h.applyInputBlock(ib) shouldBe None
+    h.inputBlocksTree().get.forks.length shouldBe 1
+  }
+
+  property("applyInputBlock should ignore duplicate input block with known parent") {
+    val us = UtxoState.fromBoxHolder(BoxHolder(Seq(eb1, eb2)), None, createTempDir, settings, parameters)
+    val h = generateHistory(
+      verifyTransactions = true, StateType.Utxo, PoPoWBootstrap = false, blocksToKeep = -1,
+      epochLength = 10000, useLastEpochs = 3, initialDiffOpt = None, None
+    )
+    val c1 = genChain(2, h, stateOpt = Some(us))
+    applyChain(h, c1)
+
+    val c2 = genChain(2, h, stateOpt = Some(us)).tail
+    val ib1 = InputBlockAnnouncement(1, c2(0).header, InputBlockFields.empty, None)
+    h.applyInputBlock(ib1) shouldBe None
+    h.applyInputBlockTransactions(ib1.id, Seq.empty, us)
+
+    val c3 = genChain(2, h, stateOpt = Some(us)).tail
+    val ib2 = InputBlockAnnouncement(1, c3(0).header, parentOnly(idToBytes(ib1.id)), None)
+
+    h.applyInputBlock(ib2) shouldBe None
+    h.applyInputBlock(ib2) shouldBe None
+    h.inputBlocksTree().get.forks.length shouldBe 1
+  }
+
+  property("applyInputBlock should not re-request parent for duplicate out-of-order block") {
+    val us = UtxoState.fromBoxHolder(BoxHolder(Seq(eb1, eb2)), None, createTempDir, settings, parameters)
+    val h = generateHistory(
+      verifyTransactions = true, StateType.Utxo, PoPoWBootstrap = false, blocksToKeep = -1,
+      epochLength = 10000, useLastEpochs = 3, initialDiffOpt = None, None
+    )
+    val c1 = genChain(2, h, stateOpt = Some(us))
+    applyChain(h, c1)
+
+    val c2 = genChain(2, h, stateOpt = Some(us)).tail
+    val parentIb = InputBlockAnnouncement(1, c2(0).header, InputBlockFields.empty, None)
+
+    val c3 = genChain(2, h, stateOpt = Some(us)).tail
+    val childIb = InputBlockAnnouncement(1, c3(0).header, parentOnly(idToBytes(parentIb.id)), None)
+
+    h.applyInputBlock(childIb) shouldBe Some(parentIb.id)
+    h.disconnectedWaitlist shouldBe Set(childIb)
+
+    h.applyInputBlock(childIb) shouldBe None
+    h.disconnectedWaitlist shouldBe Set(childIb)
+  }
+
+  property("applyInputBlock should ignore duplicate after out-of-order block is reconnected") {
+    val us = UtxoState.fromBoxHolder(BoxHolder(Seq(eb1, eb2)), None, createTempDir, settings, parameters)
+    val h = generateHistory(
+      verifyTransactions = true, StateType.Utxo, PoPoWBootstrap = false, blocksToKeep = -1,
+      epochLength = 10000, useLastEpochs = 3, initialDiffOpt = None, None
+    )
+    val c1 = genChain(2, h, stateOpt = Some(us))
+    applyChain(h, c1)
+
+    val c2 = genChain(2, h, stateOpt = Some(us)).tail
+    val parentIb = InputBlockAnnouncement(1, c2(0).header, InputBlockFields.empty, None)
+
+    val c3 = genChain(2, h, stateOpt = Some(us)).tail
+    val childIb = InputBlockAnnouncement(1, c3(0).header, parentOnly(idToBytes(parentIb.id)), None)
+
+    h.applyInputBlock(childIb) shouldBe Some(parentIb.id)
+    h.disconnectedWaitlist shouldBe Set(childIb)
+    // Child transactions arrive before parent; block is not in a chain yet so no progress
+    h.applyInputBlockTransactions(childIb.id, Seq.empty, us) shouldBe (Seq.empty -> Seq.empty)
+
+    h.applyInputBlock(parentIb) shouldBe None
+    h.applyInputBlockTransactions(parentIb.id, Seq.empty, us) shouldBe (Seq(parentIb.id, childIb.id) -> Seq.empty)
+
+    h.bestInputBlocksChain() shouldBe Seq(childIb.id, parentIb.id)
+
+    h.applyInputBlock(childIb) shouldBe None
+    h.inputBlocksTree().get.forks.length shouldBe 1
+    h.bestInputBlocksChain() shouldBe Seq(childIb.id, parentIb.id)
+  }
+
+  property("P2P layer should deduplicate input blocks before sending to NodeViewHolder") {
+    val us = UtxoState.fromBoxHolder(BoxHolder(Seq(eb1, eb2)), None, createTempDir, settings, parameters)
+    val h = generateHistory(
+      verifyTransactions = true, StateType.Utxo, PoPoWBootstrap = false, blocksToKeep = -1,
+      epochLength = 10000, useLastEpochs = 3, initialDiffOpt = None, None
+    )
+    val c1 = genChain(2, h, stateOpt = Some(us))
+    applyChain(h, c1)
+
+    val c2 = genChain(2, h, stateOpt = Some(us)).tail
+    val ib = InputBlockAnnouncement(1, c2(0).header, InputBlockFields.empty, None)
+
+    h.applyInputBlock(ib) shouldBe None
+    h.getInputBlock(ib.id) shouldBe Some(ib)
+
+    val alreadyKnown = h.getInputBlock(ib.id).isDefined
+    alreadyKnown shouldBe true
+  }
+
+  private def invokePrune(h: InputBlocksProcessor): Unit = {
+    import scala.reflect.runtime.{universe => ru}
+    val mirror = ru.runtimeMirror(h.getClass.getClassLoader)
+    val im = mirror.reflect(h)
+    val pruneMethod = ru.typeOf[InputBlocksProcessor].decl(ru.TermName("prune")).asMethod
+    im.reflectMethod(pruneMethod)()
   }
 
   // todo : tests for digest state

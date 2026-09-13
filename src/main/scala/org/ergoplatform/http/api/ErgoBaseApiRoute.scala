@@ -5,9 +5,10 @@ import akka.http.scaladsl.server.Route
 import akka.http.scaladsl.server.{Directive1, ValidationRejection}
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
 import org.ergoplatform.nodeView.ErgoReadersHolder.{GetReaders, Readers}
+import org.ergoplatform.nodeView.history.ErgoHistoryReader
 import org.ergoplatform.nodeView.mempool.ErgoMemPoolReader
 import org.ergoplatform.nodeView.state.{ErgoStateReader, UtxoStateReader}
-import org.ergoplatform.settings.{Algos, ErgoSettings}
+import org.ergoplatform.settings.{Algos, Constants, ErgoSettings}
 import scorex.core.api.http.ApiRoute
 import scorex.util.{bytesToId, ModifierId}
 import akka.pattern.ask
@@ -34,10 +35,19 @@ trait ErgoBaseApiRoute extends ApiRoute with ApiCodecs {
   val modifierIdGet: Directive1[ModifierId] = parameters("id".as[String])
     .flatMap(handleModifierId)
 
+  private def parseModifierId(value: String): Try[ModifierId] =
+    Algos.decode(value).flatMap { bytes =>
+      if (bytes.length == Constants.ModifierIdSize) {
+        Success(bytesToId(bytes))
+      } else {
+        Failure(new IllegalArgumentException("Wrong modifierId length"))
+      }
+    }
+
   private def handleModifierId(value: String): Directive1[ModifierId] = {
-    Algos.decode(value) match {
-      case Success(bytes) => provide(bytesToId(bytes))
-      case _              => reject(ValidationRejection("Wrong modifierId format"))
+    parseModifierId(value) match {
+      case Success(id) => provide(id)
+      case _           => reject(ValidationRejection("Wrong modifierId format"))
     }
   }
 
@@ -45,9 +55,9 @@ trait ErgoBaseApiRoute extends ApiRoute with ApiCodecs {
     val acc = collection.mutable.Buffer.empty[ModifierId]
     val err = collection.mutable.Buffer.empty[String]
     for (value <- values) {
-      Algos.decode(value) match {
-        case Success(bytes) => acc += bytesToId(bytes)
-        case Failure(e)     => err += e.getMessage
+      parseModifierId(value) match {
+        case Success(id) => acc += id
+        case Failure(e)  => err += e.getMessage
       }
     }
     if (err.nonEmpty) {
@@ -77,9 +87,9 @@ trait ErgoBaseApiRoute extends ApiRoute with ApiCodecs {
 
   private def getStateAndPool(
     readersHolder: ActorRef
-  ): Future[(ErgoStateReader, ErgoMemPoolReader)] = {
+  ): Future[(ErgoHistoryReader, ErgoStateReader, ErgoMemPoolReader)] = {
     (readersHolder ? GetReaders).mapTo[Readers].map { rs =>
-      (rs.s, rs.m)
+      (rs.h, rs.s, rs.m)
     }
   }
 
@@ -107,8 +117,9 @@ trait ErgoBaseApiRoute extends ApiRoute with ApiCodecs {
   }
 
   /**
-    * Helper method to verify transaction against UTXO set (and unconfirmed outputs in the mempool), or check
-    * transaction syntax only if UTXO set is not available (the node is running in "digest" mode)
+    * Helper method to verify transaction against UTXO set (and outputs of unconfirmed transactions in the mempool
+    * and in input blocks of the best input-blocks chain), or check transaction syntax only if UTXO set is not
+    * available (the node is running in "digest" mode)
     *
     * Used in /transactions (POST /transactions and /transactions/check methods) and /wallet (/wallet/payment/send
     * and /wallet/transaction/send) API methods to check submitted or generated transaction
@@ -123,10 +134,13 @@ trait ErgoBaseApiRoute extends ApiRoute with ApiCodecs {
 
     getStateAndPool(readersHolder)
       .map {
-        case (utxo: UtxoStateReader, mp: ErgoMemPoolReader) =>
+        case (hr: ErgoHistoryReader, utxo: UtxoStateReader, mp: ErgoMemPoolReader) =>
           val maxTxCost = ergoSettings.nodeSettings.maxTransactionCost
           val validationContext = utxo.stateContext.simplifiedUpcoming()
-          utxo.withMempool(mp)
+          val inputBlockTransactions = hr.bestInputBlocksChain().flatMap { id =>
+            hr.getInputBlockTransactions(id).getOrElse(Seq.empty)
+          }
+          utxo.withMempoolAndInputBlocks(mp, inputBlockTransactions)
             .validateWithCost(tx, validationContext, maxTxCost, None, softFieldsAllowed = true) // todo: pass sFA from API
             .map(cost => new UnconfirmedTransaction(tx, Some(cost), now, now, bytes, source = None))
         case _ =>
