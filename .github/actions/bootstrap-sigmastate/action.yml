@@ -27,8 +27,6 @@ runs:
       env:
         ERGO_BUILD_FILE: ${{ inputs.ergo-build-file }}
         SIGMASTATE_REPOSITORY: https://github.com/ergoplatform/sigmastate-interpreter.git
-        SIGMASTATE_COMMIT: 368a860be033af94aa14895381f42099b3646db6
-        SIGMASTATE_VERSION: 6.0.5-22-368a860b-SNAPSHOT
         SIGMASTATE_SCALA_VERSION: ${{ inputs.scala-version }}
       run: |
         set -euo pipefail
@@ -42,10 +40,19 @@ runs:
         fi
 
         declared_version="$(sed -nE 's/^[[:space:]]*val[[:space:]]+sigmaStateVersion[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/p' "${ergo_build}")"
-        if [[ "${declared_version}" != "${SIGMASTATE_VERSION}" ]]; then
-          echo "::error::Ergo declares SigmaState ${declared_version:-<missing>}, but the bootstrap pins ${SIGMASTATE_VERSION}"
-          exit 1
-        fi
+        case "${declared_version}" in
+          6.0.2-30-59782d92-SNAPSHOT)
+            SIGMASTATE_COMMIT=59782d92065eec3abd0dc47af22e25141857b2ee
+            ;;
+          6.0.5-22-368a860b-SNAPSHOT)
+            SIGMASTATE_COMMIT=368a860be033af94aa14895381f42099b3646db6
+            ;;
+          *)
+            echo "::error::Unsupported SigmaState declaration: ${declared_version:-<missing>}"
+            exit 1
+            ;;
+        esac
+        SIGMASTATE_VERSION="${declared_version}"
 
         case "${SIGMASTATE_SCALA_VERSION}" in
           2.11.12|2.12.20|2.13.16) ;;
