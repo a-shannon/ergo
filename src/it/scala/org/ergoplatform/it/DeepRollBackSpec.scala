@@ -8,7 +8,7 @@ import org.ergoplatform.it.api.NodeApi.{NodeInfo, nodeInfoDecoder}
 import org.ergoplatform.it.container.{IntegrationSuite, Node}
 import org.ergoplatform.it.container.Docker.ExtraConfig
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils
-import org.ergoplatform.it.util.ConvergenceObservations
+import org.ergoplatform.it.util.{ConvergenceObservations, DeepRollbackFailureDiagnostics}
 import org.scalatest.freespec.AnyFreeSpec
 import scala.async.Async
 import scala.concurrent.{Await, Future}
@@ -130,6 +130,7 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
 
   private val seedObservations = new ConvergenceObservations
   @volatile private var lastSeedObservation = "Initial seed has not been sampled"
+  @volatile private var lastSeedHeaderId: Option[String] = None
 
   private def waitForSettledSeed(
     nodeA: Node,
@@ -152,6 +153,8 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
     seedObservations.until(timeout.fromNow, 1.second, 5.seconds) { budget =>
       probeA.sample(budget).zip(probeB.sample(budget)).map { pair =>
         lastSeedObservation = s"A=${describe(pair._1)}; B=${describe(pair._2)}"
+        lastSeedHeaderId = pair._1.toOption.flatMap(_.bestHeaderIdOpt)
+          .filter(DeepRollbackFailureDiagnostics.validId)
         log.info(s"Initial shared-chain readiness: $lastSeedObservation")
         pair
       }
@@ -204,7 +207,33 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
       docker.stopNode(minerAGen.containerId)
       val minerASeed: Node = docker.startDevNetNode(minerAConfigNonGen,
         specialVolumeOpt = Some((localVolumeA, remoteVolumeA))).get
-      val (seedA, seedB) = Async.await(waitForSettledSeed(minerASeed, minerBGen, 2.minutes))
+      val (seedA, seedB) = Async.await(waitForSettledSeed(minerASeed, minerBGen, 2.minutes).recover {
+        case error: TimeoutException =>
+          DeepRollbackFailureDiagnostics.rethrowAfterCapture(error, {
+            import DeepRollbackFailureDiagnostics._
+            Seq(minerASeed, minerBGen).zipWithIndex.flatMap { case (node, index) =>
+              val endpoints = Seq(Info -> "/info", Connected -> "/peers/connected",
+                Sync -> "/peers/syncInfo", Delivery -> "/peers/trackInfo")
+              val standard = endpoints.map { case (kind, endpoint) => Request(index, kind, () =>
+                node.singleGet(endpoint, _.setRequestTimeout(2000)).map { response =>
+                  require(response.getStatusCode == 200, "Unexpected diagnostic status")
+                  node.ergoJsonAnswerAs[Json](response.getResponseBody)
+                })
+              }
+              standard ++ lastSeedHeaderId.toSeq.map { id => Request(index, FullBlock, () =>
+                node.singleGet(s"/blocks/$id", _.setRequestTimeout(2000)).map { response =>
+                  Json.obj("status" -> Json.fromInt(response.getStatusCode),
+                    "present" -> (response.getStatusCode match {
+                      case 200 => Json.True
+                      case 404 => Json.False
+                      case _ => Json.Null
+                    }))
+                })
+              }
+            }
+          })(snapshot => log.error(s"Initial seed failure diagnostics: $snapshot"))
+          throw error
+      })
       val seedHeight = seedA.bestBlockHeightOpt.get
       require(seedHeight < chainLength,
         s"Initial shared chain already reached $seedHeight; isolated node B must mine to $chainLength")
