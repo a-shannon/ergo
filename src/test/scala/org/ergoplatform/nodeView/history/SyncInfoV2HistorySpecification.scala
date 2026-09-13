@@ -18,6 +18,9 @@ import scala.util.Try
 
 class SyncInfoV2HistorySpecification extends ErgoCorePropertyTest {
 
+  // V2 parser bound; some supported branches keep the production constant private.
+  private val maxSyncHeaders = 50
+
   private def newHistory(): ErgoHistory =
     generateHistory(
       verifyTransactions = false,
@@ -91,7 +94,7 @@ class SyncInfoV2HistorySpecification extends ErgoCorePropertyTest {
         full.lastHeaders.count(_.id == chain.head.id) shouldBe 1
         full.lastHeaders.map(_.id).distinct.size shouldBe full.lastHeaders.size
         full.lastHeaders.size should be <= 5
-        full.lastHeaders.size should be <= ErgoSyncInfoSerializer.MaxHeadersAllowed
+        full.lastHeaders.size should be <= maxSyncHeaders
         full.height shouldBe Some(height)
         checkRoundtrip(full)
 
@@ -121,7 +124,7 @@ class SyncInfoV2HistorySpecification extends ErgoCorePropertyTest {
       full.lastHeaders.count(_.height == 1) shouldBe 1
       full.lastHeaders.map(_.id).distinct.size shouldBe full.lastHeaders.size
       full.lastHeaders.size should be <= 5
-      full.lastHeaders.size should be <= ErgoSyncInfoSerializer.MaxHeadersAllowed
+      full.lastHeaders.size should be <= maxSyncHeaders
       full.height shouldBe Some(heights.head)
       checkRoundtrip(full)
 
