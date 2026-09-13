@@ -57,9 +57,10 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
     val s = bytesToId(wId.take(half))
     val tb = wId.takeRight(half)
 
+    // todo: recheck if half is enough for collision resistance
     kt.find { id =>
       if (id.startsWith(s)) {
-        pool.get(id).exists(_.transaction.witnessSerializedId.take(ErgoTransaction.WeakIdLength).sameElements(tb))
+        pool.get(id).exists(_.transaction.witnessSerializedId.take(half).sameElements(tb))
       } else {
         false
       }
@@ -220,7 +221,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
       val doubleSpendingTotalWeight = doubleSpendingWtxs.map(_.weight).sum / doubleSpendingWtxs.size
       if (ownWtx.weight > doubleSpendingTotalWeight) {
         val doubleSpendingTxs = doubleSpendingWtxs.map(wtx => pool.orderedTransactions(wtx)).toSeq
-        val p = pool.put(unconfirmedTransaction, feeF).remove(doubleSpendingTxs)
+        val p = pool.remove(doubleSpendingTxs).put(unconfirmedTransaction, feeF)
         val updPool = new ErgoMemPool(p, stats, sortingOption)
         updPool -> new ProcessingOutcome.Accepted(unconfirmedTransaction, validationStartTime)
       } else {
@@ -239,7 +240,9 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
     }
   }
 
-  def process(unconfirmedTx: UnconfirmedTransaction, state: ErgoState[_]): (ErgoMemPool, ProcessingOutcome) = {
+  def process(unconfirmedTx: UnconfirmedTransaction,
+              state: ErgoState[_],
+              inputBlockTransactions: Seq[ErgoTransaction] = Seq.empty): (ErgoMemPool, ProcessingOutcome) = {
     val tx = unconfirmedTx.transaction
 
     val invalidatedCnt = this.pool.invalidatedTxIds.approximateElementCount
@@ -264,8 +267,9 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
           val costLimit = nodeSettings.maxTransactionCost
           state match {
             case utxo: UtxoState =>
-              // Allow proceeded transaction to spend outputs of pooled transactions.
-              val utxoWithPool = utxo.withTransactions(getAll)
+              // Allow proceeded transaction to spend outputs of pooled transactions and of input-block transactions,
+              // while inputs spent by input-block transactions are treated as already spent
+              val utxoWithPool = utxo.withMempoolAndInputBlocks(this, inputBlockTransactions)
               if (tx.inputIds.forall(inputBoxId => utxoWithPool.boxById(inputBoxId).isDefined)) {
 
                 // added in 6.0 to check now versioned serializers
