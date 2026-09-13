@@ -6,7 +6,7 @@ logLevel := Level.Debug
 // this values should be in sync with ergo-wallet/build.sbt
 val scala211 = "2.11.12"
 val scala212 = "2.12.20"
-val scala213 = "2.13.16"
+val scala213 = "2.13.18"
 
 lazy val commonSettings = Seq(
   organization := "org.ergoplatform",
@@ -39,11 +39,11 @@ lazy val commonSettings = Seq(
 
 publishArtifact in (Compile, packageDoc) := false
 
-val circeVersion = "0.13.0"
+val circeVersion = "0.14.15"
 val akkaVersion = "2.6.10"
 val akkaHttpVersion = "10.2.4"
 
-val sigmaStateVersion = "6.0.2"
+val sigmaStateVersion = "6.0.6"
 val ficusVersion = "1.4.7"
 
 // for testing current sigmastate build (see sigmastate-ergo-it jenkins job)
@@ -174,10 +174,30 @@ inConfig(Linux)(
 Defaults.itSettings
 configs(IntegrationTest extend Test)
 inConfig(IntegrationTest)(Seq(
-  parallelExecution := false,
+  // Run integration suites in parallel. Each suite is forked into its own JVM (testGrouping
+  // below) and the number running at once is bounded by the global Tags.ForkedTestGroup limit,
+  // so we get parallelism without exhausting host RAM (a suite can launch ~4 node containers).
+  parallelExecution := true,
+  testGrouping := {
+    val opts = forkOptions.value
+    definedTests.value.map { t =>
+      Tests.Group(name = t.name, tests = Seq(t), runPolicy = Tests.SubProcess(opts))
+    }
+  },
   test := (test dependsOn docker).value,
   scalacOptions ++= Seq("-Xasync")
 ))
+
+// Cap how many forked test JVMs run concurrently.  sbt's default
+// concurrentRestrictions already contains Tags.limit(Tags.ForkedTestGroup, 1);
+// simply += adds a second, looser rule and the strictest wins, so the
+// 2-way parallelism would be a no-op.  We replace the default rule by
+// keeping the other defaults and setting ForkedTestGroup to 2.
+Global / concurrentRestrictions := Seq(
+  Tags.limitAll(math.max(1, java.lang.Runtime.getRuntime.availableProcessors())),
+  Tags.limit(Tags.ForkedTestGroup, 2),
+  Tags.exclusiveGroup(Tags.Clean)
+)
 
 docker / dockerfile := {
   val configDevNet = (IntegrationTest / resourceDirectory).value / "devnetTemplate.conf"
@@ -185,7 +205,7 @@ docker / dockerfile := {
   val configMainNet = (IntegrationTest / resourceDirectory).value / "mainnetTemplate.conf"
 
   new Dockerfile {
-    from("openjdk:11-jre-slim")
+    from("eclipse-temurin:11-jre-jammy")
     label("ergo-integration-tests", "ergo-integration-tests")
     add(assembly.value, "/opt/ergo/ergo.jar")
     add(Seq(configDevNet), "/opt/ergo")
@@ -316,7 +336,7 @@ lazy val ergo = (project in file("."))
       "com.github.scopt" %% "scopt" % "4.1.0",
 
       // API dependencies
-      "de.heikoseeberger" %% "akka-http-circe" % "1.20.0",
+      "de.heikoseeberger" %% "akka-http-circe" % "1.39.2",
 
       // app dependencies
       // jaxb-api is included only to avoid a runtime exception
