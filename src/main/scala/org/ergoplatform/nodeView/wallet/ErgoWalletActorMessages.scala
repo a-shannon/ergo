@@ -61,13 +61,6 @@ object ErgoWalletActorMessages {
   // Publicly available signals for the wallet actor
 
   /**
-   * Command to scan offchain transaction
-   *
-   * @param tx - offchain transaction
-   */
-  final case class ScanOffChain(tx: ErgoTransaction)
-
-  /**
    * Command to scan a block
    *
    * @param block - block to scan
@@ -106,6 +99,30 @@ object ErgoWalletActorMessages {
   private[wallet] final case class RetryUtxoSnapshotSourceCleanup(
     expectedOrigin: UtxoSnapshotWalletOrigin,
     attempt: Int)
+  /** Record an accepted wallet-related transaction without adding projected outputs. */
+  final case class ScanOffChain(tx: ErgoTransaction)
+
+  /**
+   * Read wallet-related transactions which were not on the blockchain yet when the node was stopped,
+   * so that they can be put back into the memory pool. Answered with a `Seq[ErgoTransaction]`,
+   * ordered so that a transaction spending an output of another one comes after it.
+   */
+  final case object ReadUnconfirmedTransactions
+
+  /** Internal startup registration; it has no ask deadline while wallet recovery is pending. */
+  private[nodeView] final case class RegisterWalletTransactionRestoration(requestId: UUID)
+
+  private[nodeView] final case class WalletTransactionsForRestoration(
+    requestId: UUID,
+    result: Try[Seq[ErgoTransaction]])
+
+  /**
+   * Stop keeping the given unconfirmed transactions across restarts, e.g. because the memory pool
+   * refused them
+   *
+   * @param ids - identifiers of the transactions to forget
+   */
+  final case class ForgetUnconfirmedTransactions(ids: Seq[ModifierId])
 
   /**
    * Rollback to previous version of the wallet, by throwing away effects of blocks after the version

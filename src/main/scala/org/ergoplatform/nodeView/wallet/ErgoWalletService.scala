@@ -6,10 +6,9 @@ import org.ergoplatform._
 import org.ergoplatform.modifiers.ErgoFullBlock
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnsignedErgoTransaction}
 import org.ergoplatform.nodeView.state.{ErgoStateContext, UtxoStateReader}
-import org.ergoplatform.nodeView.wallet.IdUtils.encodedBoxId
 import org.ergoplatform.nodeView.wallet.ErgoWalletServiceUtils.DeriveNextKeyResult
 import org.ergoplatform.nodeView.wallet.models.{ChangeBox, CollectedBoxes}
-import org.ergoplatform.nodeView.wallet.persistence.{OffChainRegistry, WalletDigest, WalletRegistry, WalletStorage}
+import org.ergoplatform.nodeView.wallet.persistence.{WalletDigest, WalletRegistry, WalletStorage}
 import org.ergoplatform.nodeView.wallet.requests.{ExternalSecret, TransactionGenerationRequest}
 import org.ergoplatform.nodeView.wallet.scanning.{Scan, ScanRequest}
 import org.ergoplatform.sdk.SecretString
@@ -31,7 +30,6 @@ import java.io.{File, FileNotFoundException, IOException}
 import java.nio.file.{Files, LinkOption, NoSuchFileException, Path, StandardCopyOption}
 import java.util.UUID
 import scala.collection.JavaConverters._
-import scala.collection.compat.immutable.ArraySeq
 import scala.util.{Failure, Success, Try}
 
 object ErgoWalletService {
@@ -243,33 +241,10 @@ trait ErgoWalletService {
     */
   def updateUtxoState(state: ErgoWalletState): ErgoWalletState
 
-  /** Rebuild derived off-chain data from the current canonical registry and mempool. */
+  /** Recompute and validate the current mempool projection and durable input reservations. */
   def reconcileOffChainRegistry(state: ErgoWalletState,
                                 dustLimit: Option[Long]): ErgoWalletState = {
-    val initial = OffChainRegistry.init(state.registry)
-    val onChainIds = state.registry.allUnspentBoxes()
-      .iterator
-      .map(box => encodedBoxId(box.box.id))
-      .toSet
-    val reconciled = state.mempoolReaderOpt.fold(initial) { mempool =>
-      val transactions = mempool.getAllPrioritized.map(_.transaction)
-      val replayed = transactions.foldLeft(initial) { case (offChain, tx) =>
-        val newBoxes = WalletScanLogic
-          .extractWalletOutputs(tx, None, state.walletVars, dustLimit)
-          .filterNot(box => onChainIds.contains(encodedBoxId(box.box.id)))
-        offChain.updateOnTransaction(
-          newBoxes,
-          WalletScanLogic.extractInputBoxes(tx),
-          state.walletVars.externalScans)
-      }
-      // Priority ordering is not an interface guarantee. This final pass removes every spent
-      // output even if a child appeared before its parent during replay.
-      replayed.updateOnTransaction(
-        newBoxes = Seq.empty,
-        spentIds = transactions.flatMap(WalletScanLogic.extractInputBoxes),
-        scans = state.walletVars.externalScans)
-    }
-    state.copy(offChainRegistry = reconciled)
+    state.copy(offChainDustLimitOverride = Some(dustLimit)).materializeOffChainState()
   }
 
   /**
@@ -309,6 +284,19 @@ trait ErgoWalletService {
                             dustLimit: Option[Long]): Try[ErgoWalletState] =
     Failure(new UnsupportedOperationException(
       "UTXO snapshot scanning is not implemented by this wallet service"))
+
+  /**
+    * Identify an accepted transaction for durable recording. The projected state is unchanged.
+    *
+    * @return the same state, and whether the transaction is of any interest to the wallet, that
+    *         is whether it pays the wallet or spends one of its boxes
+    */
+  def scanOffChainUpdate(state: ErgoWalletState, tx: ErgoTransaction): (ErgoWalletState, Boolean)
+
+  /**
+    * Refresh persisted input reservations on startup without projecting absent mempool outputs.
+    */
+  def restoreOffChainState(state: ErgoWalletState): ErgoWalletState
 
   /**
     * Sign a transaction
@@ -691,7 +679,7 @@ class ErgoWalletServiceImpl(override val ergoSettings: ErgoSettings) extends Erg
       val confirmed = state.registry.walletUnspentBoxes(state.maxInputsToUse * BoxSelector.ScanDepthFactor)
       if (considerUnconfirmed) {
         // We filter out spent boxes in the same way as wallet does when assembling a transaction
-        (confirmed ++ state.offChainRegistry.offChainBoxes).filter(state.walletFilter)
+        (confirmed ++ state.offChainBoxes).filter(state.walletFilter)
       } else {
         confirmed
       }
@@ -699,7 +687,7 @@ class ErgoWalletServiceImpl(override val ergoSettings: ErgoSettings) extends Erg
       val confirmed = state.registry.walletConfirmedBoxes()
       if (considerUnconfirmed) {
         // Just adding boxes created off-chain
-        confirmed ++ state.offChainRegistry.offChainBoxes
+        confirmed ++ state.offChainBoxes
       } else {
         confirmed
       }
@@ -708,16 +696,19 @@ class ErgoWalletServiceImpl(override val ergoSettings: ErgoSettings) extends Erg
   }
 
   override def getScanUnspentBoxes(state: ErgoWalletState, scanId: ScanId, considerUnconfirmed: Boolean, minHeight: Int, maxHeight: Int): Seq[WalletBox] = {
-    val unconfirmed: Seq[TrackedBox] =
-      if (considerUnconfirmed) {
-        state.offChainRegistry.offChainBoxes.filter(_.scans.contains(scanId))
-      } else {
-        ArraySeq.empty[TrackedBox]
-      }
-
     val currentHeight = state.fullHeight
-    val unspentBoxes: Seq[TrackedBox] = state.registry.unspentBoxesByInclusionHeight(scanId, minHeight, maxHeight)
-    (unspentBoxes ++ unconfirmed).map(tb => WalletBox(tb, currentHeight)).sortBy(_.trackedBox.inclusionHeightOpt)
+    val confirmed: Seq[TrackedBox] = state.registry.unspentBoxesByInclusionHeight(scanId, minHeight, maxHeight)
+    val boxes =
+      if (considerUnconfirmed) {
+        // a box spent in the mempool is hidden unless this specific scan opts to keep spent boxes
+        // (removeOffchain = false); both confirmed and off-chain boxes for the scan are considered
+        val visible = (tb: TrackedBox) =>
+          state.keepsSpentOffChain(scanId) || !state.mempoolSpentIds.contains(tb.boxId)
+        (confirmed ++ state.rawOffChainBoxes.filter(_.scans.contains(scanId))).filter(visible)
+      } else {
+        confirmed
+      }
+    boxes.map(tb => WalletBox(tb, currentHeight)).sortBy(_.trackedBox.inclusionHeightOpt)
   }
 
   override def getScanSpentBoxes(state: ErgoWalletState, scanId: ScanId): Seq[WalletBox] = {
@@ -875,13 +866,12 @@ class ErgoWalletServiceImpl(override val ergoSettings: ErgoSettings) extends Erg
   override def scanBlockUpdate(state: ErgoWalletState, block: ErgoFullBlock, dustLimit: Option[Long]): Try[ErgoWalletState] =
       WalletScanLogic.scanBlockTransactions(
         state.registry,
-        state.offChainRegistry,
         state.walletVars,
         block,
         state.outputsFilter,
         dustLimit,
-        ergoSettings.walletSettings.walletProfile).map { case (reg, offReg, updatedOutputsFilter) =>
-        state.copy(registry = reg, offChainRegistry = offReg, outputsFilter = Some(updatedOutputsFilter))
+        ergoSettings.walletSettings.walletProfile).map { case (reg, updatedOutputsFilter) =>
+        state.copy(registry = reg, outputsFilter = Some(updatedOutputsFilter))
       }
 
   override def reconcileOffChainRegistry(state: ErgoWalletState,
@@ -906,8 +896,28 @@ class ErgoWalletServiceImpl(override val ergoSettings: ErgoSettings) extends Erg
       nextSubtreeIndex,
       finalChunk
     ).map { _ =>
-      reconcileOffChainRegistry(state, dustLimit).copy(outputsFilter = None)
+      reconcileOffChainRegistry(state.copy(outputsFilter = None), dustLimit)
     }
+  }
+
+  override def scanOffChainUpdate(state: ErgoWalletState, tx: ErgoTransaction): (ErgoWalletState, Boolean) = {
+    val dustLimit = ergoSettings.walletSettings.dustLimit
+    val newWalletBoxes = WalletScanLogic.extractWalletOutputs(tx, None, state.walletVars, dustLimit)
+    val inputs = WalletScanLogic.extractInputBoxes(tx)
+
+    def spendsWalletBox: Boolean =
+      tx.inputs.exists(input => state.registry.getBox(input.boxId).isDefined) ||
+        state.rawOffChainBoxes.exists(box => inputs.contains(box.boxId)) ||
+        state.storage.readUnconfirmedTransactions().exists { case (parent, _) =>
+          WalletScanLogic.extractWalletOutputs(parent, None, state.walletVars, dustLimit)
+            .exists(box => inputs.contains(box.boxId))
+        }
+
+    (state, newWalletBoxes.nonEmpty || spendsWalletBox)
+  }
+
+  override def restoreOffChainState(state: ErgoWalletState): ErgoWalletState = {
+    state.copy()
   }
 
   override def updateUtxoState(state: ErgoWalletState): ErgoWalletState = {

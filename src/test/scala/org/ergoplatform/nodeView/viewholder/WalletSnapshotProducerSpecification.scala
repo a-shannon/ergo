@@ -9,12 +9,15 @@ import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
 import org.ergoplatform.core.idToVersion
 import org.ergoplatform.mining.DefaultFakePowScheme
 import org.ergoplatform.modifiers.ErgoFullBlock
-import org.ergoplatform.modifiers.mempool.ErgoTransaction
-import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{InitStateFromSnapshot, UtxoSnapshotAppliedToState}
+import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
+import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{InitStateFromSnapshot, SuccessfulTransaction, UtxoSnapshotAppliedToState}
 import org.ergoplatform.nodeView.ErgoNodeViewRef
+import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.LocallyGeneratedTransaction
+import org.ergoplatform.nodeView.mempool.ErgoMemPoolUtils.ProcessingOutcome
 import org.ergoplatform.nodeView.state.{BoxHolder, DigestState, ErgoState, StateType, UtxoState}
 import org.ergoplatform.nodeView.state.wrapped.WrappedUtxoState
 import org.ergoplatform.nodeView.wallet.persistence.{UtxoSnapshotWalletOrigin, WalletStorage}
+import org.ergoplatform.nodeView.wallet.requests.PaymentRequest
 import org.ergoplatform.serialization.ManifestSerializer
 import org.ergoplatform.settings.{Algos, Constants, ErgoSettings, ErgoSettingsReader}
 import org.ergoplatform.utils.{ErgoCorePropertyTest, NodeViewTestContext, NodeViewTestOps}
@@ -69,6 +72,8 @@ class WalletSnapshotProducerSpecification extends ErgoCorePropertyTest with Node
   private class Session(override val settings: ErgoSettings) extends NodeViewTestContext {
     override val actorSystem: ActorSystem = ActorSystem()
     override val testProbe: TestProbe = TestProbe()(actorSystem)
+    val transactions: TestProbe = TestProbe()(actorSystem)
+    actorSystem.eventStream.subscribe(transactions.ref, classOf[SuccessfulTransaction])
     override val nodeViewHolderRef: ActorRef = ErgoNodeViewRef(settings)(actorSystem)
 
     def stop(): Unit = {
@@ -105,8 +110,35 @@ class WalletSnapshotProducerSpecification extends ErgoCorePropertyTest with Node
     } finally storage.close()
   }
 
-  Seq(StateType.Utxo, StateType.Digest).foreach { mode =>
-    property(s"real snapshot producer restores owned wallet payment across restarts in ${mode.stateTypeName} mode") {
+  private def awaitPendingTransaction(session: Session, transaction: ErgoTransaction): Unit = {
+    session.testProbe.awaitAssert({
+      val view = getCurrentView(session)
+      view.pool.getAll.map(_.id) shouldBe Seq(transaction.id)
+      view.pool.modifierById(transaction.id).get.bytes.toVector shouldBe transaction.bytes.toVector
+      val stored = Await.result(view.vault.unconfirmedTransactionsToRestore, 10.seconds)
+      stored.map(_.id) shouldBe Seq(transaction.id)
+      stored.head.bytes.toVector shouldBe transaction.bytes.toVector
+    }, 20.seconds, 100.millis)
+  }
+
+  private def readPendingRecords(settings: ErgoSettings): Vector[(ModifierId, Vector[Byte], Int)] = {
+    val storage = WalletStorage.readOrCreate(settings)
+    try {
+      storage.readUnconfirmedTransactions().map { case (transaction, height) =>
+        (transaction.id, transaction.bytes.toVector, height)
+      }.toVector
+    } finally storage.close()
+  }
+
+  // Ordinary transaction admission requires UTXO mode; the Digest control remains snapshot-only.
+  Seq((StateType.Utxo, false), (StateType.Digest, false), (StateType.Utxo, true)).foreach {
+    case (mode, restorePendingSpend) =>
+    val testName = if (restorePendingSpend) {
+      "real snapshot wallet restores an admitted unconfirmed spend before the first full block in utxo mode"
+    } else {
+      s"real snapshot producer restores owned wallet payment across restarts in ${mode.stateTypeName} mode"
+    }
+    property(testName) {
       val root = Files.createTempDirectory("wallet-snapshot-producer-").toFile
       val nodeSettings = parsedSettings(new File(root, "node"), mode)
       val sourceSettings = parsedSettings(new File(root, "source"), StateType.Utxo)
@@ -183,13 +215,39 @@ class WalletSnapshotProducerSpecification extends ErgoCorePropertyTest with Node
           getHistory(first).readUtxoSnapshotScanSource(snapshotHeader.id).failed.get.getMessage shouldBe
             "No persisted UTXO snapshot scan source"
         }, 20.seconds, 100.millis)
+        val pendingSpend = if (restorePendingSpend) {
+          nodeSettings.nodeSettings.minimalFeeAmount shouldBe 0L
+          getCurrentView(first).pool.getAll shouldBe empty
+          Await.result(wallet.unconfirmedTransactionsToRestore, 10.seconds) shouldBe empty
+          val request = PaymentRequest(address, payment.value / 2, Array.empty, Map.empty)
+          val transaction = Await.result(wallet.generateTransaction(Seq(request)), 10.seconds).get
+          transaction.inputs.map(input => Algos.encode(input.boxId)) shouldBe Seq(Algos.encode(payment.id))
+          first.testProbe.send(first.nodeViewHolderRef,
+            LocallyGeneratedTransaction(UnconfirmedTransaction(transaction, None)))
+          first.testProbe.expectMsgType[ProcessingOutcome.Accepted](20.seconds).tx.id shouldBe transaction.id
+          first.transactions.expectMsgType[SuccessfulTransaction](20.seconds).transaction.id shouldBe transaction.id
+          awaitPendingTransaction(first, transaction)
+          awaitOwnedPayment(first, payment, 19)
+          Some(transaction)
+        } else None
         first.stop()
         session = None
         val origin = readCompletedOrigin(nodeSettings, snapshotHeader.id)
+        pendingSpend.foreach { transaction =>
+          readPendingRecords(nodeSettings) shouldBe Vector((transaction.id, transaction.bytes.toVector, 19))
+        }
 
         val reopened = new Session(nodeSettings)
         session = Some(reopened)
         getHistory(reopened).bestFullBlockOpt shouldBe None
+        pendingSpend.foreach { transaction =>
+          // Startup alone restores the durable record; no transaction is resubmitted or directly scanned.
+          val restored = reopened.transactions.expectMsgType[SuccessfulTransaction](20.seconds).transaction
+          restored.id shouldBe transaction.id
+          restored.transaction.bytes.toVector shouldBe transaction.bytes.toVector
+          getCurrentState(reopened).version shouldBe idToVersion(snapshotHeader.id)
+          awaitPendingTransaction(reopened, transaction)
+        }
         awaitOwnedPayment(reopened, payment, 19)
         applyHeader(successor.header)(reopened).get
         applyPayload(successor)(reopened).get
@@ -197,17 +255,28 @@ class WalletSnapshotProducerSpecification extends ErgoCorePropertyTest with Node
           getCurrentState(reopened).version shouldBe idToVersion(successor.id)
         }, 20.seconds, 100.millis)
         awaitOwnedPayment(reopened, payment, 20)
+        pendingSpend.foreach(transaction => awaitPendingTransaction(reopened, transaction))
         reopened.stop()
         session = None
         readCompletedOrigin(nodeSettings, snapshotHeader.id) shouldBe origin
+        pendingSpend.foreach { transaction =>
+          readPendingRecords(nodeSettings) shouldBe Vector((transaction.id, transaction.bytes.toVector, 19))
+        }
 
         val afterSuccessorRestart = new Session(nodeSettings)
         session = Some(afterSuccessorRestart)
         getCurrentState(afterSuccessorRestart).version shouldBe idToVersion(successor.id)
         awaitOwnedPayment(afterSuccessorRestart, payment, 20)
+        pendingSpend.foreach { transaction =>
+          afterSuccessorRestart.transactions.expectMsgType[SuccessfulTransaction](20.seconds).transaction.id shouldBe transaction.id
+          awaitPendingTransaction(afterSuccessorRestart, transaction)
+        }
         afterSuccessorRestart.stop()
         session = None
         readCompletedOrigin(nodeSettings, snapshotHeader.id) shouldBe origin
+        pendingSpend.foreach { transaction =>
+          readPendingRecords(nodeSettings) shouldBe Vector((transaction.id, transaction.bytes.toVector, 19))
+        }
       } finally {
         try session.foreach(_.stop())
         finally {
