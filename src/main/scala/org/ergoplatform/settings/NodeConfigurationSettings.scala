@@ -5,9 +5,9 @@ import net.ceedubs.ficus.readers.ValueReader
 import org.ergoplatform.ErgoLikeContext.Height
 import org.ergoplatform.nodeView.mempool.ErgoMemPoolUtils.SortingOption
 import org.ergoplatform.nodeView.state.StateType
-import scorex.util.ModifierId
+import scorex.util.{ModifierId, ScorexLogging}
 
-import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.duration.{Duration, DurationInt, FiniteDuration}
 
 case class CheckpointSettings(height: Height, blockId: ModifierId)
 
@@ -50,7 +50,15 @@ case class NodeConfigurationSettings(override val stateType: StateType,
                                      adProofsSuffixLength: Int,
                                      extraIndex: Boolean,
                                      blacklistedTransactions: Seq[String] = Seq.empty,
-                                     checkpoint: Option[CheckpointSettings] = None) extends ClientCapabilities {
+                                     checkpoint: Option[CheckpointSettings] = None,
+                                     miningCandidateCacheSize: Int = NodeConfigurationSettings.DefaultMiningCandidateCacheSize,
+                                     miningPendingInputTimeout: FiniteDuration = 5.seconds,
+                                     miningPendingInputMaxRetries: Int = 50) extends ClientCapabilities {
+  require(miningCandidateCacheSize > 0, "miningCandidateCacheSize must be positive")
+
+  require(miningPendingInputTimeout > Duration.Zero, "miningPendingInputTimeout must be positive")
+  require(miningPendingInputMaxRetries > 0, "miningPendingInputMaxRetries must be positive")
+
   /**
     * Whether the node keeping all the full blocks of the blockchain or not.
     * @return true if the blockchain is pruned, false if not
@@ -58,6 +66,18 @@ case class NodeConfigurationSettings(override val stateType: StateType,
   val isFullBlocksPruned: Boolean = blocksToKeep >= 0 || utxoSettings.utxoBootstrap
 
   val areSnapshotsStored = utxoSettings.storingUtxoSnapshots > 0
+}
+
+object NodeConfigurationSettings extends ScorexLogging {
+  val DefaultMiningCandidateCacheSize: Int = 3
+
+  private[settings] def boundedMiningCandidateCacheSize(requested: Int): Int = {
+    val bounded = requested.max(1).min(16)
+    if (bounded != requested) {
+      log.warn(s"miningCandidateCacheSize $requested is outside 1..16; using $bounded")
+    }
+    bounded
+  }
 }
 
 /**
@@ -95,7 +115,12 @@ trait NodeConfigurationReaders extends StateTypeReaders with CheckpointingSettin
       cfg.as[Int](s"$path.adProofsSuffixLength"),
       cfg.as[Boolean](s"$path.extraIndex"),
       cfg.as[Seq[String]](s"$path.blacklistedTransactions"),
-      cfg.as[Option[CheckpointSettings]](s"$path.checkpoint")
+      cfg.as[Option[CheckpointSettings]](s"$path.checkpoint"),
+      NodeConfigurationSettings.boundedMiningCandidateCacheSize(
+        cfg.as[Option[Int]](s"$path.miningCandidateCacheSize")
+          .getOrElse(NodeConfigurationSettings.DefaultMiningCandidateCacheSize)),
+      cfg.as[Option[FiniteDuration]](s"$path.miningPendingInputTimeout").getOrElse(5.seconds),
+      cfg.as[Option[Int]](s"$path.miningPendingInputMaxRetries").getOrElse(50)
     )
   }
 

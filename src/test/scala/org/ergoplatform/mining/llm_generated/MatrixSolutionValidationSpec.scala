@@ -9,6 +9,7 @@ import org.ergoplatform.mining.CandidateGenerator.{Candidate, GenerateCandidate}
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.NewBlockMined
 import org.ergoplatform.nodeView.{ErgoNodeViewRef, ErgoReadersHolderRef, LocallyGeneratedInputBlock, LocallyGeneratedOrderingBlock}
+import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.GetDataFromCurrentView
 import org.ergoplatform.nodeView.state.StateType
 import org.ergoplatform.settings.{ErgoSettings, ErgoSettingsReader, Parameters}
 import org.ergoplatform.utils.ErgoCoreTestConstants.defaultMinerSecret
@@ -109,6 +110,17 @@ class MatrixSolutionValidationSpec extends AnyFlatSpec with Matchers {
       announcements.expectNoMessage(100.millis)
     }
 
+    def assertOrderingAccepted(candidate: Candidate): Unit = {
+      val block = CandidateGenerator.completeOrderingBlock(candidate.candidateBlock, solution)
+      submit(OrderingSolutionFound(solution))
+      replies.expectMsg(3.seconds, StatusReply.success(()))
+      val emitted = view.expectMsgType[LocallyGeneratedOrderingBlock](3.seconds)
+      emitted.efb.id shouldBe block.id
+      emitted.orderingBlockTransactions.map(_.id) shouldBe
+        candidate.candidateBlock.orderingBlockTransactions.map(_.id)
+      announcements.expectMsg(NewBlockMined(block.header))
+    }
+
     def assertTypedErrors(reason: String): Unit = {
       Seq(InputSolutionFound(solution), OrderingSolutionFound(solution)).foreach { message =>
         submit(message)
@@ -147,7 +159,12 @@ class MatrixSolutionValidationSpec extends AnyFlatSpec with Matchers {
         emitted.sbi.header.id shouldBe CandidateGenerator.completeInputBlock(cached.candidateBlock, h.solution)._1.header.id
         emitted.sbt.transactions.map(_.id) shouldBe cached.candidateBlock.inputBlockTransactions.map(_.id)
         h.pow.inputChecks.get() shouldBe 1
-        h.assertTypedErrors("No cached candidate available")
+        h.view.expectMsgType[GetDataFromCurrentView[_, _]]
+        h.submit(InputSolutionFound(h.solution))
+        h.errorContaining("Input block pending application")
+        h.noEffects()
+        h.assertOrderingAccepted(cached)
+        h.assertTypedErrors("Block already solved")
       } else {
         val block = CandidateGenerator.completeOrderingBlock(cached.candidateBlock, h.solution)
         h.submit(OrderingSolutionFound(h.solution))
@@ -159,14 +176,19 @@ class MatrixSolutionValidationSpec extends AnyFlatSpec with Matchers {
     }
   }
 
-  it should "reject invalid input PoW without emissions and reply to both types while the cache is empty" in withHarness { h =>
+  it should "reject invalid input PoW without emissions and accept ordering work from the retained cache" in withHarness { h =>
     val cached = h.candidate()
     h.pow.acceptInputs = false
     h.pow.inputChecks.set(0)
     h.submit(InputSolutionFound(h.solution))
-    h.errorContaining("PoW valid: false")
+    h.errorContaining("No retained candidate matches input solution PoW")
     h.pow.inputChecks.get() shouldBe 1
-    h.assertTypedErrors("No cached candidate available")
-    (h.candidate() eq cached) shouldBe false
+    h.noEffects()
+    h.submit(InputSolutionFound(h.solution))
+    h.errorContaining("No retained candidate matches input solution PoW")
+    h.noEffects()
+    (h.candidate() eq cached) shouldBe true
+    h.assertOrderingAccepted(cached)
+    h.assertTypedErrors("Block already solved")
   }
 }
