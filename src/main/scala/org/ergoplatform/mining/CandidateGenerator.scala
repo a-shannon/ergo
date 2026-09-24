@@ -235,6 +235,10 @@ class CandidateGenerator(
         }
       }
 
+    // Completing either block serializes the nonce before PoW validation.
+    case sf: SolutionFound if sf.as.n.length != 8 =>
+      sender() ! StatusReply.error("Invalid solution nonce length: expected 8 bytes")
+
     case sf: SolutionFound
         if state.solvedBlock.isEmpty && state.cachedCandidate.nonEmpty =>
       // Inject node pk if it is not externally set (in Autolykos 2)
@@ -294,6 +298,11 @@ class CandidateGenerator(
       }
       log.info(s"Processed solution $solution with the result $result")
       sender() ! result
+
+    case _: SolutionFound =>
+      val reason = state.solvedBlock.map(block => s"Block already solved : ${block.id}")
+        .getOrElse("No cached candidate available")
+      sender() ! StatusReply.error(reason)
 
     case _: AutolykosSolution =>
       sender() ! StatusReply.error(

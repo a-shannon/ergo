@@ -2,7 +2,7 @@ package org.ergoplatform.mining
 
 import akka.actor.{Actor, ActorRef, ActorRefFactory, Props, Stash}
 import akka.pattern.StatusReply
-import org.ergoplatform.AutolykosSolution
+import org.ergoplatform.{AutolykosSolution, SolutionFound}
 import org.ergoplatform.mining.CandidateGenerator.GenerateCandidate
 import org.ergoplatform.nodeView.state.DigestState
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.GetDataFromCurrentView
@@ -181,6 +181,9 @@ class ErgoMiner(
 
     case GenerateCandidate(_, _, _, _) =>
       sender() ! StatusReply.error("Miner has not started yet")
+
+    case _: SolutionFound =>
+      sender() ! StatusReply.error("Miner has not started yet")
   }
 
   /** Bridge between external miner and CandidateGenerator (Internal mining threads are talking to CandidateGenerator directly.)
@@ -191,6 +194,9 @@ class ErgoMiner(
       minerState.candidateGeneratorRef forward genCandidate
 
     case solution: AutolykosSolution =>
+      minerState.candidateGeneratorRef forward solution
+
+    case solution: SolutionFound =>
       minerState.candidateGeneratorRef forward solution
 
     case ReadMinerPk => // used in /mining/rewardAddress API method
