@@ -347,6 +347,64 @@ class InputBlockProcessorSpecification extends ErgoCorePropertyTest with ErgoCom
     }
   }
 
+  property("select same-parent sibling branches in arrival order during recovery and live insertion") {
+    for {
+      leftFirst <- Seq(true, false)
+      rootFirst <- Seq(false, true)
+    } withInputBlockFixture { (us, h, orderingParent, _) =>
+      val root = InputBlockAnnouncement(
+        1, nextInputHeader(h, us, orderingParent), InputBlockFields.empty, None
+      )
+      val left = InputBlockAnnouncement(
+        1, nextInputHeader(h, us, orderingParent), parentOnly(idToBytes(root.id)), None
+      )
+      val right = InputBlockAnnouncement(
+        1, nextInputHeader(h, us, orderingParent), parentOnly(idToBytes(root.id)), None
+      )
+      val leftChild = InputBlockAnnouncement(
+        1, nextInputHeader(h, us, orderingParent), parentOnly(idToBytes(left.id)), None
+      )
+      val rightChild = InputBlockAnnouncement(
+        1, nextInputHeader(h, us, orderingParent), parentOnly(idToBytes(right.id)), None
+      )
+      val branches = if (leftFirst) Seq(Seq(left, leftChild), Seq(right, rightChild))
+        else Seq(Seq(right, rightChild), Seq(left, leftChild))
+      val expectedChains = branches.map(branch => root.id +: branch.map(_.id))
+
+      withClue(s"leftFirst=$leftFirst, rootFirst=$rootFirst: ") {
+        if (rootFirst) {
+          h.applyInputBlock(root) shouldBe None
+          branches.flatten.foreach { ib =>
+            h.applyInputBlock(ib) shouldBe None
+            h.disconnectedWaitlist shouldBe empty
+          }
+        } else {
+          branches.foreach { branch =>
+            branch.reverse.foreach { ib =>
+              h.applyInputBlock(ib) shouldBe ib.prevInputBlockId
+            }
+          }
+          h.disconnectedWaitlist.toSet shouldBe branches.flatten.toSet
+          h.applyInputBlock(root) shouldBe None
+        }
+        h.disconnectedWaitlist shouldBe empty
+        h.inputBlocksTree().get.forks.map(_.chain) shouldBe expectedChains
+
+        h.applyInputBlockTransactions(root.id, Seq.empty, us) shouldBe
+          (Seq(root.id) -> Seq.empty)
+        branches.head.foreach { ib =>
+          h.applyInputBlockTransactions(ib.id, Seq.empty, us)
+        }
+        branches(1).foreach { ib =>
+          h.applyInputBlockTransactions(ib.id, Seq.empty, us) shouldBe
+            (Seq.empty -> Seq.empty)
+        }
+        h.bestInputBlocksChain() shouldBe expectedChains.head.reverse
+        h.inputBlocksTree().get.forks.head.processedIndex shouldBe 2
+      }
+    }
+  }
+
   property("input block - fork switching - disjoint forks") {
 
     val us = UtxoState.fromBoxHolder(BoxHolder(Seq(eb1, eb2)), None, createTempDir, settings, parameters)
