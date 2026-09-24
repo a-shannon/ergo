@@ -81,6 +81,17 @@ class MatrixInputBlockApiRouteSpec
     }
   }
 
+  it should "reject an unknown suffix after a full-block id while the plain lookup succeeds" in {
+    val block = chain.last
+    Get(s"/blocks/${block.id}") ~> route ~> check {
+      status shouldBe StatusCodes.OK
+      responseAs[Json] shouldBe block.asJson
+    }
+    Get(s"/blocks/${block.id}/thisDoesNotExist") ~> route ~> check {
+      handled shouldBe false
+    }
+  }
+
   it should "keep full-block lookup with a trailing slash" in {
     val block = chain.last
     Get(s"/blocks/${block.id}/") ~> route ~> check {
