@@ -17,6 +17,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import scorex.util.ModifierId
 import sigma.data.ProveDlog
+import sigmastate.crypto.DLogProtocol.DLogProverInput
 
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
@@ -171,6 +172,77 @@ class MatrixSolutionValidationSpec extends AnyFlatSpec with Matchers {
         h.replies.expectMsg(3.seconds, StatusReply.success(()))
         h.view.expectMsg(LocallyGeneratedOrderingBlock(block, cached.candidateBlock.orderingBlockTransactions))
         h.announcements.expectMsg(NewBlockMined(block.header))
+        h.assertTypedErrors("Block already solved")
+      }
+    }
+  }
+
+  it should "retain the first candidate after invalid ordering PoW and accept a later valid solution" in withHarness { h =>
+    val cached = h.candidate()
+    val block = CandidateGenerator.completeOrderingBlock(cached.candidateBlock, h.solution)
+    h.pow.reject(block.header)
+    h.pow.orderingChecks.clear()
+
+    h.submit(OrderingSolutionFound(h.solution))
+    h.errorContaining("No retained candidate matches ordering solution PoW")
+    h.noEffects()
+    h.pow.orderingChecks.asScala.toSeq shouldBe Seq(block.header.id)
+    h.candidate() should be theSameInstanceAs cached
+
+    h.pow.accept(block.header)
+    h.submit(OrderingSolutionFound(h.solution))
+    h.replies.expectMsg(3.seconds, StatusReply.success(()))
+    h.view.expectMsg(LocallyGeneratedOrderingBlock(block, cached.candidateBlock.orderingBlockTransactions))
+    h.announcements.expectMsg(NewBlockMined(block.header))
+    h.assertTypedErrors("Block already solved")
+  }
+
+  Seq(false, true).foreach { rejectPrevious =>
+    it should s"validate current then previous ordering PoW and preserve source transactions (rejectPrevious=$rejectPrevious)" in withHarness { h =>
+      val previous = h.candidate()
+      val previousBlock = CandidateGenerator.completeOrderingBlock(previous.candidateBlock, h.solution)
+      val otherPk = DLogProverInput(BigInt(17).bigInteger).publicImage
+      val current = h.candidate(forced = true, pk = Some(otherPk))
+      val currentBlock = CandidateGenerator.completeOrderingBlock(current.candidateBlock, h.solution)
+      currentBlock.header.id should not be previousBlock.header.id
+      current.candidateBlock.orderingBlockTransactions.map(_.id) should not be (
+        previous.candidateBlock.orderingBlockTransactions.map(_.id)
+      )
+
+      // Both caches must survive malformed submissions, including the fallback source.
+      Seq(InputSolutionFound(h.solutionWithNonce(Array.emptyByteArray)),
+        OrderingSolutionFound(h.solutionWithNonce(Array.fill[Byte](9)(1)))).foreach { malformed =>
+        h.submit(malformed)
+        h.errorContaining("nonce")
+      }
+      h.candidate(pk = Some(otherPk)) should be theSameInstanceAs current
+      h.noEffects()
+
+      h.pow.reject(currentBlock.header)
+      if (rejectPrevious) h.pow.reject(previousBlock.header)
+      h.pow.orderingChecks.clear()
+      h.submit(OrderingSolutionFound(h.solution))
+
+      if (rejectPrevious) {
+        h.errorContaining("No retained candidate matches ordering solution PoW")
+        h.pow.orderingChecks.asScala.toSeq shouldBe Seq(currentBlock.header.id, previousBlock.header.id)
+        h.pow.acceptInputs = false
+        h.submit(InputSolutionFound(h.solution))
+        h.errorContaining("No retained candidate matches input solution PoW")
+        h.submit(OrderingSolutionFound(h.solution))
+        h.errorContaining("No retained candidate matches ordering solution PoW")
+        h.noEffects()
+        // Invalid submissions preserve the current work and the retained fallback.
+        val regenerated = h.candidate(pk = Some(otherPk))
+        (regenerated eq current) shouldBe true
+        (regenerated eq previous) shouldBe false
+      } else {
+        h.replies.expectMsg(3.seconds, StatusReply.success(()))
+        h.pow.orderingChecks.asScala.toSeq shouldBe Seq(currentBlock.header.id, previousBlock.header.id)
+        val emitted = h.view.expectMsgType[LocallyGeneratedOrderingBlock](3.seconds)
+        emitted.efb.id shouldBe previousBlock.id
+        emitted.orderingBlockTransactions.map(_.id) shouldBe previous.candidateBlock.orderingBlockTransactions.map(_.id)
+        h.announcements.expectMsg(NewBlockMined(previousBlock.header))
         h.assertTypedErrors("Block already solved")
       }
     }
