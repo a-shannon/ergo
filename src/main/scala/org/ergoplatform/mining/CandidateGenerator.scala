@@ -1,6 +1,6 @@
 package org.ergoplatform.mining
 
-import akka.actor.{Actor, ActorRef, ActorRefFactory, Props}
+import akka.actor.{Actor, ActorRef, ActorRefFactory, Cancellable, Props}
 import akka.pattern.StatusReply
 import com.google.common.primitives.Longs
 import org.ergoplatform.ErgoBox.TokenId
@@ -144,6 +144,9 @@ class CandidateGenerator(
         .scheduleOnce(100.millis, self, m)(context.dispatcher, sender())
   }
 
+  private[mining] def scheduleRefreshRetry(delay: FiniteDuration, retry: RefreshCandidate): Cancellable =
+    context.system.scheduler.scheduleOnce(delay, self, retry)(context.dispatcher)
+
   private[mining] def initialized(state: CandidateGeneratorState): Receive = {
     case ChangedHistory(h: ErgoHistoryReader) =>
       context.become(initialized(state.copy(hr = h)))
@@ -207,6 +210,12 @@ class CandidateGenerator(
     case SyntacticallyFailedModification(_, modId, error) =>
       onSolvedBlockFailed(state, modId, error)
 
+    case retry: RefreshCandidate if state.refreshRetry.exists(_._1 eq retry) =>
+      val resumed = state.copy(refreshRetryScheduled = false, refreshRetry = None)
+      context.become(initialized(resumed))
+      initialized(resumed)(retry.gen)
+    case _: RefreshCandidate => // cancelled retry already queued before successful generation
+
     case DeferredGenerateCandidate(gen, retries) =>
       if (state.pendingInput.nonEmpty &&
           retries < ergoSettings.nodeSettings.miningPendingInputMaxRetries) {
@@ -234,9 +243,11 @@ class CandidateGenerator(
         state.hr.getBestOrderingCollectedInputBlocksTransactions().map(tx => LeafData @@ tx.serializedId))
       if (!forced && cachedFor(state.cachedCandidate, txsToInclude, effectiveMinerPk,
         selectedInputBlockId, selectedInputTransactionsDigest)) {
+        state.refreshRetry.foreach(_._2.cancel())
+        context.become(initialized(state.copy(refreshRetryScheduled = false, refreshRetry = None)))
         senderOpt.foreach(_ ! StatusReply.success(state.cachedCandidate.get))
       } else {
-        val start = System.currentTimeMillis()
+        val start = System.nanoTime()
         CandidateGenerator.generateCandidate(
           state.hr,
           state.sr,
@@ -252,12 +263,19 @@ class CandidateGenerator(
             senderOpt.foreach(
               _ ! StatusReply.error(s"Candidate generation failed : ${ex.getMessage}")
             )
+            if (senderOpt.isEmpty && !state.refreshRetryScheduled) {
+              val retry = RefreshCandidate(gen)
+              val scheduled = scheduleRefreshRetry(state.avgGenTime.max(100.millis), retry)
+              context.become(initialized(state.copy(
+                refreshRetryScheduled = true, refreshRetry = Some(retry -> scheduled))))
+            }
           case Some(Success((candidate, eliminatedTxs))) =>
             if (eliminatedTxs.ids.nonEmpty) {
               viewHolderRef ! eliminatedTxs
             }
-            val generationTook = System.currentTimeMillis() - start
-            log.info(s"Generated new candidate in $generationTook ms")
+            val generationTook = (System.nanoTime() - start).nanos
+            log.info(s"Generated new candidate in ${generationTook.toMillis} ms")
+            state.refreshRetry.foreach(_._2.cancel())
             context.become(
               initialized(
                 state.copy(
@@ -265,7 +283,8 @@ class CandidateGenerator(
                   retainedCandidates = (candidate +: state.retainedCandidates)
                     .take(ergoSettings.nodeSettings.miningCandidateCacheSize),
                   lastTimestamp = candidate.candidateBlock.timestamp,
-                  avgGenTime = generationTook.millis)
+                  avgGenTime = generationTook,
+                  refreshRetryScheduled = false, refreshRetry = None)
               )
             )
             senderOpt.foreach(_ ! StatusReply.success(candidate))
@@ -275,7 +294,7 @@ class CandidateGenerator(
             )
             senderOpt.foreach { s =>
               context.system.scheduler.scheduleOnce(state.avgGenTime, self, gen)(
-                context.system.dispatcher,
+                context.dispatcher,
                 s
               )
             }
@@ -436,6 +455,8 @@ object CandidateGenerator extends ScorexLogging {
     optPk: Option[ProveDlog] = None
   )
 
+  private[mining] case class RefreshCandidate(gen: GenerateCandidate)
+
   private[mining] case class PendingInputTimeout(id: ModifierId)
 
   private case class DeferredGenerateCandidate(gen: GenerateCandidate, retries: Int)
@@ -458,7 +479,9 @@ object CandidateGenerator extends ScorexLogging {
     lastAppliedBlockTxs: Option[(ModifierId, Set[ModifierId])], // last applied ordering block
     retainedCandidates: Vector[Candidate] = Vector.empty,
     pendingInput: Option[ModifierId] = None,
-    lastTimestamp: Long = 0L
+    lastTimestamp: Long = 0L,
+    refreshRetryScheduled: Boolean = false,
+    refreshRetry: Option[(RefreshCandidate, Cancellable)] = None
   )
 
   def apply(

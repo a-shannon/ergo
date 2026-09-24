@@ -2,12 +2,13 @@ package org.ergoplatform.mining.llm_generated
 
 import org.ergoplatform.mining.{AutolykosPowScheme, CandidateBlock, CandidateGenerator, ErgoMiningThread, PrivateKey}
 
-import akka.actor.{Actor, ActorRef, ActorSystem, Props}
+import akka.actor.{Actor, ActorRef, ActorSystem, Cancellable, Props}
 import akka.pattern.StatusReply
 import akka.testkit.{TestKit, TestProbe}
+import akka.testkit.TestDuration
 import com.google.common.primitives.Longs
 import org.ergoplatform.{AutolykosSolution, InputBlockFound, InputSolutionFound, OrderingSolutionFound, ProveBlockResult}
-import org.ergoplatform.mining.CandidateGenerator.{Candidate, GenerateCandidate}
+import org.ergoplatform.mining.CandidateGenerator.{Candidate, GenerateCandidate, RefreshCandidate}
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{ChangedHistory, ChangedState, LocalBlockApplied, NewBestInputBlock}
 import org.ergoplatform.nodeView.{LocallyGeneratedInputBlock, LocallyGeneratedOrderingBlock}
@@ -126,6 +127,205 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
   private def withFixture(test: Fixture => Unit): Unit = {
     val f = new Fixture
     try test(f) finally f.close()
+  }
+
+  it should "recover from V4 refresh failure with retained work answerable and no external poll" in {
+    checkRefreshRetries(1.second)
+  }
+
+  Seq(Duration.Zero, (-1).millis).foreach { average =>
+    it should s"floor and coalesce internal refresh retries with average generation time $average" in {
+      checkRefreshRetries(average)
+    }
+  }
+
+  private def checkRefreshRetries(avgGenTime: FiniteDuration): Unit = new TestKit(ActorSystem()) {
+    class RetryCancellation extends Cancellable {
+      private val cancelled = new java.util.concurrent.atomic.AtomicBoolean(false)
+      override def cancel(): Boolean = !cancelled.getAndSet(true)
+      override def isCancelled: Boolean = cancelled.get()
+    }
+    case class ScheduledRefresh(delay: FiniteDuration, message: RefreshCandidate,
+                                cancellation: RetryCancellation)
+    val orderingChecks = new java.util.concurrent.ConcurrentLinkedQueue[scorex.util.ModifierId]()
+    val pow = new ControlledPow {
+      override def validate(header: Header): Try[Unit] = {
+        orderingChecks.add(header.id)
+        scala.util.Failure(new Exception("Controlled ordering rejection"))
+      }
+    }
+    val config = settings.copy(
+      networkType = org.ergoplatform.settings.NetworkType.DevNet60,
+      chainSettings = settings.chainSettings.copy(powScheme = pow),
+      nodeSettings = settings.nodeSettings.copy(offlineGeneration = true,
+        useExternalMiner = true, internalMinersCount = 0))
+    val initial = createUtxoState(config)
+    var state = initial._1
+    var history = HistoryTestHelpers.generateHistory(
+      verifyTransactions = true, stateType = StateType.Utxo,
+      PoPoWBootstrap = false, blocksToKeep = 100)
+    try {
+      val transactions = validTransactionsFromBoxHolder(initial._2,
+        new RandomWrapper(Some(93)))._1
+      val (proof, digest) = state.proofsForTransactions(transactions).get
+      val parameters = state.stateContext.currentParameters
+      val extension = parameters.toExtensionCandidate ++
+        state.stateContext.validationSettings.toExtensionCandidate
+      val genesisBlock = org.ergoplatform.utils.ErgoCoreTestConstants.powScheme.proveBlock(
+        None, Header.Interpreter60Version, config.chainSettings.initialNBits, digest, proof,
+        transactions, System.currentTimeMillis(), extension, Array.fill[Byte](3)(0),
+        defaultMinerSecret.w, Long.MinValue, Long.MaxValue, parameters)
+        .asInstanceOf[org.ergoplatform.OrderingBlockFound].fb
+      state = state.applyModifier(genesisBlock, None)(_ => ()).get
+      history = applyChain(history, Seq(genesisBlock))
+      val pool = ErgoMemPool.empty(config)
+      val first = CandidateGenerator.generateCandidate(history, state, pool,
+        defaultMinerSecret.publicImage, Seq.empty, None, config).get.get._1
+      first.candidateBlock.version shouldBe Header.Interpreter60Version
+      val block = first.candidateBlock
+      val root = org.ergoplatform.utils.ErgoCoreTestConstants.powScheme.proveBlock(
+        block.parentOpt, block.version, block.nBits, block.stateRoot, block.adProofBytes,
+        block.transactions, block.timestamp, block.extension, block.votes,
+        defaultMinerSecret.w, Long.MinValue, Long.MaxValue, first.parameters)
+        .asInstanceOf[org.ergoplatform.OrderingBlockFound].fb
+      state = state.applyModifier(root, None)(_ => ()).get
+      history = applyChain(history, Seq(root))
+      state.stateContext.blockVersion shouldBe Header.Interpreter60Version
+      val proofs = new java.util.concurrent.atomic.AtomicInteger(0)
+      val failProofs = new java.util.concurrent.atomic.AtomicBoolean(true)
+      val failingState = new UtxoState(state.persistentProver, state.version, state.store, config) {
+        override def proofsForTransactions(txs: Seq[org.ergoplatform.modifiers.mempool.ErgoTransaction])
+          : Try[(scorex.crypto.authds.SerializedAdProof, scorex.crypto.authds.ADDigest)] = {
+          proofs.incrementAndGet()
+          if (failProofs.get()) scala.util.Failure(new Exception("Proof assembly unavailable"))
+          else super.proofsForTransactions(txs)
+        }
+      }
+      val view = TestProbe()
+      val replies = TestProbe()
+      val generations = TestProbe()
+      val unsolicited = TestProbe()
+      val ready = TestProbe()
+      val scheduled = TestProbe()
+      val cachedState = CandidateGenerator.CandidateGeneratorState(
+        Some(first), None, history, failingState, pool, avgGenTime, None,
+        retainedCandidates = Vector(first), pendingInput = Some(root.id),
+        lastTimestamp = first.candidateBlock.timestamp)
+      val generator = system.actorOf(Props(new CandidateGenerator(
+        defaultMinerSecret.publicImage, system.deadLetters, view.ref, config) {
+        override def preStart(): Unit = {
+          context.system.eventStream.subscribe(self,
+            classOf[org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.FullBlockApplied])
+          ready.ref ! "ready"
+        }
+        override def receive: Receive = initialized(cachedState)
+        override private[mining] def scheduleRefreshRetry(
+          delay: FiniteDuration, retry: RefreshCandidate): Cancellable = {
+          val cancellation = new RetryCancellation
+          scheduled.ref ! ScheduledRefresh(delay, retry, cancellation)
+          cancellation
+        }
+        override def aroundReceive(receive: Receive, message: Any): Unit = {
+          message match {
+            case status: StatusReply[_] => unsolicited.ref ! status
+            case "generation barrier" => sender() ! message
+            case _ => ()
+          }
+          super.aroundReceive(receive, message)
+          message match {
+            case gen: GenerateCandidate => generations.ref ! gen
+            case _ => ()
+          }
+        }
+      }))
+      ready.expectMsg("ready")
+      val refresh = GenerateCandidate(Seq.empty, reply = false, forced = false)
+      system.eventStream.publish(LocalBlockApplied(root.header, root.blockTransactions.txs.map(_.id)))
+      generations.expectMsg(refresh)
+      proofs.get() shouldBe 2
+      val retry = scheduled.expectMsgType[ScheduledRefresh]
+      retry.delay shouldBe avgGenTime.max(100.millis)
+      retry.message.gen shouldBe refresh
+      // Hold delivery until retained-work assertions finish, independent of elapsed time.
+      val lateSolution = solution(first.candidateBlock.timestamp)
+      generator.tell(OrderingSolutionFound(lateSolution), replies.ref)
+      replies.expectMsgType[StatusReply[Unit]](500.millis).getError.getMessage shouldBe
+        "No retained candidate matches ordering solution PoW"
+      orderingChecks.size() shouldBe 1
+      orderingChecks.peek() shouldBe
+        CandidateGenerator.completeOrderingBlock(first.candidateBlock, lateSolution).id
+      // More internal refresh failures must not create parallel retry chains.
+      (1 to 3).foreach { _ =>
+        generator ! refresh
+        generations.expectMsg(refresh)
+      }
+      proofs.get() shouldBe 8
+      scheduled.expectNoMessage(100.millis.dilated)
+      generator ! retry.message
+      val nextRetry = scheduled.expectMsgType[ScheduledRefresh]
+      nextRetry.delay shouldBe avgGenTime.max(100.millis)
+      nextRetry.message.gen shouldBe refresh
+      proofs.get() shouldBe 10
+      scheduled.expectNoMessage(100.millis.dilated)
+      failProofs.set(false)
+      generator ! nextRetry.message
+      // The following marker is observed after the inline retry has completed.
+      generator.tell("generation barrier", generations.ref)
+      generations.expectMsg("generation barrier")
+      val completedProofs = proofs.get()
+      completedProofs should be > 2
+      unsolicited.expectNoMessage(100.millis.dilated)
+      replies.expectNoMessage(100.millis.dilated)
+      view.expectNoMessage(100.millis.dilated)
+      generator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), replies.ref)
+      val regenerated = replies.expectMsgType[StatusReply[Candidate]].getValue
+      generations.expectMsgType[GenerateCandidate].forced shouldBe false
+      regenerated.candidateBlock.parentOpt.map(_.id) shouldBe Some(root.id)
+      regenerated.candidateBlock.version shouldBe Header.Interpreter60Version
+      (regenerated eq first) shouldBe false
+      proofs.get() shouldBe completedProofs
+
+      // A reply-carrying failure gets one error and does not schedule another attempt.
+      proofs.set(0)
+      failProofs.set(true)
+      val requested = GenerateCandidate(Seq.empty, reply = true, forced = true)
+      generator.tell(requested, replies.ref)
+      replies.expectMsgType[StatusReply[Candidate]].getError.getMessage should include(
+        "Candidate generation failed")
+      generations.expectMsg(requested)
+      scheduled.expectNoMessage(100.millis.dilated)
+      proofs.get() shouldBe 2
+      replies.expectNoMessage(100.millis.dilated)
+      unsolicited.expectNoMessage(100.millis.dilated)
+
+      generator ! requested.copy(reply = false)
+      generations.expectMsg(requested.copy(reply = false))
+      val cancelledByCache = scheduled.expectMsgType[ScheduledRefresh]
+      generator.tell(refresh.copy(reply = true), replies.ref)
+      (replies.expectMsgType[StatusReply[Candidate]].getValue eq regenerated) shouldBe true
+      generations.expectMsg(refresh.copy(reply = true))
+      cancelledByCache.cancellation.isCancelled shouldBe true
+      generator ! requested.copy(reply = false)
+      generations.expectMsg(requested.copy(reply = false))
+      val cancelledByGeneration = scheduled.expectMsgType[ScheduledRefresh]
+      generator ! cancelledByCache.message
+      generator.tell("generation barrier", generations.ref)
+      generations.expectMsg("generation barrier")
+      scheduled.expectNoMessage(100.millis.dilated)
+      failProofs.set(false)
+      generator.tell(requested, replies.ref)
+      replies.expectMsgType[StatusReply[Candidate]].isSuccess shouldBe true
+      generations.expectMsg(requested)
+      cancelledByGeneration.cancellation.isCancelled shouldBe true
+      generator ! cancelledByGeneration.message
+      generator.tell("generation barrier", generations.ref)
+      generations.expectMsg("generation barrier")
+      scheduled.expectNoMessage(100.millis.dilated)
+    } finally {
+      TestKit.shutdownActorSystem(system)
+      history.closeStorage()
+      state.closeStorage()
+    }
   }
 
   it should "accept a late solution for previous work with that candidate's parameters" in withFixture { f =>
