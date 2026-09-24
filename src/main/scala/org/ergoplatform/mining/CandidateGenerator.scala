@@ -186,14 +186,11 @@ class CandidateGenerator(
       log.info(
         s"Preparing new candidate on getting new block at ${header.height}"
       )
+      val solved = if (needNewSolution(state.solvedBlock, header.id)) None else state.solvedBlock
       val stateWithAppliedTxs =
-        state.copy(lastAppliedBlockTxs = Some(header.id -> applied.txIds.toSet))
+        state.copy(lastAppliedBlockTxs = Some(header.id -> applied.txIds.toSet), solvedBlock = solved)
       if (needNewCandidate(state.cachedCandidate, header)) {
-        if (needNewSolution(state.solvedBlock, header.id))
-          context.become(initialized(stateWithAppliedTxs.copy(
-            cachedCandidate = None, pendingInput = None, solvedBlock = None)))
-        else
-          context.become(initialized(stateWithAppliedTxs.copy(cachedCandidate = None, pendingInput = None)))
+        context.become(initialized(stateWithAppliedTxs.copy(cachedCandidate = None, pendingInput = None)))
         self ! GenerateCandidate(txsToInclude = Seq.empty, reply = false, forced = false, optPk = None)
       } else {
         context.become(initialized(stateWithAppliedTxs))

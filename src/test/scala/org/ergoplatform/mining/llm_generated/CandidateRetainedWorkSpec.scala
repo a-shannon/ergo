@@ -532,6 +532,37 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     }
   }
 
+  it should "retire a solved block when it applies after fresh work already builds on it" in withFixture { f =>
+    // A nonzero distance keeps the version-one parent's interlink level bounded.
+    val solved = new AutolykosSolution(
+      defaultMinerSecret.publicImage.value, defaultMinerSecret.publicImage.value,
+      Longs.toByteArray(f.first.candidateBlock.timestamp), org.ergoplatform.mining.q / 2)
+    f.generator.tell(OrderingSolutionFound(solved), f.replies.ref)
+    f.replies.expectMsg(StatusReply.success(()))
+    val applied = f.view.expectMsgType[LocallyGeneratedOrderingBlock].efb
+    applied.id shouldBe CandidateGenerator.completeOrderingBlock(f.first.candidateBlock, solved).id
+
+    f.state = f.state.applyModifier(applied, None)(_ => ()).get
+    f.history = applyChain(f.history, Seq(applied))
+    // All actor messages use the same sender; application notification is withheld
+    // until the forced request has returned work on the newly applied parent.
+    f.generator.tell(ChangedHistory(f.history), f.replies.ref)
+    f.generator.tell(ChangedState(f.state), f.replies.ref)
+    val fresh = f.candidate(forced = true)
+    fresh.candidateBlock.parentOpt.map(_.id) shouldBe Some(applied.id)
+    (fresh eq f.first) shouldBe false
+    f.generator.tell(LocalBlockApplied(applied.header, applied.transactions.map(_.id)), f.replies.ref)
+    (f.candidate() eq fresh) shouldBe true
+
+    val nextSolution = f.accept(fresh)
+    f.generator.tell(OrderingSolutionFound(nextSolution), f.replies.ref)
+    f.replies.expectMsg(StatusReply.success(()))
+    val next = f.view.expectMsgType[LocallyGeneratedOrderingBlock].efb
+    next.id shouldBe CandidateGenerator.completeOrderingBlock(fresh.candidateBlock, nextSolution).id
+    next.parentId shouldBe applied.id
+    next.transactions.map(_.id) shouldBe fresh.candidateBlock.transactions.map(_.id)
+  }
+
   it should "reject retained ordering work after history advances" in withFixture { f =>
     val solved = f.accept(f.first)
     val txs = validTransactionsFromBoxHolder(f.txs._2, new RandomWrapper(Some(92)))._1
