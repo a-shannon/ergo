@@ -3,7 +3,10 @@ package org.ergoplatform.it
 import java.io.File
 import akka.japi.Option.Some
 import com.typesafe.config.Config
+import io.circe.{Decoder, Json}
+import io.circe.parser.decode
 import org.asynchttpclient.util.HttpConstants
+import org.ergoplatform.it.api.NodeApi
 import org.ergoplatform.it.container.{IntegrationSuite, Node}
 import org.scalatest.flatspec.AnyFlatSpec
 
@@ -59,7 +62,9 @@ class PrunedDigestNodeSyncSpec extends AnyFlatSpec with IntegrationSuite {
       val nodeForSyncing = docker
         .startDevNetNode(nodeForSyncingConfig, specialVolumeOpt = Some((localVolume, remoteVolume))).get
       Async.await(nodeForSyncing.waitForHeight(approxTargetHeight))
-      val sampleInfo = Async.await(nodeForSyncing.info)
+      val sampleSnapshot = Async.await(nodeForSyncing.get("/info")
+        .map(r => PrunedDigestInfo.decodeSnapshot(r.getResponseBody)))
+      val sampleInfo = sampleSnapshot.info
 
       val digestNode = docker.startDevNetNode(digestConfig).get
       val targetHeight = sampleInfo.bestBlockHeightOpt.value
@@ -73,8 +78,12 @@ class PrunedDigestNodeSyncSpec extends AnyFlatSpec with IntegrationSuite {
         },
         50.millis
       ))
-      val digestNodeInfo = Async.await(digestNode.info)
-      digestNodeInfo shouldEqual sampleInfo
+      val digestSnapshot = Async.await(digestNode.get("/info")
+        .map(r => PrunedDigestInfo.decodeSnapshot(r.getResponseBody)))
+      val digestNodeInfo = digestSnapshot.info
+      withClue(PrunedDigestInfo.comparisonClue(sampleSnapshot, digestSnapshot)) {
+        digestNodeInfo shouldEqual sampleInfo
+      }
       Async.await(digestNode.singleGet(s"/blocks/${blocksToPrune.last}")
         .map(_.getStatusCode == HttpConstants.ResponseStatusCodes.OK_200)) shouldBe false
     }
@@ -82,4 +91,26 @@ class PrunedDigestNodeSyncSpec extends AnyFlatSpec with IntegrationSuite {
     Await.result(result, 10.minutes)
   }
 
+}
+
+/** Retain diagnostic fields from the same responses used by the original assertion. */
+private[it] object PrunedDigestInfo {
+  final case class Snapshot(info: NodeApi.NodeInfo, stateVersion: Option[Json])
+
+  private implicit val snapshotDecoder: Decoder[Snapshot] = { cursor =>
+    // A malformed diagnostic field must not replace the original equality failure.
+    NodeApi.nodeInfoDecoder(cursor).map(info =>
+      Snapshot(info, cursor.downField("stateVersion").focus))
+  }
+
+  def decodeSnapshot(body: String): Snapshot =
+    decode[Snapshot](body).fold(throw _, identity)
+
+  def comparisonClue(sample: Snapshot, digest: Snapshot): String = {
+    def version(snapshot: Snapshot): String =
+      snapshot.stateVersion.fold("missing")(_.noSpaces)
+
+    s"Original /info samples: source stateVersion=${version(sample)}, " +
+      s"digest stateVersion=${version(digest)}. "
+  }
 }
