@@ -60,6 +60,14 @@ class VotingSpecification extends ErgoCorePropertyTest {
     }
   }
 
+  property("every declared rule id has a rulesSpec entry") {
+    val declared = ValidationRules.getClass.getDeclaredMethods.toSeq
+      .filter(m => m.getParameterCount == 0 && m.getReturnType == java.lang.Short.TYPE)
+      .map(m => m.getName -> m.invoke(ValidationRules).asInstanceOf[Short])
+    declared.size should be > 60
+    declared.filterNot { case (_, id) => rulesSpec.contains(id) } shouldBe empty
+  }
+
   property(".toExtensionCandidate && .parseExtension") {
     val update = ErgoValidationSettingsUpdate(
       Seq.empty,
