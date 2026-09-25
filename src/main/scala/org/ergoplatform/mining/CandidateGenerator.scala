@@ -156,11 +156,23 @@ class CandidateGenerator(
       context.become(initialized(state.copy(mpr = mp)))
     // Published only after input transactions have been applied to history and removed
     // from the pool. Refresh through the same GenerateCandidate path as ordering blocks.
-    case NewBestInputBlock(Some(id), _) if needNewCandidate(state.cachedCandidate, id) =>
-      val pending = state.pendingInput.filterNot(_ == id)
-      context.become(initialized(state.copy(cachedCandidate = None, pendingInput = pending)))
-      self ! GenerateCandidate(Seq.empty, reply = false, forced = false, optPk = None)
-    case _: NewBestInputBlock => // no new tip, or active work already uses it
+    case NewBestInputBlock(Some(id), _) =>
+      val selectedInputBlockId = state.hr.bestBlocks._2.map(_.id)
+      // The selected tip may already be known while its transactions are still being
+      // processed. Use the same tip-and-prefix cache identity as explicit requests.
+      if (selectedInputBlockId.contains(id)) {
+        val selectedInputTransactionsDigest = Algos.merkleTreeRoot(
+          state.hr.getBestOrderingCollectedInputBlocksTransactions()
+            .map(tx => LeafData @@ tx.serializedId))
+        val cachedMinerPk = state.cachedCandidate.map(_.externalVersion.pk).getOrElse(minerPk)
+        if (!cachedFor(state.cachedCandidate, Seq.empty, cachedMinerPk,
+          selectedInputBlockId, selectedInputTransactionsDigest)) {
+          val pending = state.pendingInput.filterNot(_ == id)
+          context.become(initialized(state.copy(cachedCandidate = None, pendingInput = pending)))
+          self ! GenerateCandidate(Seq.empty, reply = false, forced = false, optPk = None)
+        }
+      }
+    case _: NewBestInputBlock => // no new tip
 
     case PendingInputTimeout(id) if state.pendingInput.contains(id) =>
       log.warn(s"Input processing timed out: $id; resuming candidate generation")
@@ -536,11 +548,6 @@ object CandidateGenerator extends ScorexLogging {
     val parentHeaderIdOpt = cache.map(_.candidateBlock).flatMap(_.parentOpt).map(_.id)
     !parentHeaderIdOpt.contains(bestFullBlockHeader.id)
   }
-
-  /** Input-tip events only invalidate work that does not already build on that tip. */
-  def needNewCandidate(cache: Option[Candidate], bestInputId: ModifierId): Boolean =
-    !cache.flatMap(_.candidateBlock.inputBlockFields.prevInputBlockId)
-      .exists(_.sameElements(idToBytes(bestInputId)))
 
   /** Solution is valid only if bestFullBlock on the chain is its parent */
   def needNewSolution(

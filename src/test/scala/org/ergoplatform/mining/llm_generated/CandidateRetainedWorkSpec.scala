@@ -1,6 +1,6 @@
 package org.ergoplatform.mining.llm_generated
 
-import org.ergoplatform.mining.{AutolykosPowScheme, CandidateBlock, CandidateGenerator, ErgoMiningThread, PrivateKey}
+import org.ergoplatform.mining.{AutolykosPowScheme, CandidateBlock, CandidateGenerator, ErgoMiningThread, InputBlockFields, PrivateKey}
 
 import akka.actor.{Actor, ActorRef, ActorSystem, Cancellable, Props}
 import akka.pattern.StatusReply
@@ -10,13 +10,16 @@ import com.google.common.primitives.Longs
 import org.ergoplatform.{AutolykosSolution, InputBlockFound, InputSolutionFound, OrderingSolutionFound, ProveBlockResult}
 import org.ergoplatform.mining.CandidateGenerator.{Candidate, GenerateCandidate, RefreshCandidate}
 import org.ergoplatform.modifiers.history.header.Header
+import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{ChangedHistory, ChangedState, LocalBlockApplied, NewBestInputBlock}
 import org.ergoplatform.nodeView.{LocallyGeneratedInputBlock, LocallyGeneratedOrderingBlock}
 import org.ergoplatform.nodeView.ErgoReadersHolder.{GetReaders, Readers}
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.nodeView.state.{ErgoStateContext, StateType, UtxoState}
 import org.ergoplatform.nodeView.wallet.ErgoWalletReader
-import org.ergoplatform.settings.Parameters
+import org.ergoplatform.settings.{Constants, Parameters}
+import org.ergoplatform.subblocks.InputBlockAnnouncement
+import org.ergoplatform.{ErgoBoxCandidate, Input}
 import org.ergoplatform.utils.{HistoryTestHelpers, RandomWrapper}
 import org.ergoplatform.utils.generators.ChainGenerator.applyChain
 import org.ergoplatform.utils.generators.ValidBlocksGenerators.{createUtxoState, validFullBlock, validTransactionsFromBoxHolder}
@@ -25,6 +28,7 @@ import org.scalatest.matchers.should.Matchers
 
 import scala.concurrent.duration._
 import scala.util.Try
+import sigma.interpreter.ProverResult
 
 /** Real actor, candidate assembly and stores; deterministic PoW controls the race boundary.
   * No network actors are started. Input application uses the same history API as the holder.
@@ -626,6 +630,65 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     val current = f.candidate()
     f.generator.tell(NewBestInputBlock(Some(input.sbi.id), local = false), f.replies.ref)
     f.candidate().candidateBlock.timestamp shouldBe current.candidateBlock.timestamp
+  }
+
+  it should "refresh work when the selected input tip stays fixed but its processed prefix grows" in withFixture { f =>
+    f.submit(f.accept(f.first)).isSuccess shouldBe true
+    val firstInput = f.view.expectMsgType[LocallyGeneratedInputBlock]
+    f.applyInput(firstInput)
+    val spendable = f.txs._2.boxes.values.find(_.ergoTree == Constants.TrueTree).get
+    val nextTxs = Seq(ErgoTransaction(
+      IndexedSeq(Input(spendable.id, ProverResult.empty)), IndexedSeq.empty,
+      IndexedSeq(new ErgoBoxCandidate(spendable.value, Constants.TrueTree,
+        f.state.stateContext.currentHeight, spendable.additionalTokens))))
+    val secondBlock = validFullBlock(Some(f.root), f.state, nextTxs)
+    val emptyFields = InputBlockFields.empty
+    val childFields = new InputBlockFields(Some(scorex.util.idToBytes(firstInput.sbi.id)),
+      emptyFields.transactionsDigest, emptyFields.prevTransactionsDigest,
+      emptyFields.inputBlockFieldsProof)
+    val secondAnnouncement = InputBlockAnnouncement(1, secondBlock.header, childFields, None)
+
+    // The announcement selects the tip before its transactions are processed.
+    f.history.applyInputBlock(secondAnnouncement) shouldBe None
+    f.history.bestBlocks._2.map(_.id) shouldBe Some(secondAnnouncement.id)
+    val pool = ErgoMemPool.empty(f.config)
+    val before = CandidateGenerator.generateCandidate(f.history, f.state, pool,
+      defaultMinerSecret.publicImage, Seq.empty, None, f.config).get.get._1
+    val oldDigest = before.candidateBlock.inputBlockFields.prevTransactionsDigest
+
+    case object ReadCachedCandidate
+    val initial = CandidateGenerator.CandidateGeneratorState(
+      Some(before), None, f.history, f.state, pool, 10.millis, None,
+      retainedCandidates = Vector(before), lastTimestamp = before.candidateBlock.timestamp)
+    val generator = f.system.actorOf(Props(new CandidateGenerator(
+      defaultMinerSecret.publicImage, f.readers, f.view.ref, f.config) {
+      override def preStart(): Unit = ()
+      override def receive: Receive = initialized(initial)
+      override private[mining] def initialized(
+        state: CandidateGenerator.CandidateGeneratorState): Receive = {
+        val inspect: Receive = { case ReadCachedCandidate => sender() ! state.cachedCandidate }
+        inspect.orElse(super.initialized(state))
+      }
+    }))
+
+    val (applied, _) = f.history.applyInputBlockTransactions(
+      secondAnnouncement.id, nextTxs, f.state)
+    applied should contain(secondAnnouncement.id)
+    f.history.bestBlocks._2.map(_.id) shouldBe Some(secondAnnouncement.id)
+    val processed = CandidateGenerator.generateCandidate(f.history, f.state, pool,
+      defaultMinerSecret.publicImage, Seq.empty, None, f.config).get.get._1
+    val processedDigest = processed.candidateBlock.inputBlockFields.prevTransactionsDigest
+    java.util.Arrays.equals(oldDigest, processedDigest) shouldBe false
+
+    generator.tell(NewBestInputBlock(Some(secondAnnouncement.id), local = true), f.replies.ref)
+    f.replies.awaitAssert({
+      generator.tell(ReadCachedCandidate, f.replies.ref)
+      val refreshed = f.replies.expectMsgType[Option[Candidate]].get
+      (refreshed eq before) shouldBe false
+      java.util.Arrays.equals(
+        refreshed.candidateBlock.inputBlockFields.prevTransactionsDigest,
+        processedDigest) shouldBe true
+    }, 5.seconds, 100.millis)
   }
 
   it should "report distinct input errors for unmatched work and pending application" in withFixture { f =>
