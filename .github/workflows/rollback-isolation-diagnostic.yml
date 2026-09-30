@@ -1,0 +1,69 @@
+name: Rollback isolation diagnostic
+
+on:
+  push:
+    branches: [feat/rollback-isolation-diagnostic-20260930]
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: rollback-sbt-${{ runner.os }}-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
+      - name: Build pinned SigmaState dependency
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
+      - name: Build integration image and tests once
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          git rev-parse HEAD > diagnostic/commit.txt
+          sbt -batch -Denv=test '++2.12.20' 'it:compile' docker 2>&1 | tee diagnostic/build.log
+      - name: Run up to three fresh rollback cases, stopping on failure
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            evidence="${GITHUB_WORKSPACE}/diagnostic/attempt-${attempt}"
+            mkdir -p "${evidence}" "${RUNNER_TEMP}/rollback-${attempt}"
+            test -z "$(docker ps -q)"
+            set +e
+            TMPDIR="${RUNNER_TEMP}/rollback-${attempt}" timeout --signal=TERM --kill-after=30s 25m \
+              sbt -batch -Denv=test '++2.12.20' 'it:testOnly org.ergoplatform.it.DeepRollBackSpec' \
+              2>&1 | tee "${evidence}/test.log"
+            status=${PIPESTATUS[0]}
+            set -e
+            echo "${status}" > "${evidence}/exit-code.txt"
+            if [[ -d target/logs ]]; then cp -a target/logs "${evidence}/node-logs"; fi
+            # Capture stopped mining stages too; the suite only exports its final live nodes.
+            for id in $(docker ps -aq --filter 'name=ergo-itest-'); do
+              docker logs --timestamps "${id}" > "${evidence}/container-${id}.log" 2>&1 || true
+            done
+            # This is a disposable hosted runner, containing only this experiment's nodes.
+            docker ps -a --format '{{.ID}} {{.Names}} {{.Status}}' > "${evidence}/containers.txt"
+            ids=$(docker ps -aq --filter 'name=ergo-itest-')
+            if [[ -n "${ids}" ]]; then docker rm -f ${ids}; fi
+            if [[ "${status}" -ne 0 ]]; then exit "${status}"; fi
+            test -z "$(docker ps -q)"
+          done
+      - name: Retain diagnostic evidence on success or failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-isolation-${{ github.sha }}
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 14
