@@ -105,6 +105,25 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
     snapshot(phase, "A", nodeA, budget).zip(snapshot(phase, "B", nodeB, budget))
   }
 
+  private def waitForSettledSeed(nodeA: Node, nodeB: Node): Future[Int] = {
+    observations.until(2.minutes.fromNow, 1.second, 5.seconds)(
+      budget => observeNodes("initial seed", nodeA, nodeB, budget)
+    ) { case (a, b) =>
+      a.info.exists { infoA =>
+        b.info.exists { infoB =>
+          ConvergenceObservations.sameBestBlock(infoA, infoB, ErgoHistoryUtils.GenesisHeight) &&
+            infoA.isMining.contains(false) && infoB.isMining.contains(false) &&
+            infoA.bestHeaderHeightOpt == infoA.bestBlockHeightOpt &&
+            infoB.bestHeaderHeightOpt == infoB.bestBlockHeightOpt &&
+            infoA.bestHeaderIdOpt == infoA.bestBlockIdOpt &&
+            infoB.bestHeaderIdOpt == infoB.bestBlockIdOpt
+        }
+      }
+    }(
+      s"Initial chain did not settle on the same fully applied tip; $lastObservation"
+    ).map { case (a, _) => a.info.get.bestBlockHeightOpt.get }
+  }
+
   private def waitForSameBestBlock(
     nodeA: Node,
     nodeB: Node,
@@ -148,8 +167,14 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
       genesisAGen shouldBe genesisBGen
       Async.await(observeNodes("initial shared chain", minerAGen, minerBGen))
 
-      // 2. Stop all nodes
+      // Stop producing new blocks while B downloads the complete shared seed.
       docker.stopNode(minerAGen.containerId)
+      val minerASeed: Node = docker.startDevNetNode(minerAConfigNonGen,
+        specialVolumeOpt = Some((localVolumeA, remoteVolumeA))).get
+      val seedHeight = Async.await(waitForSettledSeed(minerASeed, minerBGen))
+      require(seedHeight < chainLength,
+        s"Initial shared chain already reached $seedHeight; isolated B must mine to $chainLength")
+      docker.stopNode(minerASeed.containerId)
       docker.stopNode(minerBGen.containerId)
 
       val minerAIsolated: Node = docker.startDevNetNode(DeepRollBackSpec.isolatedMiningConfig.withFallback(minerAConfig), isolatedPeersConfig,
