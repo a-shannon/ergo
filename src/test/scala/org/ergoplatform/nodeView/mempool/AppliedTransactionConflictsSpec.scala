@@ -37,7 +37,7 @@ class AppliedTransactionConflictsSpec extends AnyFlatSpec with ErgoTestHelpers w
     after.getAll.map(_.id).toSet shouldBe Set(unrelated.id)
     after.spentInputs.toSet shouldBe unrelated.inputs.map(_.boxId).toSet
     after.pool.outputs.keySet shouldBe unrelated.outputs.map(_.id).toSet
-    after.stats.takenTxns shouldBe 8
+    after.stats.takenTxns shouldBe 7
     before.contains(conflict.id) shouldBe true
   }
 
@@ -62,17 +62,17 @@ class AppliedTransactionConflictsSpec extends AnyFlatSpec with ErgoTestHelpers w
     val after = poolWith(first, second, unrelated).removeWithDoubleSpends(Seq(applied))
 
     after.getAll.map(_.id).toSet shouldBe Set(unrelated.id)
-    after.stats.takenTxns shouldBe 9
+    after.stats.takenTxns shouldBe 7
   }
 
-  it should "count a conflict sharing several inputs only once" in {
+  it should "evict a conflict sharing several inputs without counting it" in {
     val applied = transaction(1, 2)(1000000L)
     val conflict = transaction(1, 2)(2000000L)
 
     val after = poolWith(conflict).removeWithDoubleSpends(Seq(applied, applied))
 
     after.size shouldBe 0
-    after.stats.takenTxns shouldBe 8
+    after.stats.takenTxns shouldBe 7
   }
 
   it should "remove a present applied transaction once and retain its unconfirmed child" in {

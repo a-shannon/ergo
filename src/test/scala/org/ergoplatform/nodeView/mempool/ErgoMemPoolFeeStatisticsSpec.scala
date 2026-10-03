@@ -11,7 +11,7 @@ import scorex.crypto.authds.ADKey
 import sigma.interpreter.ProverResult
 
 /**
-  * Regression tests for #2635: conflict evictions are not confirmations.
+  * Regression tests for #2635: only transactions included in blocks are confirmations.
   * Synthetic transactions exercise pool bookkeeping without state validation.
   * Direct cleanup isolates statistics from the batch membership guard in #2526.
   */
@@ -104,5 +104,20 @@ class ErgoMemPoolFeeStatisticsSpec extends AnyFlatSpec with Matchers {
 
     repeated.getAll.map(_.id).toSet shouldBe Set(unrelated.id)
     repeated.stats shouldBe after.stats
+  }
+
+  it should "preserve confirmation statistics when invalidating an unconfirmed transaction" in {
+    val confirmed = feeTx(inputSeed = 1, fee = 2000000L)
+    val invalid = feeTx(inputSeed = 2, fee = 3000000L)
+    val before = ErgoMemPool.empty(settings)
+      .put(Seq(confirmed, invalid).map(tx => UnconfirmedTransaction(tx, None)))
+      .removeWithDoubleSpends(Seq(confirmed))
+    totals(before.stats)._1 shouldBe 1L
+
+    val after = before.invalidate(UnconfirmedTransaction(invalid, None))
+
+    after.contains(invalid.id) shouldBe false
+    after.isInvalidated(invalid.id) shouldBe true
+    after.stats shouldBe before.stats
   }
 }
