@@ -50,6 +50,7 @@ class ExtraIndexerTestActor(test: ExtraIndexerSpecification) extends ExtraIndexe
       _history = ErgoHistory.readOrGenerate(dbSettings.copy(nodeSettings = nodeSettings.copy(extraIndex = true)))(context)
       test._history = _history
       sender ! IndexerState.fromHistory(_history)
+    case test.ReopenWithoutRentRows(schemaVersion) => reopenWithoutRentRows(schemaVersion)
     case test.CheckpointSettings() => sender ! dbSettings
   }
 
@@ -167,7 +168,9 @@ class ExtraIndexerTestActor(test: ExtraIndexerSpecification) extends ExtraIndexe
         LDBFactory.createKvDb(s"${dir.getAbsolutePath}/history/extra"),
         dbSettings.cacheSettings
       ) {
-        override def insertExtraTry(entries: Array[(Array[Byte], Array[Byte])], objects: Array[ExtraIndex]): Try[Unit] = {
+        override def insertExtraTry(entries: Array[(Array[Byte], Array[Byte])],
+                                    objects: Array[ExtraIndex],
+                                    objectsToRemove: Array[ModifierId]): Try[Unit] = {
           val marker = entries.find(_._1.sameElements(ExtraIndexer.RollbackToKey)).map(e => ByteBuffer.wrap(e._2).getInt)
           val shouldFail = writeFailurePhase match {
             case "forward" => marker.contains(0)
@@ -183,7 +186,7 @@ class ExtraIndexerTestActor(test: ExtraIndexerSpecification) extends ExtraIndexe
               writeFailureProbe.foreach(_ ! pendingIds)
             }
             Failure(new IllegalStateException(s"injected $writeFailurePhase write failure"))
-          } else super.insertExtraTry(entries, objects).map { _ =>
+          } else super.insertExtraTry(entries, objects, objectsToRemove).map { _ =>
             if (writeFailurePhase.nonEmpty) {
               completedWriteKinds += marker.map(m => if (m > 0) "marked" else "unmarked").getOrElse("rows")
             }
@@ -217,6 +220,24 @@ class ExtraIndexerTestActor(test: ExtraIndexerSpecification) extends ExtraIndexe
     test.lock.unlock()
   }
 
+  private def reopenWithoutRentRows(schemaVersion: Int): Unit = {
+    val rentRows = _history.storageRentBoxesUntil(Int.MaxValue, Int.MaxValue)
+    historyStorage.removeExtraTry(rentRows.map(_.id)).get
+    historyStorage.insertExtraTry(
+      Array(ExtraIndexer.SchemaVersionKey -> ByteBuffer.allocate(4).putInt(schemaVersion).array),
+      Array.empty
+    ).get
+    resetTransientState()
+    _history.closeStorage()
+    _history = ErgoHistory.readOrGenerate(dbSettings.copy(
+      nodeSettings = nodeSettings.copy(extraIndex = true)))(context)
+    test._history = _history
+    context.become(receive.orElse(loaded(IndexerState.fromHistory(_history))))
+    test.lock.lock()
+    test.created.signal()
+    test.lock.unlock()
+  }
+
   def reset(): Unit = {
     resetTransientState()
     stateOpt = None
@@ -227,6 +248,8 @@ class ExtraIndexerTestActor(test: ExtraIndexerSpecification) extends ExtraIndexe
     templates.clear()
     tokens.clear()
     segments.clear()
+    rentBoxes.clear()
+    rentBoxDeletes.clear()
     deferredHeaderHeightOpt = None
     deferredTransactionsHeightOpt = None
     rollbackFailureProbeOpt = None
