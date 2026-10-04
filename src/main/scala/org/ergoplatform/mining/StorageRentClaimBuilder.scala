@@ -123,17 +123,17 @@ object StorageRentClaimBuilder extends ScorexLogging {
             val outputIndex = recreated.length.toShort
             val recreatedBox = new ErgoBoxCandidate(floorValue, box.ergoTree,
               currentHeight, box.additionalTokens, box.additionalRegisters)
-            val dust = dustLimit(recreatedBox, outputIndex, parameters)
-            // the recreated box may need a few nanoERG more than the floor when the dust rule
-            // prices its (possibly longer) serialization
-            val recreatedValue = math.max(floorValue, dust)
-            if (recreatedValue <= box.value && boxSize(recreatedBox, outputIndex) <= ErgoBox.MaxBoxSize) {
-              val finalBox =
-                if (recreatedValue == floorValue) recreatedBox
-                else new ErgoBoxCandidate(recreatedValue, box.ergoTree, currentHeight,
-                  box.additionalTokens, box.additionalRegisters)
+            var finalBox = recreatedBox
+            var dust = dustLimit(finalBox, outputIndex, parameters)
+            // Raising the value can lengthen its VLQ, so price the final serialization.
+            while (finalBox.value < dust) {
+              finalBox = new ErgoBoxCandidate(dust, box.ergoTree, currentHeight,
+                box.additionalTokens, box.additionalRegisters)
+              dust = dustLimit(finalBox, outputIndex, parameters)
+            }
+            if (finalBox.value <= box.value && boxSize(finalBox, outputIndex) <= ErgoBox.MaxBoxSize) {
               recreated += finalBox
-              sweptValue += box.value - recreatedValue
+              sweptValue += box.value - finalBox.value
               claimed += ((box, true))
             }
           } else if (gracePeriodPassed && !carriesWhitelistedToken) {
@@ -158,9 +158,23 @@ object StorageRentClaimBuilder extends ScorexLogging {
       // box; with no burned boxes a single proceeds output collects the fees. Burned boxes
       // whose proceeds share would fall below the dust floor are dropped (claimable next
       // time, when more proceeds accumulate).
-      val dust = dustLimit(p2pkCandidate(0L, minerTree, currentHeight), 0, parameters)
+      def proceedsFor(count: Int): IndexedSeq[ErgoBoxCandidate] = {
+        val proceedsCount = math.max(count, if (sweptValue > 0) 1 else 0)
+        val perOutput = if (count > 0) sweptValue / count else sweptValue
+        (0 until proceedsCount).map { i =>
+          val value = if (i < proceedsCount - 1) perOutput else sweptValue - perOutput * (proceedsCount - 1)
+          p2pkCandidate(value, minerTree, currentHeight)
+        }
+      }
+
+      def dustClean(outputs: IndexedSeq[ErgoBoxCandidate]): Boolean =
+        outputs.zipWithIndex.forall { case (candidate, i) =>
+          candidate.value >= dustLimit(candidate, (recreated.length + i).toShort, parameters)
+        }
+
       var burnCount = burnBoxes.length
-      while (burnCount > 0 && sweptValue < burnCount.toLong * dust) {
+      var proceedsOutputs = proceedsFor(burnCount)
+      while (burnCount > 0 && !dustClean(proceedsOutputs)) {
         // not enough proceeds to give every burned box a dust-clean output: drop the
         // smallest one (it is the cheapest to claim later, alongside other proceeds)
         val minIdx = burnBoxes.indices.minBy(burnBoxes(_).value)
@@ -169,17 +183,12 @@ object StorageRentClaimBuilder extends ScorexLogging {
         if (claimedIdx >= 0) claimed.remove(claimedIdx)
         burnBoxes.remove(minIdx)
         burnCount -= 1
+        proceedsOutputs = proceedsFor(burnCount)
       }
-      val perOutput = if (burnCount > 0) sweptValue / burnCount else sweptValue
 
-      if (claimed.isEmpty || (burnCount == 0 && sweptValue < dust && sweptValue > 0)) {
+      if (claimed.isEmpty || !dustClean(proceedsOutputs)) {
         None
       } else {
-        val proceedsCount = math.max(burnCount, if (sweptValue > 0) 1 else 0)
-        val proceedsOutputs = (0 until proceedsCount).map { i =>
-          val value = if (i < proceedsCount - 1) perOutput else sweptValue - perOutput * (proceedsCount - 1)
-          p2pkCandidate(value, minerTree, currentHeight)
-        }
         val outputCandidates = recreated.toIndexedSeq ++ proceedsOutputs.toIndexedSeq
 
         var recreateIdx = 0

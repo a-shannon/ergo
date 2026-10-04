@@ -5,7 +5,7 @@ import org.ergoplatform.nodeView.state.{ErgoStateContext, VotingData}
 import org.ergoplatform.settings.{Constants, ValidationRules}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
-import org.ergoplatform.ErgoBox
+import org.ergoplatform.{ErgoBox, ErgoBoxCandidate}
 import scorex.util.{ModifierId, bytesToId}
 import sigma.Colls
 import sigma.ast.{ErgoTree, ShortConstant}
@@ -345,6 +345,34 @@ class StorageRentClaimBuilderSpec extends ErgoCorePropertyTest {
       indices.length shouldBe tx.outputCandidates.length
       indices should contain theSameElementsAs (0 until tx.outputCandidates.length)
     }
+  }
+
+  property("dropping a dusty burn keeps the surviving claim and its output binding valid") {
+    val tokenIds = Seq(11.toByte, 12.toByte)
+    val initialLarge = burnCandidateWithTokens(tokenIds)
+    val dummyTxId = bytesToId(Array.fill(32)(0.toByte))
+    def proceedsDust(value: Long, index: Short): Long =
+      new ErgoBoxCandidate(value, MinerTree, H, Colls.emptyColl, Map.empty)
+        .toBox(dummyTxId, index).bytes.length.toLong * parameters.minValuePerByte
+
+    val largeValue = math.min(initialLarge.value, proceedsDust(initialLarge.value, 0.toShort) + 1000L)
+    val large = boxWithTokens(largeValue,
+      Constants.StoragePeriod + StorageRentClaimBuilder.StorageGracePeriod, tokenIds)
+    val small = boxWithTokens(1L,
+      Constants.StoragePeriod + StorageRentClaimBuilder.StorageGracePeriod + 1, Seq(13.toByte))
+    val initialShare = (large.value + small.value) / 2
+
+    large.value should be < minValueOf(large)
+    small.value should be < minValueOf(small)
+    large.value should be >= proceedsDust(large.value, 0.toShort)
+    initialShare should be < proceedsDust(initialShare, 1.toShort)
+
+    val tx = buildAndValidate(Seq(small, large))
+      .getOrElse(fail("expected the larger burned input to remain claimable"))
+    tx.inputs.map(_.boxId) shouldBe IndexedSeq(large.id)
+    tx.outputCandidates.length shouldBe 1
+    tx.outputCandidates.head.value shouldBe large.value
+    var127Indices(tx) shouldBe IndexedSeq(0)
   }
 
   /** Every token id present in any output of `tx`. */
