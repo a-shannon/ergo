@@ -1,8 +1,9 @@
 package org.ergoplatform.mining
 
+import com.typesafe.config.ConfigFactory
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.nodeView.state.{ErgoStateContext, VotingData}
-import org.ergoplatform.settings.{Constants, ValidationRules}
+import org.ergoplatform.settings.{Constants, ErgoSettingsReader, ValidationRules}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate}
@@ -69,6 +70,13 @@ class StorageRentClaimBuilderSpec extends ErgoCorePropertyTest {
   }
 
   private val WhitelistedTokenId: ModifierId = tokenIdOf(7.toByte)
+
+  private def configuredWhitelist(id: String): Set[ModifierId] = {
+    val overrideConfig = ConfigFactory.parseString(
+      s"""ergo.node.storageRentTokenWhitelist = ["$id"]""")
+    val config = overrideConfig.withFallback(ConfigFactory.load()).resolve()
+    ErgoSettingsReader.fromConfig(config).nodeSettings.storageRentTokenWhitelist.toSet
+  }
 
   private def minValueOf(box: ErgoBox): Long = parameters.minValuePerByte.toLong * box.bytes.length
 
@@ -171,6 +179,33 @@ class StorageRentClaimBuilderSpec extends ErgoCorePropertyTest {
     buildAndValidate(Seq(b), whitelist = Set(WhitelistedTokenId)) shouldBe None
     // not whitelisted: burned after the grace period
     buildAndValidate(Seq(b), whitelist = Set.empty).isDefined shouldBe true
+  }
+
+  property("a lowercase configured token id protects its box from rent burning") {
+    val id = tokenIdOf(0xab.toByte)
+    val b = burnCandidateWithTokens(Seq(0xab.toByte))
+    val whitelist = configuredWhitelist(id.toString)
+
+    buildAndValidate(Seq(b), whitelist = whitelist) shouldBe None
+    whitelist shouldBe Set(id)
+  }
+
+  property("an uppercase configured token id protects the same box from rent burning") {
+    val id = tokenIdOf(0xab.toByte)
+    val b = burnCandidateWithTokens(Seq(0xab.toByte))
+    val whitelist = configuredWhitelist(id.toString.toUpperCase(java.util.Locale.ROOT))
+
+    buildAndValidate(Seq(b), whitelist = whitelist) shouldBe None
+    whitelist shouldBe Set(id)
+  }
+
+  property("a malformed configured rent token id prevents settings startup") {
+    Seq("ab" * 31, "ab" * 33, "zz" * 32).foreach { id =>
+      val error = intercept[IllegalArgumentException] {
+        configuredWhitelist(id)
+      }
+      error.getMessage should include("storageRentTokenWhitelist")
+    }
   }
 
   property("too young box is skipped") {

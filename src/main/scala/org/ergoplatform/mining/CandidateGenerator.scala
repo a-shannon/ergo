@@ -693,7 +693,7 @@ object CandidateGenerator extends ScorexLogging {
               upcomingContext.currentParameters,
               minerPk,
               Option(ergoSettings.chainSettings.reemission.reemissionTokenId).filter(_.nonEmpty),
-              ergoSettings.nodeSettings.storageRentTokenWhitelist.map(id => ModifierId @@ id).toSet
+              ergoSettings.nodeSettings.storageRentTokenWhitelist.toSet
             ).toSeq
           } else {
             Seq.empty

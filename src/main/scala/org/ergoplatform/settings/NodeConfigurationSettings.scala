@@ -1,11 +1,13 @@
 package org.ergoplatform.settings
 
+import com.typesafe.config.Config
 import net.ceedubs.ficus.Ficus._
 import net.ceedubs.ficus.readers.ValueReader
 import org.ergoplatform.ErgoLikeContext.Height
 import org.ergoplatform.nodeView.mempool.ErgoMemPoolUtils.SortingOption
 import org.ergoplatform.nodeView.state.StateType
-import scorex.util.ModifierId
+import scorex.util.{ModifierId, bytesToId}
+import scorex.util.encode.Base16
 
 import scala.concurrent.duration.FiniteDuration
 
@@ -51,7 +53,7 @@ case class NodeConfigurationSettings(override val stateType: StateType,
                                      extraIndex: Boolean,
                                      rejectStorageRentTxs: Boolean = false,
                                      storageRentCollection: Boolean = false,
-                                     storageRentTokenWhitelist: Seq[String] = Seq.empty,
+                                     storageRentTokenWhitelist: Seq[ModifierId] = Seq.empty,
                                      blacklistedTransactions: Seq[String] = Seq.empty,
                                      checkpoint: Option[CheckpointSettings] = None) extends ClientCapabilities {
   /**
@@ -68,6 +70,13 @@ case class NodeConfigurationSettings(override val stateType: StateType,
   */
 trait NodeConfigurationReaders extends StateTypeReaders with CheckpointingSettingsReader
                                   with UtxoSettingsReader with NipopowSettingsReader with ModifierIdReader {
+
+  private def readStorageRentTokenWhitelist(cfg: Config, path: String): Seq[ModifierId] =
+    cfg.as[Seq[String]](path).zipWithIndex.map { case (hex, index) =>
+      require(hex.matches("[0-9a-fA-F]{64}"),
+        s"$path[$index] must be exactly 32 bytes of hexadecimal token id")
+      bytesToId(Base16.decode(hex).get)
+    }
 
   implicit val nodeConfigurationReader: ValueReader[NodeConfigurationSettings] = { (cfg, path) =>
     val stateTypeKey = s"$path.stateType"
@@ -99,7 +108,7 @@ trait NodeConfigurationReaders extends StateTypeReaders with CheckpointingSettin
       cfg.as[Boolean](s"$path.extraIndex"),
       cfg.as[Boolean](s"$path.rejectStorageRentTxs"),
       cfg.as[Boolean](s"$path.storageRentCollection"),
-      cfg.as[Seq[String]](s"$path.storageRentTokenWhitelist"),
+      readStorageRentTokenWhitelist(cfg, s"$path.storageRentTokenWhitelist"),
       cfg.as[Seq[String]](s"$path.blacklistedTransactions"),
       cfg.as[Option[CheckpointSettings]](s"$path.checkpoint")
     )
