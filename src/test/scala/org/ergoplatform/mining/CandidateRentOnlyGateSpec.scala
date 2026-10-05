@@ -129,6 +129,8 @@ class CandidateRentOnlyGateSpec extends ErgoCorePropertyTest with TestFileUtils 
         defaultMinerPk, Seq.empty, None, fixtureSettings)
       indexedButUnclaimable shouldBe None
       enteredAssembly shouldBe true
+      history.storageRentBoxesUntil(threshold, StorageRentClaimBuilder.MaxClaims)
+        .map(_.boxId).toSeq shouldBe Seq(bytesToId(unclaimableBox.id))
 
       failIndexRead = true
       val failedIndex = CandidateGenerator.generateCandidate(history, state, pool,

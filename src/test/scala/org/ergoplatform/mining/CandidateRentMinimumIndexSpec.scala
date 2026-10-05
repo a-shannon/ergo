@@ -109,7 +109,7 @@ class CandidateRentMinimumIndexSpec extends ErgoCorePropertyTest with TestFileUt
       history.storageRentBoxesUntil(threshold, StorageRentClaimBuilder.MaxClaims)
         .map(_.boxId) should contain(bytesToId(box.id))
       history.storageRentBoxesUntil(threshold, StorageRentClaimBuilder.MaxClaims)
-        .map(_.boxId) should not contain bytesToId(dustOnly.id)
+        .map(_.boxId) should contain(bytesToId(dustOnly.id))
     } finally {
       storage.close()
       state.closeStorage()

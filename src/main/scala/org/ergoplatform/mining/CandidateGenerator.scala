@@ -722,25 +722,12 @@ object CandidateGenerator extends ScorexLogging {
             val reemissionTokenId = Option(ergoSettings.chainSettings.reemission.reemissionTokenId)
               .filter(_.nonEmpty)
             val tokenWhitelist = ergoSettings.nodeSettings.storageRentTokenWhitelist
-              .map(id => ModifierId @@ id).toSet
-            // An input at its own minimum can still be consumed by the rent-burn path:
-            // its smaller miner payout may clear the output dust floor. Preserve those
-            // index rows; retain the existing removal policy only when a singleton
-            // claim cannot be built under the current parameters.
-            val (unclaimableBelowMin, eligible) = scanned.partition { box =>
-              val minValue = params.minValuePerByte * box.bytes.length
-              val belowMin = minValue <= 0 || box.value <= minValue.toLong
-              belowMin && StorageRentClaimBuilder.buildClaim(
-                Seq(box), upcomingHeight, params, minerPk, reemissionTokenId, tokenWhitelist).isEmpty
-            }
-            if (unclaimableBelowMin.nonEmpty) {
-              log.warn(s"Removing ${unclaimableBelowMin.length} storage-rent eligibility entries " +
-                s"for boxes currently unclaimable at or below their minimum value: " +
-                s"${unclaimableBelowMin.map(box => bytesToId(box.id))}")
-              history.removeStorageRentBoxes(unclaimableBelowMin.map(box => bytesToId(box.id)))
-            }
+              .toSet
+            // Claimability depends on current parameters and miner policy. The extra indexer
+            // owns persistent row removal after a spend on the selected chain; the builder
+            // skips boxes it cannot claim in this candidate without deleting their rows.
             StorageRentClaimBuilder.buildClaim(
-              eligible,
+              scanned,
               upcomingHeight,
               params,
               minerPk,
