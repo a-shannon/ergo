@@ -307,6 +307,9 @@ class CandidateGenerator(
 
 object CandidateGenerator extends ScorexLogging {
 
+  private final class NoCandidateTransactions extends IllegalArgumentException(
+    "Proofs for 0 txs cannot be generated")
+
   /**
     * Holder for both candidate block and data for external miners derived from it
     * (to avoid possibly costly recalculation)
@@ -526,8 +529,15 @@ object CandidateGenerator extends ScorexLogging {
     def hasAnyMemPoolOrMinerTx =
       poolTransactions.nonEmpty || unspentTxsToInclude.nonEmpty || emissionTxOpt.nonEmpty
 
-    if (!hasAnyMemPoolOrMinerTx) {
-      log.info(s"Avoiding generation of a block without any transactions")
+    // Avoid the full assembly work when no indexed rent box could be claimed.
+    def hasIndexedRentBox = {
+      val threshold = stateContext.currentHeight + 1 - Constants.StoragePeriod
+      ergoSettings.nodeSettings.storageRentCollection && threshold > 0 &&
+        Try(h.storageRentBoxesUntil(threshold, 1).nonEmpty).getOrElse(true)
+    }
+
+    if (!hasAnyMemPoolOrMinerTx && !hasIndexedRentBox) {
+      log.info("Avoiding generation of a block without any transactions")
       None
     } else if (!chainSynced) {
       log.info(
@@ -561,7 +571,12 @@ object CandidateGenerator extends ScorexLogging {
         )
         None
       } else {
-        Some(candidateAttempt)
+        candidateAttempt match {
+          case Failure(_: NoCandidateTransactions) =>
+            log.info("Avoiding generation of a block without any transactions")
+            None
+          case _ => Some(candidateAttempt)
+        }
       }
     }
   }
@@ -755,6 +770,11 @@ object CandidateGenerator extends ScorexLogging {
         log.debug(s"Storage-rent claim transactions injected into the candidate: ${rentClaimTxs.map(_.id)}")
       }
 
+      val candidateTxs = emissionTxs ++ prioritizedTransactions ++ rentClaimTxs ++ poolTxs.map(_.transaction)
+      if (candidateTxs.isEmpty) {
+        throw new NoCandidateTransactions
+      }
+
       // todo: remove in 5.0
       // we allow for some gap, to avoid possible problems when different interpreter version can estimate cost
       // differently due to bugs in AOT costing
@@ -777,7 +797,7 @@ object CandidateGenerator extends ScorexLogging {
           state.stateContext.currentParameters.maxBlockSize,
           state,
           upcomingContext,
-          emissionTxs ++ prioritizedTransactions ++ rentClaimTxs ++ poolTxs.map(_.transaction)
+          candidateTxs
         )
         val rejectedRentClaimTxIds = res._2.filter(id => rentClaimTxs.exists(_.id == id))
         if (rejectedRentClaimTxIds.nonEmpty) {
