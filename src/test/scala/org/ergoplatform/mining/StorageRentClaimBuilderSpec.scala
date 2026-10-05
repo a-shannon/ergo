@@ -6,12 +6,13 @@ import org.ergoplatform.nodeView.state.{ErgoStateContext, VotingData}
 import org.ergoplatform.settings.{Constants, ErgoSettingsReader, ErgoValidationSettingsUpdate, Parameters, ValidationRules}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
-import org.ergoplatform.ErgoBox
+import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
 import scorex.util.{ModifierId, bytesToId}
 import sigma.Colls
 import sigma.ast.{ErgoTree, ShortConstant}
 import sigma.Extensions.CollBytesOps
 import sigma.data.{Digest32Coll, ProveDlog}
+import sigma.interpreter.{ContextExtension, ProverResult}
 import sigmastate.helpers.TestingHelpers._
 
 /**
@@ -235,6 +236,35 @@ class StorageRentClaimBuilderSpec extends ErgoCorePropertyTest {
     val b = atMinValueBox(Constants.StoragePeriod)
     (b.value <= minValueOf(b)) shouldBe true // sanity: not above the minimum
     buildAndValidate(Seq(b)) shouldBe None
+  }
+
+  property("a box at its own minimum may still have a valid rent-burn payout") {
+    val tokenIds = (1 to 10).map(_.toByte)
+    var b = boxWithTokens(10000000000L, Constants.StoragePeriod, tokenIds)
+    var attempts = 0
+    while (b.value > minValueOf(b) && attempts < 20) {
+      b = boxWithTokens(minValueOf(b), Constants.StoragePeriod, tokenIds)
+      attempts += 1
+    }
+    b.value should be <= minValueOf(b)
+    b.value - feeOf(b) should be <= 0L
+
+    val payout = new ErgoBoxCandidate(b.value, MinerTree, H, Colls.emptyColl, Map.empty)
+    val input = Input(b.id, ProverResult(Array.emptyByteArray,
+      ContextExtension(Map(Constants.StorageIndexVarId -> ShortConstant(0.toShort)))))
+    val tx = ErgoTransaction(IndexedSeq(input), IndexedSeq.empty, IndexedSeq(payout))
+    b.value should be >= parameters.minValuePerByte.toLong * payout.toBox(tx.id, 0).bytes.length
+
+    val fb0 = invalidErgoFullBlockGen.sample.get
+    val fakeHeader = fb0.header.copy(height = H - 1)
+    val fb = fb0.copy(fb0.header.copy(height = H, parentId = fakeHeader.id))
+    val baseContext = new ErgoStateContext(Seq(fakeHeader), None, genesisStateDigest,
+      parameters, validationSettingsNoIl, VotingData.empty)(settings.chainSettings)
+    val context = baseContext.appendFullBlock(fb).get
+    tx.statefulValidity(IndexedSeq(b), emptyDataBoxes, context).isSuccess shouldBe true
+
+    StorageRentClaimBuilder.buildClaim(Seq(b), H, parameters, minerPk, None, Set.empty)
+      .isDefined shouldBe true
   }
 
   property("box at or below the minimum value does not block other claims") {
