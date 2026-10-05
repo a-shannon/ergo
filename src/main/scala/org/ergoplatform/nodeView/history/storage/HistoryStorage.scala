@@ -114,10 +114,9 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     }
 
   /**
-    * Remove storage-rent eligibility entries of the given boxes, e.g. when a miner self-claim
-    * transaction spending them failed validation during block assembly, so retrying the claim
-    * is futile. An entry whose [[IndexedErgoBox]] is not in the extra index can not be
-    * located and is left in place.
+    * Remove storage-rent eligibility entries of the given boxes. This persistent operation
+    * must not be used for speculative candidate rejection or before the indexer has accepted
+    * the selected-chain spend. An entry whose [[IndexedErgoBox]] is absent cannot be located.
     */
   def removeStorageRentBoxes(boxIds: Seq[ModifierId]): Unit = {
     val keys = boxIds.flatMap { boxId =>

@@ -31,8 +31,9 @@ import scala.concurrent.duration._
   * The claim branch in `CandidateGenerator` is guarded twice: by the
   * `storageRentCollection` setting, and by `upcomingHeight - Constants.StoragePeriod > 0`.
   * `StoragePeriod` is `4 * BlocksPerYear` = 1,051,200 blocks, so a chain must be over a
-  * million blocks deep before any claim can be produced. No unit test can build such a
-  * chain, so these tests can only observe the young-chain path.
+  * million blocks deep before any claim can be produced on a real chain. These actor tests
+  * only observe the young-chain path; a separate synthetic aged-header fixture exercises
+  * claim assembly with real state and index storage.
   *
   * These tests therefore pin the *absence* of claims and the stability of candidate
   * generation with the collector enabled. They do NOT prove the flag or the height guard
@@ -41,9 +42,8 @@ import scala.concurrent.duration._
   * matches no row, so the observable result is identical. That mutation was verified to
   * pass this spec, so treat these as regression guards, not as gate coverage.
   *
-  * Covering the gate needs either a synthetic history at a height past the storage period,
-  * or extracting the sweep decision into a separately testable function - which would mean
-  * changing production code. The claim body is already covered against consensus by
+  * A synthetic history at a height past the storage period covers claim assembly in
+  * [[CandidateRentRejectIndexSpec]]. The claim body is covered against consensus by
   * [[org.ergoplatform.mining.StorageRentClaimBuilderSpec]].
   */
 class CandidateGeneratorStorageRentSpec extends AnyFlatSpec

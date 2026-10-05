@@ -480,7 +480,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     val before = history.storageRentBoxesUntil(Int.MaxValue, Int.MaxValue)
     before.length should be > 2
 
-    // remove the first two entries by box id, as CandidateGenerator does for a rejected claim
+    // Exercise explicit removal by box id. Candidate rejection must not use this operation.
     val toRemove = before.take(2).map(_.boxId)
     history.removeStorageRentBoxes(toRemove)
 
