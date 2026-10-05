@@ -86,24 +86,6 @@ class CandidateGenerator(
   }
 
   /**
-    * Drop storage-rent eligibility entries of boxes spent by rent-claim transactions of an
-    * applied block, so a freshly generated candidate can not pick them up again. The extra
-    * indexer would remove the same entries on its own, but it processes blocks
-    * asynchronously; doing it here closes the window between block application and indexing.
-    * Applies to blocks mined by us and by other miners alike.
-    */
-  private def dropSpentRentBoxEntries(history: ErgoHistoryReader, header: Header): Unit = {
-    history.getFullBlock(header).foreach { block =>
-      val spentBoxIds = rentClaimSpentBoxIds(block.transactions)
-      if (spentBoxIds.nonEmpty) {
-        log.debug(s"Removing ${spentBoxIds.length} storage-rent eligibility entries " +
-          s"spent by rent claims of block ${header.id}")
-        history.removeStorageRentBoxes(spentBoxIds)
-      }
-    }
-  }
-
-  /**
     * Reaction on invalidation of the block solved by us (e.g. due to a transaction which became
     * invalid after the block candidate was generated): drop the solved block along with cached
     * candidates. Mining will resume on the next external request, which will generate a fresh
@@ -192,7 +174,6 @@ class CandidateGenerator(
       log.info(
         s"Preparing new candidate on getting new block at ${header.height}"
       )
-      dropSpentRentBoxEntries(state.hr, header)
       val stateWithAppliedTxs =
         state.copy(lastAppliedBlockTxs = Some(header.id -> applied.txIds.toSet))
       if (needNewCandidate(state.cachedCandidate, header)) {
@@ -752,12 +733,10 @@ object CandidateGenerator extends ScorexLogging {
         500000
       }
 
-      // A storage-rent claim rejected during candidate assembly gets its input boxes dropped
-      // from the storage-rent index, so a broken eligibility entry is not retried in every
-      // candidate. Removal is idempotent, so a claim re-rejected by the retry pass below is
-      // handled by the same code without any extra bookkeeping.
+      // Candidate-local conflicts and transient validation failures cannot change the
+      // persistent unspent index. The extra indexer owns deletion on selected-chain spends.
       def collectPoolTxs: (Seq[ErgoTransaction], Seq[ModifierId]) = {
-        val res = collectTxs(
+        collectTxs(
           minerPk,
           state.stateContext.currentParameters.maxBlockCost - safeGap,
           state.stateContext.currentParameters.maxBlockSize,
@@ -765,15 +744,6 @@ object CandidateGenerator extends ScorexLogging {
           upcomingContext,
           emissionTxs ++ prioritizedTransactions ++ rentClaimTxs ++ poolTxs.map(_.transaction)
         )
-        val rejectedRentClaimTxIds = res._2.filter(id => rentClaimTxs.exists(_.id == id))
-        if (rejectedRentClaimTxIds.nonEmpty) {
-          val boxIds = rentClaimTxs.filter(tx => rejectedRentClaimTxIds.contains(tx.id))
-            .flatMap(tx => tx.inputs.map(in => bytesToId(in.boxId)))
-          log.warn(s"Storage-rent claim transactions $rejectedRentClaimTxIds rejected during candidate assembly, " +
-            s"removing their ${boxIds.length} input boxes from the storage-rent index")
-          history.removeStorageRentBoxes(boxIds)
-        }
-        res
       }
 
       val (txs, toEliminate) = collectPoolTxs
