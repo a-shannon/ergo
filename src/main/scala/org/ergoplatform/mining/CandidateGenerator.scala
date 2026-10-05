@@ -722,27 +722,34 @@ object CandidateGenerator extends ScorexLogging {
             val scanned = history.storageRentBoxesUntil(threshold, StorageRentClaimBuilder.MaxClaims)
               .toSeq
               .flatMap(entry => state.boxById(ADKey @@ idToBytes(entry.boxId)))
-            // boxes at or below the minimum allowed value (or with a minimum value wrapping
-            // non-positive in 32-bit arithmetic) can not be charged or recreated; they are
-            // broken eligibility entries, so drop them from the index right away
-            // and never claim them
             val params = upcomingContext.currentParameters
-            val (belowMinValue, eligible) = scanned.partition { b =>
-              val minValue = params.minValuePerByte * b.bytes.length
-              minValue <= 0 || b.value <= minValue.toLong
+            val reemissionTokenId = Option(ergoSettings.chainSettings.reemission.reemissionTokenId)
+              .filter(_.nonEmpty)
+            val tokenWhitelist = ergoSettings.nodeSettings.storageRentTokenWhitelist
+              .map(id => ModifierId @@ id).toSet
+            // An input at its own minimum can still be consumed by the rent-burn path:
+            // its smaller miner payout may clear the output dust floor. Preserve those
+            // index rows; retain the existing removal policy only when a singleton
+            // claim cannot be built under the current parameters.
+            val (unclaimableBelowMin, eligible) = scanned.partition { box =>
+              val minValue = params.minValuePerByte * box.bytes.length
+              val belowMin = minValue <= 0 || box.value <= minValue.toLong
+              belowMin && StorageRentClaimBuilder.buildClaim(
+                Seq(box), upcomingHeight, params, minerPk, reemissionTokenId, tokenWhitelist).isEmpty
             }
-            if (belowMinValue.nonEmpty) {
-              log.warn(s"Removing ${belowMinValue.length} storage-rent eligibility entries " +
-                s"for boxes at or below the minimum value: ${belowMinValue.map(b => bytesToId(b.id))}")
-              history.removeStorageRentBoxes(belowMinValue.map(b => bytesToId(b.id)))
+            if (unclaimableBelowMin.nonEmpty) {
+              log.warn(s"Removing ${unclaimableBelowMin.length} storage-rent eligibility entries " +
+                s"for boxes currently unclaimable at or below their minimum value: " +
+                s"${unclaimableBelowMin.map(box => bytesToId(box.id))}")
+              history.removeStorageRentBoxes(unclaimableBelowMin.map(box => bytesToId(box.id)))
             }
             StorageRentClaimBuilder.buildClaim(
               eligible,
               upcomingHeight,
               params,
               minerPk,
-              Option(ergoSettings.chainSettings.reemission.reemissionTokenId).filter(_.nonEmpty),
-              ergoSettings.nodeSettings.storageRentTokenWhitelist.map(id => ModifierId @@ id).toSet
+              reemissionTokenId,
+              tokenWhitelist
             ).toSeq
           } else {
             Seq.empty
