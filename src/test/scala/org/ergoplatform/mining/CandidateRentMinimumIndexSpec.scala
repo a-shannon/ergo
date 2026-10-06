@@ -110,9 +110,14 @@ class CandidateRentMinimumIndexSpec extends ErgoCorePropertyTest with TestFileUt
         override def invoke(proxy: Any, method: Method, args: Array[AnyRef]): AnyRef =
           method.getName match {
             case "bestFullBlockOpt" => Some(parentBlock)
+            case "isInSelectedFullChain" =>
+              java.lang.Boolean.valueOf(args(0) == parentBlock.id)
             case "storageRentBoxesAtOrBefore" =>
               storage.storageRentBoxesAtOrBefore(
                 args(0).asInstanceOf[Int], args(1).asInstanceOf[Int])
+            case "storageRentBoxesPage" =>
+              storage.storageRentBoxesPage(args(0).asInstanceOf[Int],
+                args(1).asInstanceOf[Int], args(2).asInstanceOf[Option[Vector[Byte]]])
             case "removeStorageRentBoxes" =>
               storage.removeStorageRentBoxes(args(0).asInstanceOf[Seq[ModifierId]])
               ().asInstanceOf[AnyRef]

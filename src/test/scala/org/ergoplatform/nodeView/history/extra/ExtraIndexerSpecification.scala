@@ -1,6 +1,7 @@
 package org.ergoplatform.nodeView.history.extra
 
 import akka.actor.{ActorRef, ActorSystem, Props}
+import akka.testkit.TestProbe
 import org.ergoplatform.ErgoAddressEncoder
 import org.ergoplatform.http.api.SortDirection
 import org.ergoplatform.modifiers.history.header.Header
@@ -11,11 +12,14 @@ import org.ergoplatform.nodeView.history.extra.IndexedErgoAddressSerializer.hash
 import org.ergoplatform.nodeView.history.extra.SegmentSerializer.{boxSegmentId, txSegmentId}
 import org.ergoplatform.nodeView.history.{ErgoHistory, ErgoHistoryReader}
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
+import org.ergoplatform.nodeView.state.UtxoState
 import org.ergoplatform.settings.ErgoSettings
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import scorex.util.{ModifierId, bytesToId}
 import spire.implicits.cfor
 
+import java.io.File
+import java.nio.file.Files
 import java.util.concurrent.locks.{Condition, ReentrantLock}
 import scala.collection.mutable
 import scala.concurrent.duration.DurationInt
@@ -28,6 +32,10 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
   val initSettings: ErgoSettings = settings
   case class CreateDB(blockCount: Int)
   case class ExtendDB(blockCount: Int)
+  case class OpenPersistentDB(path: File, blockCount: Int, previousState: Option[UtxoState])
+  case class PersistentDBOpened(state: UtxoState, history: ErgoHistory)
+  case class PersistentIndexReady(height: Int)
+  case object ClosePersistentDB
   case class Reset()
   case class GenerateBetterChainTip()
   case class SetCaughtUp(caughtUp: Boolean)
@@ -202,15 +210,15 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     * maintained by the indexer under test, so a systematic miscount of the rent rows
     * could cancel out in a comparison using them on both sides.
     */
-  def unspentBoxesFromChain(height: Int): Map[ModifierId, (Int, Long)] = {
+  def unspentBoxesFromChain(height: Int, sourceHistory: ErgoHistoryReader = history): Map[ModifierId, (Int, Long)] = {
     val created = mutable.HashMap.empty[ModifierId, (Int, Long)]
     val spent = mutable.HashSet.empty[ModifierId]
     var globalIndex = 0L
     var h = 1
     while (h <= height) {
-      history.bestHeaderIdAtHeight(h).foreach { headerId =>
-        history.typedModifierById[Header](headerId).foreach { header =>
-          history.getFullBlock(header).foreach { block =>
+      sourceHistory.bestHeaderIdAtHeight(h).foreach { headerId =>
+        sourceHistory.typedModifierById[Header](headerId).foreach { header =>
+          sourceHistory.getFullBlock(header).foreach { block =>
             block.transactions.foreach { tx =>
               tx.inputs.foreach(in => spent += bytesToId(in.boxId))
               tx.outputs.foreach { out =>
@@ -234,10 +242,10 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     * Box ids are compared against the chain-derived truth, so this catches rent rows that
     * survive a rollback for boxes that no longer exist, and rows missing for boxes that do.
     */
-  def checkRentIndexAgainstChain(height: Int): Unit = {
-    val expected = unspentBoxesFromChain(height)
+  def checkRentIndexAgainstChain(height: Int, sourceHistory: ErgoHistoryReader = history): Unit = {
+    val expected = unspentBoxesFromChain(height, sourceHistory)
     val rentEntries =
-      history.storageRentBoxesAtOrBefore(Int.MaxValue, math.max(expected.size * 4, 1000))
+      sourceHistory.storageRentBoxesAtOrBefore(Int.MaxValue, math.max(expected.size * 4, 1000))
 
     withClue(s"rent index size at height $height: ") {
       rentEntries.length shouldBe expected.size
@@ -245,7 +253,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
 
     // rent rows carry no payload, so resolve the box id through the box-number index,
     // exactly like the claim path in CandidateGenerator does
-    val resolved = rentEntries.flatMap(e => NumericBoxIndex.getBoxByNumber(history, e.globalIndex))
+    val resolved = rentEntries.flatMap(e => NumericBoxIndex.getBoxByNumber(sourceHistory, e.globalIndex))
     withClue("every rent row must resolve to a box: ") {
       resolved.length shouldBe rentEntries.length
     }
@@ -256,7 +264,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
 
     // creation height is part of the key, so it must match the box exactly
     rentEntries.foreach { e =>
-      NumericBoxIndex.getBoxByNumber(history, e.globalIndex).foreach { iEb =>
+      NumericBoxIndex.getBoxByNumber(sourceHistory, e.globalIndex).foreach { iEb =>
         e.creationHeight shouldBe iEb.box.creationHeight
         iEb.isSpent shouldBe false
       }
@@ -518,6 +526,79 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     // the extra index is fully built, but no storage-rent rows are written
     history.storageRentBoxesAtOrBefore(Int.MaxValue, 1000) shouldBe empty
     noRentIndexer ! Reset()
+  }
+
+  property("reenabling rent collection rebuilds boxes created while it was off") {
+    val dbDir = Files.createTempDirectory("rent-index-toggle").toFile
+    val probe = TestProbe()(system)
+    var chainStateOpt: Option[UtxoState] = None
+    var activeIndexerOpt: Option[ActorRef] = None
+
+    def open(rentEnabled: Boolean, blockCount: Int): ErgoHistoryReader = {
+      val actor = system.actorOf(Props.create(classOf[ExtraIndexerTestActor],
+        this, Boolean.box(rentEnabled)))
+      activeIndexerOpt = Some(actor)
+      probe.send(actor, OpenPersistentDB(dbDir, blockCount, chainStateOpt))
+      val opened = probe.expectMsgType[PersistentDBOpened](60.seconds)
+      chainStateOpt = Some(opened.state)
+      probe.send(actor, Index())
+      probe.expectMsg(30.seconds, PersistentIndexReady(blockCount))
+      IndexerState.fromHistory(opened.history).indexedHeight shouldBe blockCount
+      opened.history.getReader
+    }
+
+    def close(): Unit = activeIndexerOpt.foreach { actor =>
+      activeIndexerOpt = None
+      probe.watch(actor)
+      probe.send(actor, ClosePersistentDB)
+      try {
+        probe.expectMsg("closed")
+        probe.expectTerminated(actor, 10.seconds)
+      } catch {
+        case error: Throwable =>
+          system.stop(actor)
+          throw error
+      }
+    }
+
+    var primaryFailure: Throwable = null
+    try {
+      val firstHistory = open(rentEnabled = true, blockCount = 8)
+      ExtraIndexer.getIndex(ExtraIndexer.SchemaVersionKey, firstHistory).getInt shouldBe ExtraIndexer.NewestVersion
+      checkRentIndexAgainstChain(8, firstHistory)
+      val before = unspentBoxesFromChain(8, firstHistory).keySet
+      close()
+
+      val offHistory = open(rentEnabled = false, blockCount = 9)
+      val offVersion = ExtraIndexer.getIndex(ExtraIndexer.SchemaVersionKey, offHistory).getInt
+      val createdWhileOff = unspentBoxesFromChain(9, offHistory).keySet -- before
+      createdWhileOff should not be empty
+      close()
+
+      val finalHistory = open(rentEnabled = true, blockCount = 9)
+      ExtraIndexer.getIndex(ExtraIndexer.SchemaVersionKey, finalHistory).getInt shouldBe ExtraIndexer.NewestVersion
+      val indexedIds = finalHistory.storageRentBoxesAtOrBefore(Int.MaxValue, 1000)
+        .flatMap(e => NumericBoxIndex.getBoxByNumber(finalHistory, e.globalIndex))
+        .map(_.id).toSet
+      withClue("unspent boxes created while rent collection was off: ") {
+        indexedIds.intersect(createdWhileOff) shouldBe createdWhileOff
+      }
+      offVersion shouldBe ExtraIndexer.BaseVersion
+      checkRentIndexAgainstChain(9, finalHistory)
+    } catch {
+      case error: Throwable =>
+        primaryFailure = error
+        throw error
+    } finally {
+      val closeFailure = scala.util.Try(close()).failed.toOption
+      val stateFailure = scala.util.Try(chainStateOpt.foreach(_.closeStorage())).failed.toOption
+      val cleanupFailures = Seq(closeFailure, stateFailure).flatten
+      if (primaryFailure != null) cleanupFailures.foreach(primaryFailure.addSuppressed)
+      else cleanupFailures.headOption.foreach { error =>
+        cleanupFailures.tail.foreach(error.addSuppressed)
+        throw error
+      }
+    }
   }
 
   property("rent index is trimmed to the unspent set after a rollback") {

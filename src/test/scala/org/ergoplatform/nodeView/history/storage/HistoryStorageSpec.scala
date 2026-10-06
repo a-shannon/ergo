@@ -8,7 +8,7 @@ import org.ergoplatform.nodeView.history.extra.{ExtraIndex, IndexedErgoBox, Stor
 import org.ergoplatform.settings.{Algos, Constants}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.scalacheck.Gen
-import scorex.db.ByteArrayWrapper
+import scorex.db.{ByteArrayWrapper, LDBKVStore}
 import scorex.util.{ModifierId, bytesToId, idToBytes}
 import sigmastate.helpers.TestingHelpers.testBox
 
@@ -99,6 +99,65 @@ class HistoryStorageSpec extends ErgoCorePropertyTest {
     } finally {
       // the spec's db is shared and persisted: leave no rows behind for other runs
       db.removeExtra((rentRowIds :+ bytesToId(foreignKey)).toArray)
+    }
+  }
+
+  property("rent scan stops when the sorted keys leave the rent namespace") {
+    var scansPastNamespace = false
+    val spy = new LDBKVStore(null) {
+      override def scanFrom(first: K, limit: Int,
+                            keyFilter: K => Boolean,
+                            continueScan: K => Boolean): Array[(K, V)] = {
+        continueScan(StorageRentBox.key(10, 0L)) shouldBe true
+        val nextNamespace = Array.fill[Byte](StorageRentBox.KeyLength)(0)
+        nextNamespace(0) = (StorageRentBox.KeyMarker + 1).toByte
+        scansPastNamespace = continueScan(nextNamespace)
+        Array.empty[(K, V)]
+      }
+    }
+    val probed = new HistoryStorage(null, null, spy, settings.cacheSettings)
+    probed.storageRentBoxesAtOrBefore(20, 10) shouldBe empty
+    scansPastNamespace shouldBe false
+  }
+
+  property("rent pages bound raw key visits and resume after a deleted cursor") {
+    val heights = Seq(10, 20, 30)
+    val rentRows = heights.zipWithIndex.map { case (height, index) =>
+      val box = testBox(1000000000L, Constants.TrueTree, height)
+      val indexed = new IndexedErgoBox(height, None, None, None, box, index.toLong)
+      val row = StorageRentBox(indexed)
+      db.insertExtra(Array.empty, Array[ExtraIndex](indexed, row))
+      row
+    }
+    val foreignKeys = (0 until 250).map { index =>
+      StorageRentBox.key(15, index.toLong) ++ Array.fill(19)(0.toByte)
+    }
+    db.insertExtra(foreignKeys.map(_ -> Array[Byte](1)).toArray, Array.empty)
+
+    try {
+      val first = db.storageRentBoxesPage(30, 100, None)
+      first.rows.map(_.globalIndex).toSeq shouldBe Seq(0L)
+      first.hasMore shouldBe true
+      first.rawKeysRead should be <= 102
+      // The resume key need not remain in LevelDB between candidate generations.
+      db.removeExtra(Array(bytesToId(first.after.get.toArray)))
+      var cursor = first.after
+      var rows = first.rows.map(_.globalIndex).toSeq
+      var pages = 1
+      var more = first.hasMore
+      while (more && pages < 5) {
+        val page = db.storageRentBoxesPage(30, 100, cursor)
+        page.rawKeysRead should be <= 102
+        rows ++= page.rows.map(_.globalIndex).toSeq
+        cursor = page.after
+        more = page.hasMore
+        pages += 1
+      }
+      more shouldBe false
+      rows shouldBe Seq(0L, 1L, 2L)
+      db.storageRentBoxesAtOrBefore(30, 10).map(_.globalIndex).toSeq shouldBe rows
+    } finally {
+      db.removeExtra((rentRows.map(_.id) ++ foreignKeys.map(bytesToId)).toArray)
     }
   }
 

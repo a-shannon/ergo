@@ -1,5 +1,6 @@
 package org.ergoplatform.nodeView.history.extra
 
+import akka.actor.ActorRef
 import org.ergoplatform._
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
@@ -21,6 +22,9 @@ class ExtraIndexerTestActor(test: ExtraIndexerSpecification,
   override def receive: Receive = {
     case test.CreateDB(blockCount: Int) => createDB(blockCount)
     case test.ExtendDB(blockCount: Int) => extendDB(blockCount)
+    case test.OpenPersistentDB(path, blockCount, previousState) =>
+      openPersistentDB(path, blockCount, previousState)
+    case test.ClosePersistentDB => closePersistentDB()
     case test.Reset() => reset()
     case test.GenerateBetterChainTip() => GenerateBetterChainTip()
   }
@@ -33,6 +37,16 @@ class ExtraIndexerTestActor(test: ExtraIndexerSpecification,
 
   override def caughtUpHook(height: Int = 0): Unit = {
     if(height > 0 && height < chainHeight) return
+    if (persistentMode) {
+      persistentReadyReplyTo.foreach { case (replyTo, targetHeight) =>
+        val indexedHeight = IndexerState.fromHistory(_history).indexedHeight
+        if (indexedHeight == targetHeight) {
+          replyTo ! test.PersistentIndexReady(indexedHeight)
+          persistentReadyReplyTo = None
+        }
+      }
+      return
+    }
     test.lock.lock()
     test.done.signal()
     test.lock.unlock()
@@ -59,6 +73,8 @@ class ExtraIndexerTestActor(test: ExtraIndexerSpecification,
 
   private var dir: File = _
   private var stateOpt: Option[UtxoState] = None
+  private var persistentMode = false
+  private var persistentReadyReplyTo: Option[(ActorRef, Int)] = None
 
   def createDB(blockCount: Int): Unit = {
     if(stateOpt.isEmpty) {
@@ -85,6 +101,34 @@ class ExtraIndexerTestActor(test: ExtraIndexerSpecification,
     test.lock.lock()
     test.created.signal()
     test.lock.unlock()
+  }
+
+  /** Reopen one test chain with this actor's rent-collection setting. */
+  private def openPersistentDB(path: File, blockCount: Int, previousState: Option[UtxoState]): Unit = {
+    val replyTo = sender()
+    persistentMode = true
+    dir = path
+    dir.mkdirs()
+    val fullHistorySettings = ErgoSettings(dir.getAbsolutePath, NetworkType.TestNet,
+      test.initSettings.chainSettings,
+      nodeSettings.copy(extraIndex = true, storageRentCollection = rentIndexEnabled),
+      test.initSettings.scorexSettings, test.initSettings.walletSettings,
+      test.initSettings.cacheSettings)
+
+    _history = ErgoHistory.readOrGenerate(fullHistorySettings)(context)
+    stateOpt = previousState
+    if (blockCount > _history.fullBlockHeight) {
+      stateOpt = Some(ChainGenerator.generate(blockCount, dir, _history, stateOpt))
+    }
+    context.become(receive.orElse(loaded(IndexerState.fromHistory(_history))))
+    persistentReadyReplyTo = Some(replyTo -> blockCount)
+    replyTo ! test.PersistentDBOpened(stateOpt.get, _history)
+  }
+
+  private def closePersistentDB(): Unit = {
+    _history.closeStorage()
+    sender() ! "closed"
+    context.stop(self)
   }
 
   def reset(): Unit = {

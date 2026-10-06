@@ -9,7 +9,7 @@ import org.ergoplatform.modifiers.{BlockSection, ErgoFullBlock, NetworkObjectTyp
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils.{EmptyHistoryHeight, GenesisHeight, Height}
 import org.ergoplatform.nodeView.history.extra.{ExtraIndex, StorageRentBox}
 import org.ergoplatform.nodeView.history.storage._
-import org.ergoplatform.nodeView.history.storage.modifierprocessors.{BlockSectionProcessor, HeadersProcessor}
+import org.ergoplatform.nodeView.history.storage.modifierprocessors.{BlockSectionProcessor, FullBlockProcessor, HeadersProcessor}
 import org.ergoplatform.settings.{ErgoSettings, NipopowSettings}
 import org.ergoplatform.utils.ScorexEncoding
 import org.ergoplatform.validation.MalformedModifierError
@@ -61,6 +61,11 @@ trait ErgoHistoryReader
     */
   def bestFullBlockOpt: Option[ErgoFullBlock] =
     bestFullBlockIdOpt.flatMap(id => typedModifierById[Header](id)).flatMap(getFullBlock)
+
+  /** Membership in the selected full-block chain, independent of the best header branch. */
+  def isInSelectedFullChain(id: ModifierId): Boolean =
+    historyStorage.getIndex(FullBlockProcessor.chainStatusKey(id))
+      .exists(_.sameElements(FullBlockProcessor.BestChainMarker))
 
   /**
     * @param id - modifier id
@@ -125,9 +130,15 @@ trait ErgoHistoryReader
   def storageRentBoxesAtOrBefore(creationHeight: Int, limit: Int): Array[StorageRentBox] =
     historyStorage.storageRentBoxesAtOrBefore(creationHeight, limit)
 
+  /** Continue a raw-key-bounded storage-rent scan after the supplied key. */
+  def storageRentBoxesPage(creationHeight: Int,
+                           rawLimit: Int,
+                           after: Option[Vector[Byte]]): StorageRentScanPage =
+    historyStorage.storageRentBoxesPage(creationHeight, rawLimit, after)
+
   /**
-    * Remove storage-rent eligibility entries of the given boxes, e.g. when a miner self-claim
-    * transaction spending them failed validation during block assembly.
+    * Remove storage-rent eligibility entries of the given boxes. Candidate-local rejection
+    * must not remove rows for unspent boxes.
     */
   def removeStorageRentBoxes(boxIds: Seq[ModifierId]): Unit =
     historyStorage.removeStorageRentBoxes(boxIds)

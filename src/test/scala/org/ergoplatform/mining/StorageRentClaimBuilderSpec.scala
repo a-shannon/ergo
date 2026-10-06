@@ -5,10 +5,10 @@ import org.ergoplatform.nodeView.state.{ErgoStateContext, VotingData}
 import org.ergoplatform.settings.{Constants, ErgoValidationSettingsUpdate, Parameters, ValidationRules}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
-import org.ergoplatform.ErgoBox
+import org.ergoplatform.{ErgoBox, ErgoBoxCandidate}
 import scorex.util.{ModifierId, bytesToId}
 import sigma.Colls
-import sigma.ast.{ErgoTree, ShortConstant}
+import sigma.ast.{ByteArrayConstant, ErgoTree, ShortConstant}
 import sigma.Extensions.CollBytesOps
 import sigma.data.{Digest32Coll, ProveDlog}
 import sigmastate.helpers.TestingHelpers._
@@ -209,6 +209,32 @@ class StorageRentClaimBuilderSpec extends ErgoCorePropertyTest {
     val b = atMinValueBox(Constants.StoragePeriod)
     (b.value <= minValueOf(b)) shouldBe true // sanity: not above the minimum
     buildAndValidate(Seq(b)) shouldBe None
+    StorageRentClaimBuilder.payoutContributions(Seq(b), H, parameters,
+      minerPk, None, Set.empty) shouldBe empty
+  }
+
+  property("a recreation whose dust bump consumes its fee adds no payout") {
+    val creationHeight = 1500000
+    val currentHeight = creationHeight + Constants.StoragePeriod
+    val dustParams = Parameters(parameters.height, parameters.parametersTable
+      .updated(Parameters.StorageFeeFactorIncrease, Parameters.StorageFeeFactorMax)
+      .updated(Parameters.MinValuePerByteIncrease, Parameters.MinValueMax),
+      parameters.proposedUpdate)
+    val payloadLength = (0 to 1718).find { length =>
+      testBox(17190000L, Constants.TrueTree, creationHeight, Seq.empty,
+        Map(ErgoBox.R4 -> ByteArrayConstant(Array.fill[Byte](length)(1)))).bytes.length == 1718
+    }.get
+    val box = testBox(17190000L, Constants.TrueTree, creationHeight, Seq.empty,
+      Map(ErgoBox.R4 -> ByteArrayConstant(Array.fill[Byte](payloadLength)(1))))
+    box.bytes.length shouldBe 1718
+    box.value should be > dustParams.minValuePerByte.toLong * box.bytes.length
+    (dustParams.storageFeeFactor * box.bytes.length) shouldBe 32704
+    val recreated = new ErgoBoxCandidate(box.value, box.ergoTree, currentHeight,
+      box.additionalTokens, box.additionalRegisters)
+    recreated.toBox(bytesToId(Array.fill[Byte](32)(0)), 0).bytes.length shouldBe 1719
+    dustParams.minValuePerByte.toLong * 1719 shouldBe box.value
+    StorageRentClaimBuilder.payoutContributions(Seq(box), currentHeight,
+      dustParams, minerPk, None, Set.empty) shouldBe empty
   }
 
   property("a tokenized box at its own minimum may still have a valid rent-burn payout") {
@@ -225,6 +251,8 @@ class StorageRentClaimBuilderSpec extends ErgoCorePropertyTest {
     tx.outputCandidates should have length 1
     tx.outputCandidates.head.value shouldBe b.value
     tx.outputCandidates.head.ergoTree shouldBe MinerTree
+    StorageRentClaimBuilder.payoutContributions(Seq(b), H, parameters,
+      minerPk, None, Set.empty).map(_.box) shouldBe Seq(b)
   }
 
   property("box at or below the minimum value does not block other claims") {

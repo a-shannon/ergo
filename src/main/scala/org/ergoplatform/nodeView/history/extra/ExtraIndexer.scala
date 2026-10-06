@@ -737,10 +737,9 @@ object ExtraIndexer {
 
   /**
     * Schema version without the storage-rent eligibility index. Sufficient when
-    * `storageRentCollection` is off: the indexer keeps maintaining rent rows for new
-    * blocks regardless of the flag, so a schema-6 database is only missing historical
-    * rent rows, which do not matter until the flag is turned on (which then forces
-    * a rescan via [[requiredSchemaVersion]]).
+    * `storageRentCollection` is off. A rent-complete database is downgraded to this
+    * marker before the indexer stops maintaining rent rows, so turning the flag on
+    * later forces a rescan via [[requiredSchemaVersion]].
     */
   val BaseVersion: Int = 6
 

@@ -75,6 +75,76 @@ object StorageRentClaimBuilder extends ScorexLogging {
   private def p2pkCandidate(value: Long, minerTree: ErgoTree, currentHeight: Int): ErgoBoxCandidate =
     new ErgoBoxCandidate(value, minerTree, currentHeight, Colls.emptyColl, Map.empty)
 
+  private case class ClaimableOutput(recreated: Boolean,
+                                     output: ErgoBoxCandidate,
+                                     payout: Long)
+
+  private[mining] case class PayoutContribution(box: ErgoBox,
+                                                recreated: Boolean,
+                                                payout: Long)
+
+  private def claimableOutput(box: ErgoBox,
+                              currentHeight: Int,
+                              parameters: Parameters,
+                              minerTree: ErgoTree,
+                              reemissionTokenIdOpt: Option[ModifierId],
+                              tokenWhitelist: Set[ModifierId],
+                              outputIndex: Short): Option[ClaimableOutput] = {
+    val oldEnough = currentHeight - box.creationHeight >= Constants.StoragePeriod
+    val carriesReemissionToken = reemissionTokenIdOpt.exists(box.tokens.contains(_))
+    // Keep the same 32-bit fee and minimum-value arithmetic as the consensus claim.
+    val minValue = parameters.minValuePerByte * box.bytes.length
+    val aboveMinValue = minValue > 0 && box.value > minValue.toLong
+    if (!oldEnough || carriesReemissionToken) None
+    else {
+      val storageFee = parameters.storageFeeFactor * box.bytes.length
+      if (storageFee <= 0) None
+      else {
+        val afterFee = box.value - storageFee
+        if (afterFee > 0 && aboveMinValue) {
+          // A dust bump may consume the entire fee, producing no miner payout.
+          var recreatedBox = new ErgoBoxCandidate(afterFee, box.ergoTree,
+            currentHeight, box.additionalTokens, box.additionalRegisters)
+          var dust = dustLimit(recreatedBox, outputIndex, parameters)
+          while (recreatedBox.value < dust) {
+            recreatedBox = new ErgoBoxCandidate(dust, box.ergoTree, currentHeight,
+              box.additionalTokens, box.additionalRegisters)
+            dust = dustLimit(recreatedBox, outputIndex, parameters)
+          }
+          if (recreatedBox.value <= box.value &&
+              boxSize(recreatedBox, outputIndex) <= ErgoBox.MaxBoxSize)
+            Some(ClaimableOutput(true, recreatedBox,
+              box.value - recreatedBox.value))
+          else None
+        } else if (afterFee <= 0) {
+          // A minimum-value box can still fund its own smaller full-consume output.
+          val salvagedTokens: Coll[(ErgoBox.TokenId, Long)] =
+            if (tokenWhitelist.isEmpty) Colls.emptyColl
+            else box.additionalTokens.filter(t => tokenWhitelist.contains(t._1.toModifierId))
+          val burnOutput = new ErgoBoxCandidate(box.value, minerTree, currentHeight,
+            salvagedTokens, Map.empty)
+          if (box.value >= dustLimit(burnOutput, outputIndex, parameters))
+            Some(ClaimableOutput(false, burnOutput, box.value))
+          else None
+        } else None
+      }
+    }
+  }
+
+  /** Positive fee recreations can be carried across pages; payable burns can be offered now. */
+  private[mining] def payoutContributions(boxes: Seq[ErgoBox],
+                                          currentHeight: Int,
+                                          parameters: Parameters,
+                                          minerPk: ProveDlog,
+                                          reemissionTokenIdOpt: Option[ModifierId],
+                                          tokenWhitelist: Set[ModifierId]): Seq[PayoutContribution] = {
+    val minerTree = ErgoTree.fromSigmaBoolean(minerPk)
+    // Claim inputs are capped at 100, where the encoded output-index size is unchanged.
+    boxes.flatMap(box => claimableOutput(box, currentHeight, parameters,
+      minerTree, reemissionTokenIdOpt, tokenWhitelist, 0.toShort)
+      .filter(_.payout > 0).map(out => PayoutContribution(box, out.recreated, out.payout)))
+  }
+
   /**
     * Build a zero-fee storage-rent claim sweeping up to [[MaxClaims]] of the `eligible` boxes
     * to the miner's P2PK. Returns `None` when no box is claimable, or when the claim would
@@ -112,58 +182,10 @@ object StorageRentClaimBuilder extends ScorexLogging {
 
     eligible.iterator.takeWhile(_ => claimed.length < MaxClaims).foreach { box =>
       examined += 1
-      val age = currentHeight - box.creationHeight
-      val oldEnough = age >= Constants.StoragePeriod
-      val carriesReemissionToken = reemissionTokenIdOpt.exists(box.tokens.contains(_))
-      // A box at its own minimum can still fund a smaller P2PK output when the storage
-      // fee consumes the entire input. The minimum-value check therefore applies only
-      // to recreation, not to the full-consume branch.
-      val minValue = parameters.minValuePerByte * box.bytes.length
-      val aboveMinValue = minValue > 0 && box.value > minValue.toLong
-      if (oldEnough && !carriesReemissionToken) {
-        // storage fee in 32-bit arithmetic, exactly as the consensus interpreter computes it;
-        // a non-positive fee means the box is consensus-uncollectable and must be skipped
-        val storageFee = parameters.storageFeeFactor * box.bytes.length
-        if (storageFee > 0) {
-          val afterFee = box.value - storageFee
-          if (afterFee > 0 && aboveMinValue) {
-            // recreate branch: output preserves script/tokens/registers, sits at the current
-            // height, carries the value minus the storage fee; the miner keeps the fee
-            val outputIndex = claimed.length.toShort
-            // the recreated box may need a few nanoERG more than the after-fee value when
-            // the dust rule prices its serialization; bumping the value can lengthen the
-            // VLQ encoding of the value itself, so iterate to the fixpoint
-            var recreatedBox = new ErgoBoxCandidate(afterFee, box.ergoTree,
-              currentHeight, box.additionalTokens, box.additionalRegisters)
-            var dust = dustLimit(recreatedBox, outputIndex, parameters)
-            while (recreatedBox.value < dust) {
-              recreatedBox = new ErgoBoxCandidate(dust, box.ergoTree, currentHeight,
-                box.additionalTokens, box.additionalRegisters)
-              dust = dustLimit(recreatedBox, outputIndex, parameters)
-            }
-            if (recreatedBox.value <= box.value && boxSize(recreatedBox, outputIndex) <= ErgoBox.MaxBoxSize) {
-              sweptFees += box.value - recreatedBox.value
-              claimed += ((box, true, recreatedBox))
-            }
-          } else if (afterFee <= 0) {
-            // full-consume branch: the box can not cover its storage fee - it is destroyed
-            // and its non-whitelisted tokens are burned with it; whitelisted tokens are
-            // salvaged into the proceeds output. The box gets its own proceeds output
-            // carrying exactly its value (plus the salvaged tokens) to the miner's P2PK.
-            // A box whose value does not clear the dust floor for such an output can not
-            // be claimed at all and is left behind.
-            val salvagedTokens: Coll[(ErgoBox.TokenId, Long)] =
-              if (tokenWhitelist.isEmpty) {
-                Colls.emptyColl // nothing can be salvaged - skip filtering altogether
-              } else {
-                box.additionalTokens.filter(t => tokenWhitelist.contains(t._1.toModifierId))
-              }
-            val burnOutput = new ErgoBoxCandidate(box.value, minerTree, currentHeight, salvagedTokens, Map.empty)
-            if (box.value >= dustLimit(burnOutput, claimed.length.toShort, parameters)) {
-              claimed += ((box, false, burnOutput))
-            }
-          }
-        }
+      claimableOutput(box, currentHeight, parameters, minerTree,
+        reemissionTokenIdOpt, tokenWhitelist, claimed.length.toShort).foreach { output =>
+        if (output.recreated) sweptFees += output.payout
+        claimed += ((box, output.recreated, output.output))
       }
     }
 

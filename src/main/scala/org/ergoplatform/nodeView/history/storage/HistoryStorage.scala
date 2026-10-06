@@ -17,6 +17,12 @@ import java.io.File
 import java.nio.file.Files
 import scala.jdk.CollectionConverters.asScalaIteratorConverter
 
+/** A rent-index page bounded by raw extra-store keys, including foreign IDs. */
+case class StorageRentScanPage(rows: Array[StorageRentBox],
+                               after: Option[Vector[Byte]],
+                               hasMore: Boolean,
+                               rawKeysRead: Int)
+
 /**
   * Storage for Ergo history
   *
@@ -114,9 +120,9 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     }
 
   /**
-    * Remove storage-rent eligibility entries of the given boxes, e.g. when a miner self-claim
-    * transaction spending them failed validation during block assembly, so retrying the claim
-    * is futile. An entry whose [[IndexedErgoBox]] is not in the extra index can not be
+    * Remove storage-rent eligibility entries of the given boxes. A speculative candidate
+    * failure does not justify removing an unspent row; selected-chain spend indexing owns
+    * that transition. An entry whose [[IndexedErgoBox]] is not in the extra index can not be
     * located and is left in place.
     */
   def removeStorageRentBoxes(boxIds: Seq[ModifierId]): Unit = {
@@ -152,9 +158,45 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
       // cutoff, and end the scan when beyond it - so the tail of the namespace is never
       // walked once everything eligible is collected.
       continueScan = key =>
-        key.length < 5 || key(0) != StorageRentBox.KeyMarker ||
-          java.nio.ByteBuffer.wrap(key, 1, 4).getInt <= creationHeight
+        key.nonEmpty && key(0) == StorageRentBox.KeyMarker &&
+          (key.length < 5 ||
+            java.nio.ByteBuffer.wrap(key, 1, 4).getInt <= creationHeight)
     ).map { case (key, _) => StorageRentBox.fromKey(key) }
+  }
+
+  /**
+    * Read at most `rawLimit + 2` raw keys, including an inclusive cursor and one lookahead.
+    * The cursor is the last visited raw key, so even many foreign IDs cannot make a page
+    * unbounded. Seeking after a deleted cursor naturally resumes at its successor.
+    */
+  def storageRentBoxesPage(creationHeight: Int,
+                           rawLimit: Int,
+                           after: Option[Vector[Byte]]): StorageRentScanPage = {
+    require(rawLimit > 0 && rawLimit <= Int.MaxValue - 2)
+    val start = after.map(_.toArray).getOrElse(StorageRentBox.key(0, 0L))
+    var rawKeysRead = 0
+    val scanned = extraStore.scanFrom(start, rawLimit + 2,
+      keyFilter = _ => true,
+      continueScan = key => {
+        rawKeysRead += 1
+        key.nonEmpty && key(0) == StorageRentBox.KeyMarker &&
+          (key.length < 5 || java.lang.Integer.compareUnsigned(
+            java.nio.ByteBuffer.wrap(key, 1, 4).getInt, creationHeight) <= 0)
+      })
+    val fresh = if (scanned.headOption.exists { case (key, _) =>
+      after.exists(cursor => java.util.Arrays.equals(key, cursor.toArray))
+    }) scanned.tail else scanned
+    val visited = fresh.take(rawLimit)
+    val rows = visited.collect { case (key, _)
+        if key.length == StorageRentBox.KeyLength &&
+          key(0) == StorageRentBox.KeyMarker &&
+          java.nio.ByteBuffer.wrap(key, 1, 4).getInt <= creationHeight =>
+      StorageRentBox.fromKey(key)
+    }
+    val hasMore = fresh.length > rawLimit
+    StorageRentScanPage(rows,
+      if (hasMore) visited.lastOption.map(_._1.toVector) else None,
+      hasMore, rawKeysRead)
   }
 
   /**
