@@ -18,7 +18,7 @@ import sigmastate.helpers.TestingHelpers._
 
 import org.ergoplatform.utils.generators.ErgoCoreTransactionGenerators._
 
-/** A rejected batch claim must not erase eligibility of independent unspent boxes. */
+/** A candidate-local claim conflict must not erase independent unspent boxes or invalidate the mempool. */
 class CandidateRentRejectIndexSpec extends ErgoCorePropertyTest with TestFileUtils {
   import org.ergoplatform.utils.ErgoCoreTestConstants._
   import org.ergoplatform.utils.ErgoNodeTestConstants.{settings => baseSettings}
@@ -62,6 +62,12 @@ class CandidateRentRejectIndexSpec extends ErgoCorePropertyTest with TestFileUti
             case "bestFullBlockOpt" => Some(parentBlock)
             case "storageRentBoxesUntil" =>
               storage.storageRentBoxesUntil(args(0).asInstanceOf[Int], args(1).asInstanceOf[Int])
+            case "storageRentBoxesAfter" =>
+              storage.storageRentBoxesAfter(args(0).asInstanceOf[Int],
+                args(1).asInstanceOf[Int], args(2).asInstanceOf[Option[(Int, Long)]])
+            case "storageRentBoxesPage" =>
+              storage.storageRentBoxesPage(args(0).asInstanceOf[Int],
+                args(1).asInstanceOf[Int], args(2).asInstanceOf[Option[Vector[Byte]]])
             case "removeStorageRentBoxes" =>
               storage.removeStorageRentBoxes(args(0).asInstanceOf[Seq[ModifierId]])
               ().asInstanceOf[AnyRef]
@@ -90,7 +96,8 @@ class CandidateRentRejectIndexSpec extends ErgoCorePropertyTest with TestFileUti
       val (candidate, rejected) = result.get.get
       candidate.candidateBlock.transactions.map(_.id) should contain(ownerSpend.id)
       candidate.candidateBlock.transactions.map(_.id) should not contain batch.id
-      rejected.ids should contain(batch.id)
+      // The claim is speculative candidate work, not a mempool transaction to evict.
+      rejected.ids should not contain batch.id
 
       // A was spent only in this candidate; B was never spent at all. It must remain
       // available for the next candidate even when the combined claim was rejected.

@@ -1,15 +1,18 @@
 package org.ergoplatform.mining
 
-import org.ergoplatform.ErgoTreePredef
+import java.nio.file.Files
+
+import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, ErgoTreePredef, Input}
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils._
-import org.ergoplatform.nodeView.state.ErgoStateContext
-import org.ergoplatform.settings.MonetarySettings
+import org.ergoplatform.nodeView.state.{BoxHolder, ErgoStateContext, UtxoState, VotingData}
+import org.ergoplatform.settings.{Constants, MonetarySettings}
 import org.ergoplatform.utils.{BoxUtils, ErgoCorePropertyTest, RandomWrapper}
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
 import org.scalacheck.Gen
 import scorex.util.{ModifierId, bytesToId}
 import sigma.data.ProveDlog
+import sigmastate.helpers.TestingHelpers._
 
 import scala.concurrent.duration._
 
@@ -17,6 +20,7 @@ class CandidateGeneratorPropSpec extends ErgoCorePropertyTest {
   import org.ergoplatform.utils.ErgoNodeTestConstants._
   import org.ergoplatform.utils.ErgoCoreTestConstants._
   import org.ergoplatform.utils.generators.ErgoCoreGenerators._
+  import org.ergoplatform.utils.generators.ErgoCoreTransactionGenerators._
   import org.ergoplatform.utils.generators.ErgoNodeTransactionGenerators._
   import org.ergoplatform.utils.generators.ValidBlocksGenerators._
 
@@ -379,6 +383,54 @@ class CandidateGeneratorPropSpec extends ErgoCorePropertyTest {
 
     invalid shouldBe empty
     collected should contain theSameElementsAs zeroFeeTxs
+  }
+
+  property("an oversized rent claim does not hide a smaller fee-paying transaction") {
+    val height = 3 * Constants.StoragePeriod
+    val rentBoxes = (0 until StorageRentClaimBuilder.MaxClaims).map { index =>
+      testBox(10000000000L + index, Constants.TrueTree,
+        height - Constants.StoragePeriod - index, Seq.empty, Map.empty)
+    }
+    val poolBox = testBox(10000000000L, Constants.TrueTree, height - 2,
+      Seq.empty, Map.empty)
+    val stateDir = Files.createTempDirectory("rent-overflow-candidate-")
+    val fixtureSettings = settings.copy(directory = stateDir.toString)
+    val baseState = UtxoState.fromBoxHolder(BoxHolder(rentBoxes :+ poolBox), None,
+      stateDir.toFile, fixtureSettings, parameters)
+    val parentHeader = invalidErgoFullBlockGen.sample.get.header.copy(height = height - 1)
+    val agedContext = new ErgoStateContext(Seq(parentHeader), None,
+      genesisStateDigest, parameters, validationSettingsNoIl, VotingData.empty)(fixtureSettings.chainSettings)
+    val state = new UtxoState(baseState.persistentProver, baseState.version,
+      baseState.store, fixtureSettings) {
+      override def stateContext: ErgoStateContext = agedContext
+      override def emissionBoxOpt: Option[ErgoBox] = None
+    }
+
+    try {
+      val upcoming = state.stateContext.upcoming(defaultMinerPk.value,
+        parentHeader.timestamp + 1, parentHeader.nBits, Array.emptyByteArray,
+        emptyVSUpdate, parentHeader.version)
+      val rentClaim = StorageRentClaimBuilder.buildClaim(rentBoxes, height, parameters,
+        defaultMinerPk, None, Set.empty[ModifierId]).get
+      val poolTx = ErgoTransaction(
+        IndexedSeq(Input(poolBox.id, emptyProverResult)), IndexedSeq.empty,
+        IndexedSeq(new ErgoBoxCandidate(poolBox.value,
+          fixtureSettings.chainSettings.monetary.feeProposition, height)))
+      val rentCost = state.validateWithCost(rentClaim, upcoming,
+        parameters.maxBlockCost, None).get
+      val budget = rentCost
+
+      val (poolOnly, _) = CandidateGenerator.collectTxs(defaultMinerPk, budget,
+        parameters.maxBlockSize, state, upcoming, Seq(poolTx))
+      poolOnly.map(_.id) should contain(poolTx.id)
+      poolOnly.size shouldBe 2 // fee collection remains valid under this budget
+
+      val (withRentFirst, _) = CandidateGenerator.collectTxs(defaultMinerPk, budget,
+        parameters.maxBlockSize, state, upcoming, Seq(rentClaim, poolTx), Set(rentClaim.id))
+      withRentFirst.map(_.id) should contain(poolTx.id)
+    } finally {
+      state.closeStorage()
+    }
   }
 
   property("excludeAppliedTxs filters transactions of the applied best block only") {

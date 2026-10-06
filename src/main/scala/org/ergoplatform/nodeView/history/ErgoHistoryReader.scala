@@ -9,7 +9,7 @@ import org.ergoplatform.modifiers.{BlockSection, ErgoFullBlock, NetworkObjectTyp
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils.{EmptyHistoryHeight, GenesisHeight, Height}
 import org.ergoplatform.nodeView.history.extra.{ExtraIndex, StorageRentBox}
 import org.ergoplatform.nodeView.history.storage._
-import org.ergoplatform.nodeView.history.storage.modifierprocessors.{BlockSectionProcessor, HeadersProcessor}
+import org.ergoplatform.nodeView.history.storage.modifierprocessors.{BlockSectionProcessor, FullBlockProcessor, HeadersProcessor}
 import org.ergoplatform.settings.{ErgoSettings, NipopowSettings}
 import org.ergoplatform.utils.ScorexEncoding
 import org.ergoplatform.validation.MalformedModifierError
@@ -61,6 +61,11 @@ trait ErgoHistoryReader
     */
   def bestFullBlockOpt: Option[ErgoFullBlock] =
     bestFullBlockIdOpt.flatMap(id => typedModifierById[Header](id)).flatMap(getFullBlock)
+
+  /** Membership in the selected full-block chain, independent of the best header branch. */
+  def isInSelectedFullChain(id: ModifierId): Boolean =
+    historyStorage.getIndex(FullBlockProcessor.chainStatusKey(id))
+      .exists(_.sameElements(FullBlockProcessor.BestChainMarker))
 
   /**
     * @param id - modifier id
@@ -124,6 +129,18 @@ trait ErgoHistoryReader
     */
   def storageRentBoxesUntil(creationHeight: Int, limit: Int): Array[StorageRentBox] =
     historyStorage.storageRentBoxesUntil(creationHeight, limit)
+
+  /** Continue a rent-row-limited scan strictly after a previous row's index key. */
+  def storageRentBoxesAfter(creationHeight: Int,
+                            limit: Int,
+                            after: Option[(Int, Long)]): Array[StorageRentBox] =
+    historyStorage.storageRentBoxesAfter(creationHeight, limit, after)
+
+  /** A page bounded by raw extra-store keys, including interleaved non-rent IDs. */
+  def storageRentBoxesPage(creationHeight: Int,
+                           rawLimit: Int,
+                           after: Option[Vector[Byte]]): StorageRentScanPage =
+    historyStorage.storageRentBoxesPage(creationHeight, rawLimit, after)
 
   /** Remove storage-rent eligibility entries; never call for a speculative candidate. */
   def removeStorageRentBoxes(boxIds: Seq[ModifierId]): Unit =

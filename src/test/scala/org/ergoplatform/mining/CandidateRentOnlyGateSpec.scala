@@ -66,6 +66,14 @@ class CandidateRentOnlyGateSpec extends ErgoCorePropertyTest with TestFileUtils 
             case "storageRentBoxesUntil" =>
               if (failIndexRead) throw new IllegalStateException("synthetic rent index failure")
               storage.storageRentBoxesUntil(args(0).asInstanceOf[Int], args(1).asInstanceOf[Int])
+            case "storageRentBoxesAfter" =>
+              if (failIndexRead) throw new IllegalStateException("synthetic rent index failure")
+              storage.storageRentBoxesAfter(args(0).asInstanceOf[Int],
+                args(1).asInstanceOf[Int], args(2).asInstanceOf[Option[(Int, Long)]])
+            case "storageRentBoxesPage" =>
+              if (failIndexRead) throw new IllegalStateException("synthetic rent index failure")
+              storage.storageRentBoxesPage(args(0).asInstanceOf[Int],
+                args(1).asInstanceOf[Int], args(2).asInstanceOf[Option[Vector[Byte]]])
             case "typedModifierById" =>
               enteredAssembly = true
               if (stopAtAssembly) throw new UnsupportedOperationException("candidate assembly reached")

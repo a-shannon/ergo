@@ -98,7 +98,9 @@ class CandidateGenerator(
         error
       )
       context.become(
-        initialized(state.copy(cachedCandidate = None, cachedPreviousCandidate = None, solvedBlock = None))
+        initialized(state.copy(cachedCandidate = None, cachedPreviousCandidate = None,
+          solvedBlock = None, rentScanRefreshPending = None,
+          rentScanDeferredCandidate = None))
       )
     }
   }
@@ -145,9 +147,9 @@ class CandidateGenerator(
 
   private def initialized(state: CandidateGeneratorState): Receive = {
     case ChangedHistory(h: ErgoHistoryReader) =>
-      context.become(initialized(state.copy(hr = h)))
+      context.become(initialized(state.copy(hr = h, rentScanDeferredCandidate = None)))
     case ChangedState(s: UtxoStateReader) =>
-      context.become(initialized(state.copy(sr = s)))
+      context.become(initialized(state.copy(sr = s, rentScanDeferredCandidate = None)))
     case ChangedMempool(mp: ErgoMemPoolReader) =>
       if (hasCandidateExpired(
         state.cachedCandidate,
@@ -157,10 +159,10 @@ class CandidateGenerator(
         log.debug(s"Regenerating candidate block")
         // with forced = true, state.cachedCandidate will be ignored in GenerateCandidate processing,
         // but state.previousCachedCandidate will be set to cachedCandidate
-        context.become(initialized(state.copy(mpr = mp)))
+        context.become(initialized(state.copy(mpr = mp, rentScanDeferredCandidate = None)))
         self ! GenerateCandidate(txsToInclude = Seq.empty, reply = false, forced = true)
       } else {
-        context.become(initialized(state.copy(mpr = mp)))
+        context.become(initialized(state.copy(mpr = mp, rentScanDeferredCandidate = None)))
       }
     case _: NodeViewChange =>
     // Just ignore all other NodeView Changes
@@ -178,9 +180,13 @@ class CandidateGenerator(
         state.copy(lastAppliedBlockTxs = Some(header.id -> applied.txIds.toSet))
       if (needNewCandidate(state.cachedCandidate, header)) {
         if (needNewSolution(state.solvedBlock, header.id))
-          context.become(initialized(stateWithAppliedTxs.copy(cachedCandidate = None, cachedPreviousCandidate = None, solvedBlock = None)))
+          context.become(initialized(stateWithAppliedTxs.copy(cachedCandidate = None,
+            cachedPreviousCandidate = None, solvedBlock = None, rentScanRefreshPending = None,
+            rentScanDeferredCandidate = None)))
         else
-          context.become(initialized(stateWithAppliedTxs.copy(cachedCandidate = None, cachedPreviousCandidate = None)))
+          context.become(initialized(stateWithAppliedTxs.copy(cachedCandidate = None,
+            cachedPreviousCandidate = None, rentScanRefreshPending = None,
+            rentScanDeferredCandidate = None)))
         self ! GenerateCandidate(txsToInclude = Seq.empty, reply = false, forced = false)
       } else {
         context.become(initialized(stateWithAppliedTxs))
@@ -197,43 +203,141 @@ class CandidateGenerator(
     case SyntacticallyFailedModification(_, modId, error) =>
       onSolvedBlockFailed(state, modId, error)
 
-    case gen @ GenerateCandidate(txsToInclude, reply, forced, optPk) =>
+    case ContinueRentScan(pk, expected) =>
+      if (state.rentScanContinuationFor(pk, minerPk).contains(expected)) {
+        val next = state.withoutRentScanContinuationFor(pk, minerPk)
+        context.become(initialized(next))
+        if (next.hasRentScanFor(pk, minerPk) && next.rentScanFor(pk, minerPk) == expected) {
+          self ! GenerateRentScan(pk, expected)
+        }
+      }
+
+    case GenerateRentScan(pk, expected)
+        if !state.hasRentScanFor(pk, minerPk) || state.rentScanFor(pk, minerPk) != expected =>
+      // A normal candidate request may have advanced the cursor while this tick was queued.
+      ()
+
+    case request if request.isInstanceOf[GenerateRentScan] ||
+        request.isInstanceOf[GenerateCandidate] =>
+      val rentScanOnly = request.isInstanceOf[GenerateRentScan]
+      val gen: GenerateCandidate = if (rentScanOnly)
+        GenerateCandidate(Seq.empty, reply = false, forced = true,
+          optPk = Some(request.asInstanceOf[GenerateRentScan].pk))
+        else request.asInstanceOf[GenerateCandidate]
+      val txsToInclude = gen.txsToInclude
+      val reply = gen.reply
+      val forced = gen.forced
+      val optPk = gen.optPk
       val senderOpt = if (reply) Some(sender()) else None
       val effectiveMinerPk = optPk.getOrElse(minerPk)
-      if (!forced && cachedFor(state.cachedCandidate, txsToInclude, effectiveMinerPk)) {
+      val selectedRentScan = state.rentScanFor(effectiveMinerPk, minerPk)
+      val rentCacheOwnerMatches = cachedFor(state.cachedCandidate, Seq.empty, effectiveMinerPk)
+      if (!forced && (!reply || !state.rentScanRefreshPending.contains(effectiveMinerPk)) &&
+          cachedFor(state.cachedCandidate, txsToInclude, effectiveMinerPk)) {
         senderOpt.foreach(_ ! StatusReply.success(state.cachedCandidate.get))
+      } else if (reply && !forced && state.rentScanRefreshPending.contains(effectiveMinerPk) &&
+          cachedFor(state.rentScanDeferredCandidate, txsToInclude, effectiveMinerPk)) {
+        // A scan produced this candidate while earlier work was issued. Publish it only
+        // on the miner's next request, retaining the earlier work as the previous candidate.
+        val candidate = state.rentScanDeferredCandidate.get
+        context.become(initialized(state.copy(cachedCandidate = Some(candidate),
+          cachedPreviousCandidate = state.cachedCandidate,
+          rentScanRefreshPending = None, rentScanDeferredCandidate = None)))
+        senderOpt.foreach(_ ! StatusReply.success(candidate))
       } else {
         val start = System.currentTimeMillis()
-        CandidateGenerator.generateCandidate(
+        val (candidateAttempt, rentProgress) = CandidateGenerator.generateCandidateWithRentScan(
           state.hr,
           state.sr,
           state.mpr,
           effectiveMinerPk,
           txsToInclude,
           state.lastAppliedBlockTxs,
-          ergoSettings
-        ) match {
+          ergoSettings,
+          selectedRentScan,
+          rentScanOnly,
+          rentCacheOwnerMatches
+        )
+        def withRentContinuation(next: CandidateGeneratorState): CandidateGeneratorState = {
+          val nextScan = next.rentScanFor(effectiveMinerPk, minerPk)
+          if (rentProgress.more && next.hasRentScanFor(effectiveMinerPk, minerPk) &&
+              !next.rentScanContinuationFor(effectiveMinerPk, minerPk).contains(nextScan)) {
+            val delay = if (rentProgress.wrapped) RentScanWrapPause else RentScanTick
+            context.system.scheduler.scheduleOnce(delay, self,
+              ContinueRentScan(effectiveMinerPk, nextScan))(context.dispatcher)
+            next.withRentScanContinuationFor(effectiveMinerPk, minerPk, nextScan)
+          } else {
+            next
+          }
+        }
+        val rentCacheInvalidated = rentScanOnly && rentCacheOwnerMatches &&
+          (rentProgress.state.pendingClaims != selectedRentScan.pendingClaims ||
+            rentProgress.state.policy != selectedRentScan.policy ||
+            rentProgress.state.tip != selectedRentScan.tip)
+        val rentContextChanged = rentScanOnly && rentCacheOwnerMatches &&
+          (rentProgress.state.policy != selectedRentScan.policy ||
+            rentProgress.state.tip != selectedRentScan.tip)
+        // The solution wire format has no work id. Keep issued work in the cache while
+        // background rent scans advance; let the next candidate request publish the refresh.
+        val preserveIssuedCandidate = rentScanOnly && state.cachedCandidate.nonEmpty &&
+          !rentContextChanged
+        val markRentRefresh = preserveIssuedCandidate && state.solvedBlock.isEmpty &&
+          rentCacheOwnerMatches &&
+          (rentCacheInvalidated || candidateAttempt.nonEmpty)
+        def withRentProgress(next: CandidateGeneratorState): CandidateGeneratorState = {
+          val updated = next.withRentScanFor(effectiveMinerPk, minerPk, rentProgress.state)
+          if (markRentRefresh) updated.copy(rentScanRefreshPending = Some(effectiveMinerPk))
+          else updated
+        }
+        candidateAttempt match {
           case Some(Failure(ex)) =>
             log.error(s"Candidate generation failed", ex)
+            context.become(initialized(withRentContinuation(
+              withRentProgress(state).copy(
+                cachedCandidate = if (rentContextChanged) None else state.cachedCandidate,
+                cachedPreviousCandidate = if (rentContextChanged) None else state.cachedPreviousCandidate,
+                rentScanRefreshPending = if (rentContextChanged) None
+                  else if (markRentRefresh) Some(effectiveMinerPk) else state.rentScanRefreshPending,
+                rentScanDeferredCandidate = None))))
             senderOpt.foreach(
               _ ! StatusReply.error(s"Candidate generation failed : ${ex.getMessage}")
             )
           case Some(Success((candidate, eliminatedTxs))) =>
-            if (eliminatedTxs.ids.nonEmpty) {
+            // An autonomous rent scan can stage an unpublished claim against a valid
+            // mempool transaction. Do not evict that transaction for speculative work.
+            if (!rentScanOnly && eliminatedTxs.ids.nonEmpty) {
               viewHolderRef ! eliminatedTxs
             }
             val generationTook = System.currentTimeMillis() - start
-            log.info(s"Generated new candidate in $generationTook ms")
-            context.become(
-              initialized(
-                state.copy(cachedCandidate = Some(candidate), cachedPreviousCandidate = state.cachedCandidate, avgGenTime = generationTook.millis)
-              )
-            )
+            if (preserveIssuedCandidate) {
+              log.debug(s"Rent scan updated in $generationTook ms; keeping issued candidate")
+              context.become(initialized(withRentContinuation(withRentProgress(state).copy(
+                rentScanDeferredCandidate = if (markRentRefresh) Some(candidate)
+                  else state.rentScanDeferredCandidate))))
+            } else {
+              log.info(s"Generated new candidate in $generationTook ms")
+              context.become(initialized(withRentContinuation(withRentProgress(state).copy(
+                cachedCandidate = Some(candidate),
+                cachedPreviousCandidate = if (rentContextChanged) None else state.cachedCandidate,
+                rentScanRefreshPending = None,
+                rentScanDeferredCandidate = None,
+                avgGenTime = generationTook.millis))))
+            }
             senderOpt.foreach(_ ! StatusReply.success(candidate))
           case None =>
-            log.warn(
-              "Can not generate block candidate: either mempool is empty or chain is not synced (maybe last block not fully applied yet"
-            )
+            val next = withRentProgress(state).copy(
+              cachedCandidate = if (rentContextChanged) None else state.cachedCandidate,
+              cachedPreviousCandidate = if (rentContextChanged) None else state.cachedPreviousCandidate,
+              rentScanRefreshPending = if (rentContextChanged) None
+                else if (markRentRefresh) Some(effectiveMinerPk) else state.rentScanRefreshPending,
+              rentScanDeferredCandidate = if (rentScanOnly && !rentCacheInvalidated &&
+                  !rentContextChanged) state.rentScanDeferredCandidate else None)
+            context.become(initialized(if (reply) next else withRentContinuation(next)))
+            if (!rentScanOnly) {
+              log.warn(
+                "Can not generate block candidate: either mempool is empty or chain is not synced (maybe last block not fully applied yet"
+              )
+            }
             senderOpt.foreach { s =>
               context.system.scheduler.scheduleOnce(state.avgGenTime, self, gen)(
                 context.system.dispatcher,
@@ -264,11 +368,14 @@ class CandidateGenerator(
         ergoSettings.chainSettings.powScheme.validate(newBlock.header) match {
           case Success(_) =>
             sendToNodeView(newBlock)
-            context.become(initialized(state.copy(solvedBlock = Some(newBlock))))
+            context.become(initialized(state.copy(solvedBlock = Some(newBlock),
+              rentScanRefreshPending = None, rentScanDeferredCandidate = None)))
             StatusReply.success(())
           case Failure(exception) =>
             log.warn(s"Removing candidates due to invalid block", exception)
-            context.become(initialized(state.copy(cachedCandidate = None, cachedPreviousCandidate = None)))
+            context.become(initialized(state.copy(cachedCandidate = None,
+              cachedPreviousCandidate = None, rentScanRefreshPending = None,
+              rentScanDeferredCandidate = None)))
             StatusReply.error(
               new Exception(s"Invalid block mined: ${exception.getMessage}", exception)
             )
@@ -312,6 +419,43 @@ object CandidateGenerator extends ScorexLogging {
     optPk: Option[ProveDlog] = None
   )
 
+  private[mining] case class ContinueRentScan(pk: ProveDlog, expected: RentScanState)
+  private case class GenerateRentScan(pk: ProveDlog, expected: RentScanState)
+
+  private[mining] case class RentScanPolicy(parameters: Map[Byte, Int],
+                                          blockVersion: Byte,
+                                          minerPk: ProveDlog,
+                                          reemissionToken: Option[ModifierId],
+                                          tokenWhitelist: Set[ModifierId])
+
+  private[mining] case class RentScanState(after: Option[Vector[Byte]] = None,
+                                         ceiling: Option[Int] = None,
+                                         tip: Option[(Int, ModifierId)] = None,
+                                         policy: Option[RentScanPolicy] = None,
+                                         pendingClaims: Seq[Seq[ModifierId]] = Seq.empty)
+
+  private[mining] case class RentScanProgress(state: RentScanState,
+                                            more: Boolean = false,
+                                            wrapped: Boolean = false)
+
+  private val RentRawKeysPerPage = StorageRentClaimBuilder.MaxClaims
+  private val RentPagesPerAttempt = 2
+  private val MaxPendingRentClaims = 4
+  private val MaxAlternateRentScans = 4
+  private val RentScanTick = 500.millis
+  private val RentScanWrapPause = 5.seconds
+
+  /** The best header branch may differ from the selected full-block branch. */
+  private[mining] def continuesSelectedFullChain(history: ErgoHistoryReader,
+                                                 previous: Option[(Int, ModifierId)],
+                                                 current: Option[(Int, ModifierId)]): Boolean =
+    previous.exists { case (height, id) =>
+      current.exists { case (currentHeight, currentId) =>
+        currentHeight >= height &&
+          (currentId == id || history.isInSelectedFullChain(id))
+      }
+    }
+
   /** Local state of candidate generator to avoid mutable vars */
   case class CandidateGeneratorState(
     cachedCandidate: Option[Candidate],
@@ -321,8 +465,52 @@ object CandidateGenerator extends ScorexLogging {
     sr: UtxoStateReader,
     mpr: ErgoMemPoolReader,
     avgGenTime: FiniteDuration, // approximation of average block generation time for more efficient retries
-    lastAppliedBlockTxs: Option[(ModifierId, Set[ModifierId])] // header id and tx ids of the last applied block
-  )
+    lastAppliedBlockTxs: Option[(ModifierId, Set[ModifierId])], // header id and tx ids of the last applied block
+    rentScan: RentScanState = RentScanState(),
+    rentScanContinuationPending: Option[RentScanState] = None,
+    alternateRentScans: Vector[(ProveDlog, RentScanState)] = Vector.empty,
+    alternateRentScanContinuationPending: Vector[(ProveDlog, RentScanState)] = Vector.empty,
+    rentScanRefreshPending: Option[ProveDlog] = None,
+    rentScanDeferredCandidate: Option[Candidate] = None
+  ) {
+    private[mining] def hasRentScanFor(pk: ProveDlog, defaultPk: ProveDlog): Boolean =
+      pk == defaultPk || alternateRentScans.exists(_._1 == pk)
+
+    private[mining] def rentScanFor(pk: ProveDlog, defaultPk: ProveDlog): RentScanState =
+      if (pk == defaultPk) rentScan
+      else alternateRentScans.find(_._1 == pk).map(_._2).getOrElse(RentScanState())
+
+    private[mining] def rentScanContinuationFor(pk: ProveDlog,
+                                                defaultPk: ProveDlog): Option[RentScanState] =
+      if (pk == defaultPk) rentScanContinuationPending
+      else alternateRentScanContinuationPending.find(_._1 == pk).map(_._2)
+
+    private[mining] def withRentScanContinuationFor(pk: ProveDlog,
+                                                    defaultPk: ProveDlog,
+                                                    scan: RentScanState): CandidateGeneratorState =
+      if (pk == defaultPk) copy(rentScanContinuationPending = Some(scan))
+      else copy(alternateRentScanContinuationPending =
+        (alternateRentScanContinuationPending.filterNot(_._1 == pk) :+ (pk -> scan))
+          .takeRight(MaxAlternateRentScans))
+
+    private[mining] def withoutRentScanContinuationFor(pk: ProveDlog,
+                                                       defaultPk: ProveDlog): CandidateGeneratorState =
+      if (pk == defaultPk) copy(rentScanContinuationPending = None)
+      else copy(alternateRentScanContinuationPending =
+        alternateRentScanContinuationPending.filterNot(_._1 == pk))
+
+    private[mining] def withRentScanFor(pk: ProveDlog,
+                        defaultPk: ProveDlog,
+                        scan: RentScanState): CandidateGeneratorState =
+      if (pk == defaultPk) copy(rentScan = scan)
+      else {
+        val scans = (alternateRentScans.filterNot(_._1 == pk) :+ (pk -> scan))
+          .takeRight(MaxAlternateRentScans)
+        copy(alternateRentScans = scans,
+          alternateRentScanContinuationPending = alternateRentScanContinuationPending
+            .filter { case (key, _) => scans.exists(_._1 == key) })
+      }
+  }
 
   def apply(
     minerPk: ProveDlog,
@@ -487,7 +675,24 @@ object CandidateGenerator extends ScorexLogging {
     txsToInclude: Seq[ErgoTransaction],
     lastAppliedBlockTxs: Option[(ModifierId, Set[ModifierId])],
     ergoSettings: ErgoSettings
-  ): Option[Try[(Candidate, EliminateTransactions)]] = {
+  ): Option[Try[(Candidate, EliminateTransactions)]] =
+    generateCandidateWithRentScan(h, s, m, pk, txsToInclude,
+      lastAppliedBlockTxs, ergoSettings, RentScanState())._1
+
+  private[mining] def generateCandidateWithRentScan(
+    h: ErgoHistoryReader,
+    s: UtxoStateReader,
+    m: ErgoMemPoolReader,
+    pk: ProveDlog,
+    txsToInclude: Seq[ErgoTransaction],
+    lastAppliedBlockTxs: Option[(ModifierId, Set[ModifierId])],
+    ergoSettings: ErgoSettings,
+    rentScan: RentScanState,
+    rentScanOnly: Boolean = false,
+    rentCacheOwnerMatches: Boolean = true
+  ): (Option[Try[(Candidate, EliminateTransactions)]], RentScanProgress) = {
+    var rentProgress = RentScanProgress(rentScan)
+    def unchanged: RentScanProgress = RentScanProgress(rentScan)
     // mandatory transactions to include into next block taken from the previous candidate
     val stateWithMandatoryTxs = s.withTransactions(txsToInclude)
     lazy val unspentTxsToInclude = txsToInclude.filter { tx =>
@@ -510,21 +715,26 @@ object CandidateGenerator extends ScorexLogging {
     def hasAnyMemPoolOrMinerTx =
       poolTransactions.nonEmpty || unspentTxsToInclude.nonEmpty || emissionTxOpt.nonEmpty
 
-    // Avoid the full assembly work when no indexed rent box could be claimed.
+    // A bounded probe can skip assembly only when the rent prefix is exhausted.
+    // A foreign key may precede the first rent row, so its presence keeps the
+    // resumable scan alive even if this first raw page has no rent row.
     def hasIndexedRentBox = {
       val threshold = stateContext.currentHeight + 1 - Constants.StoragePeriod
       ergoSettings.nodeSettings.storageRentCollection && threshold > 0 &&
-        Try(h.storageRentBoxesUntil(threshold, 1).nonEmpty).getOrElse(true)
+        Try {
+          val page = h.storageRentBoxesPage(threshold, 1, None)
+          page.rows.nonEmpty || page.hasMore
+        }.getOrElse(true)
     }
 
     if (!hasAnyMemPoolOrMinerTx && !hasIndexedRentBox) {
       log.info("Avoiding generation of a block without any transactions")
-      None
+      (None, unchanged)
     } else if (!chainSynced) {
       log.info(
         "Chain not synced probably due to racing condition when last block is not fully applied yet"
       )
-      None
+      (None, unchanged)
     } else {
       val desiredUpdate = if (stateContext.blockVersion == 3) {
         ergoSettings.votingTargets.desiredUpdate.copy(statusUpdates =
@@ -543,20 +753,26 @@ object CandidateGenerator extends ScorexLogging {
         poolTransactions,
         emissionTxOpt,
         unspentTxsToInclude,
-        ergoSettings
+        ergoSettings,
+        rentScan,
+        progress => rentProgress = progress,
+        rentScanOnly,
+        rentCacheOwnerMatches
       )
       if (!chainSynced) {
         log.debug(
           "Discarding block candidate as a new block was applied during its assembly, " +
           "a new candidate will be generated on FullBlockApplied"
         )
-        None
+        (None, unchanged)
       } else {
         candidateAttempt match {
           case Failure(_: NoCandidateTransactions) =>
-            log.info("Avoiding generation of a block without any transactions")
-            None
-          case _ => Some(candidateAttempt)
+            if (!rentScanOnly)
+              log.info("Avoiding generation of a block without any transactions")
+            (None, rentProgress)
+          case Failure(_) => (Some(candidateAttempt), rentProgress)
+          case _ => (Some(candidateAttempt), rentProgress)
         }
       }
     }
@@ -633,7 +849,11 @@ object CandidateGenerator extends ScorexLogging {
                        poolTxs: Seq[UnconfirmedTransaction],
                        emissionTxOpt: Option[ErgoTransaction],
                        prioritizedTransactions: Seq[ErgoTransaction],
-                       ergoSettings: ErgoSettings
+                        ergoSettings: ErgoSettings,
+                        rentScan: RentScanState,
+                        onRentScan: RentScanProgress => Unit,
+                        rentScanOnly: Boolean,
+                        rentCacheOwnerMatches: Boolean
   ): Try[(Candidate, EliminateTransactions)] =
     Try {
       val popowAlgos = new NipopowAlgos(ergoSettings.chainSettings)
@@ -710,39 +930,90 @@ object CandidateGenerator extends ScorexLogging {
 
       // storage-rent self-claim: sweep rent-eligible boxes directly into the candidate,
       // bypassing the mempool (goes into the block right after the prioritized transactions)
+      var rentProgress = RentScanProgress(rentScan)
+      var scanFoundNewClaim = false
       val rentClaimTxs: Seq[ErgoTransaction] =
         if (ergoSettings.nodeSettings.storageRentCollection) {
           val upcomingHeight = upcomingContext.currentHeight
           val threshold = upcomingHeight - Constants.StoragePeriod
           if (threshold > 0) {
-            val scanned = history.storageRentBoxesUntil(threshold, StorageRentClaimBuilder.MaxClaims)
-              .toSeq
-              .flatMap(entry => state.boxById(ADKey @@ idToBytes(entry.boxId)))
             val params = upcomingContext.currentParameters
             val reemissionTokenId = Option(ergoSettings.chainSettings.reemission.reemissionTokenId)
               .filter(_.nonEmpty)
             val tokenWhitelist = ergoSettings.nodeSettings.storageRentTokenWhitelist
               .toSet
-            // Claimability depends on current parameters and miner policy. The extra indexer
-            // owns persistent row removal after a spend on the selected chain; the builder
-            // skips boxes it cannot claim in this candidate without deleting their rows.
-            StorageRentClaimBuilder.buildClaim(
-              scanned,
-              upcomingHeight,
-              params,
-              minerPk,
-              reemissionTokenId,
-              tokenWhitelist
-            ).toSeq
+            val policy = RentScanPolicy(params.parametersTable, version, minerPk,
+              reemissionTokenId, tokenWhitelist)
+            val tip = bestHeaderOpt.map(h => h.height -> h.id)
+            val sameSelectedChain = continuesSelectedFullChain(history, rentScan.tip, tip)
+            val continueSweep = rentScan.policy.contains(policy) && sameSelectedChain
+            val ceiling = if (continueSweep) rentScan.ceiling.getOrElse(threshold)
+              else threshold
+            var after = if (continueSweep)
+              rentScan.after else None
+            // Candidate inclusion is speculative. Rebuild each bounded pending claim from
+            // current UTXO boxes, independently of the forward-only index cursor.
+            val pendingClaims = rentScan.pendingClaims.flatMap { ids =>
+              val boxes = ids.flatMap(id => state.boxById(ADKey @@ idToBytes(id)))
+              StorageRentClaimBuilder.buildClaim(boxes, upcomingHeight, params,
+                minerPk, reemissionTokenId, tokenWhitelist).map { tx =>
+                tx.inputs.map(in => bytesToId(in.boxId)).toSeq -> tx
+              }
+            }.take(MaxPendingRentClaims)
+            val pendingIds = pendingClaims.map(_._1)
+            val pendingBoxIds = pendingIds.flatten.toSet
+            var more = true
+            var pages = 0
+            var claim: Option[ErgoTransaction] = None
+            // A bounded scan page may contain only boxes that current parameters or miner
+            // policy cannot claim. Move past them without modifying the chain-derived index.
+            while (pages < RentPagesPerAttempt && more && claim.isEmpty) {
+              val page = history.storageRentBoxesPage(ceiling, RentRawKeysPerPage, after)
+              more = page.hasMore
+              after = page.after
+              val resolved = page.rows.toSeq.filterNot(entry =>
+                pendingBoxIds.contains(entry.boxId)).flatMap(entry =>
+                state.boxById(ADKey @@ idToBytes(entry.boxId)))
+              claim = StorageRentClaimBuilder.buildClaim(resolved, upcomingHeight, params,
+                minerPk, reemissionTokenId, tokenWhitelist)
+              scanFoundNewClaim = claim.nonEmpty
+              pages += 1
+            }
+            val wrapped = !more
+            val nextScan = RentScanState(after, if (wrapped) None else Some(ceiling),
+              tip, Some(policy), pendingIds)
+            rentProgress = RentScanProgress(nextScan, more = true, wrapped = wrapped)
+            onRentScan(rentProgress)
+            // Rotate a full speculative window so later eligible rows still enter
+            // candidates; evicted rows remain indexed for the next sweep. Give the
+            // newly discovered claim the first rent slot: block packing stops at
+            // the first cost or size overflow.
+            val retained = if (scanFoundNewClaim)
+              pendingClaims.take(MaxPendingRentClaims - 1) else pendingClaims
+            claim.toSeq ++ retained.map(_._2)
           } else {
+            rentProgress = RentScanProgress(RentScanState())
+            onRentScan(rentProgress)
             Seq.empty
           }
         } else {
+          rentProgress = RentScanProgress(RentScanState())
+          onRentScan(rentProgress)
           Seq.empty
         }
 
       if (rentClaimTxs.nonEmpty) {
         log.debug(s"Storage-rent claim transactions injected into the candidate: ${rentClaimTxs.map(_.id)}")
+      }
+
+      // A continuation with no new claim only advances the cursor. The cached candidate
+      // already contains the revalidated pending claims, so no AVL proof is needed.
+      if (rentScanOnly && !scanFoundNewClaim &&
+          rentProgress.state.pendingClaims == rentScan.pendingClaims &&
+          rentProgress.state.policy == rentScan.policy &&
+          rentProgress.state.tip == rentScan.tip &&
+          (rentProgress.state.pendingClaims.isEmpty || rentCacheOwnerMatches)) {
+        throw new NoCandidateTransactions
       }
 
       val candidateTxs = emissionTxs ++ prioritizedTransactions ++ rentClaimTxs ++ poolTxs.map(_.transaction)
@@ -770,7 +1041,8 @@ object CandidateGenerator extends ScorexLogging {
           state.stateContext.currentParameters.maxBlockSize,
           state,
           upcomingContext,
-          candidateTxs
+          candidateTxs,
+          rentClaimTxs.map(_.id).toSet
         )
       }
 
@@ -796,6 +1068,10 @@ object CandidateGenerator extends ScorexLogging {
                       adProof: SerializedAdProof,
                       adDigest: ADDigest,
                       eliminate: EliminateTransactions): (Candidate, EliminateTransactions) = {
+        val includedClaims = rentClaimTxs.filter(claim => blockTxs.exists(_.id == claim.id))
+          .map(claim => claim.inputs.map(in => bytesToId(in.boxId)).toSeq)
+        onRentScan(rentProgress.copy(
+          state = rentProgress.state.copy(pendingClaims = includedClaims)))
         val candidate = CandidateBlock(
           bestHeaderOpt, version, nBits, adDigest,
           adProof, blockTxs, timestamp, extensionCandidate, votes
@@ -1017,7 +1293,8 @@ object CandidateGenerator extends ScorexLogging {
                   maxBlockSize: Int,
                   us: UtxoStateReader,
                   upcomingContext: ErgoStateContext,
-                  transactions: Seq[ErgoTransaction]
+                  transactions: Seq[ErgoTransaction],
+                  skippableOnOverflow: Set[ModifierId] = Set.empty
                 ): (Seq[ErgoTransaction], Seq[ModifierId]) = {
 
     val currentHeight = us.stateContext.currentHeight
@@ -1028,6 +1305,23 @@ object CandidateGenerator extends ScorexLogging {
     )
 
     val verifier: ErgoInterpreter = ErgoInterpreter(upcomingContext.currentParameters)
+
+    // A candidate-local conflict does not prove that a mempool transaction is
+    // invalid. Only context-free invalidity or an ERG imbalance against inputs
+    // that exist in the base UTXO is sufficient to evict it here. In particular,
+    // do not use script validation against this miner's tentative candidate as
+    // a global mempool decision.
+    def independentlyInvalid(tx: ErgoTransaction): Boolean = {
+      if (tx.statelessValidity().isFailure) {
+        true
+      } else {
+        val baseInputs = tx.inputs.map(input => us.boxById(input.boxId))
+        baseInputs.forall(_.isDefined) && {
+          val baseInputSum = Try(baseInputs.flatten.map(_.value).reduce(Math.addExact(_, _)))
+          baseInputSum != tx.outputsSumTry
+        }
+      }
+    }
 
     @tailrec
     def loop(
@@ -1044,10 +1338,16 @@ object CandidateGenerator extends ScorexLogging {
 
       mempoolTxs.headOption match {
         case Some(tx) =>
-          if (!inputsNotSpent(tx, stateWithTxs) || doublespend(current, tx)) {
-            //mark transaction as invalid if it tries to do double-spending or trying to spend outputs not present
-            //do these checks before validating the scripts to save time
-            log.debug(s"Transaction ${tx.id} double-spending or spending non-existing inputs")
+          if (doublespend(current, tx)) {
+            // A conflicting transaction can still be valid against the UTXO set. The
+            // earlier transaction may be a speculative rent claim in this candidate.
+            log.debug(s"Transaction ${tx.id} conflicts with an earlier candidate transaction")
+            val rejected = if (independentlyInvalid(tx)) invalidTxs :+ tx.id else invalidTxs
+            loop(mempoolTxs.tail, acc, lastFeeTx, rejected)
+          } else if (!inputsNotSpent(tx, stateWithTxs)) {
+            // Only an input absent independently of this candidate's prior spends is
+            // a reason to evict the transaction from the mempool.
+            log.debug(s"Transaction ${tx.id} spends non-existing inputs")
             loop(mempoolTxs.tail, acc, lastFeeTx, invalidTxs :+ tx.id)
           } else {
             // check validity and calculate transaction cost
@@ -1072,9 +1372,14 @@ object CandidateGenerator extends ScorexLogging {
                         if (correctLimits(blockTxs, maxBlockCost, maxBlockSize)) {
                           loop(mempoolTxs.tail, newTxs, Some(feeTx -> cost), invalidTxs)
                         } else {
-                          log.debug(s"Finishing block assembly on limits overflow, " +
-                                    s"cost is ${currentCosted.map(_._2).sum}, cost limit: $maxBlockCost")
-                          current -> invalidTxs
+                          if (skippableOnOverflow.contains(tx.id)) {
+                            log.debug(s"Skipping speculative rent claim ${tx.id} on candidate limits overflow")
+                            loop(mempoolTxs.tail, acc, lastFeeTx, invalidTxs)
+                          } else {
+                            log.debug(s"Finishing block assembly on limits overflow, " +
+                              s"cost is ${currentCosted.map(_._2).sum}, cost limit: $maxBlockCost")
+                            current -> invalidTxs
+                          }
                         }
                       case Failure(e) =>
                         log.warn(
@@ -1089,7 +1394,9 @@ object CandidateGenerator extends ScorexLogging {
                     if (correctLimits(blockTxs, maxBlockCost, maxBlockSize)) {
                       loop(mempoolTxs.tail, blockTxs, lastFeeTx, invalidTxs)
                     } else {
-                      current -> invalidTxs
+                      if (skippableOnOverflow.contains(tx.id))
+                        loop(mempoolTxs.tail, acc, lastFeeTx, invalidTxs)
+                      else current -> invalidTxs
                     }
                 }
               case Failure(e) =>

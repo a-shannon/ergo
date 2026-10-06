@@ -17,6 +17,12 @@ import java.io.File
 import java.nio.file.Files
 import scala.jdk.CollectionConverters.asScalaIteratorConverter
 
+/** A rent-index page bounded by raw extra-store keys, including non-rent IDs. */
+case class StorageRentScanPage(rows: Array[StorageRentBox],
+                               after: Option[Vector[Byte]],
+                               hasMore: Boolean,
+                               rawKeysRead: Int)
+
 /**
   * Storage for Ergo history
   *
@@ -136,18 +142,70 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     * Returns an empty array when the extra index is disabled or does not cover the height.
     */
   def storageRentBoxesUntil(creationHeight: Int, limit: Int): Array[StorageRentBox] = {
-    val start = StorageRentBox.key(0, 0L)
+    storageRentBoxesAfter(creationHeight, limit, None)
+  }
+
+  private def rentRowWithin(key: Array[Byte], creationHeight: Int): Boolean =
+    key.length == StorageRentBox.KeyLength &&
+      key(0) == StorageRentBox.KeyMarker &&
+      java.nio.ByteBuffer.wrap(key, 1, 4).getInt <= creationHeight
+
+  // A 32-byte ID can sort inside the rent-key prefix. Only crossing the ordered
+  // height prefix or leaving the marker namespace ends a scan.
+  private def inRentHeightPrefix(key: Array[Byte], creationHeight: Int): Boolean =
+    key.nonEmpty && key(0) == StorageRentBox.KeyMarker &&
+      (key.length < 5 || java.lang.Integer.compareUnsigned(
+        java.nio.ByteBuffer.wrap(key, 1, 4).getInt, creationHeight) <= 0)
+
+  /**
+    * Resume a rent-row-limited index scan strictly after the supplied key. The cursor remains
+    * valid if that row was spent and removed between scans: LevelDB seeks to its successor.
+    */
+  def storageRentBoxesAfter(creationHeight: Int,
+                            limit: Int,
+                            after: Option[(Int, Long)]): Array[StorageRentBox] = {
+    val start = after.map { case (height, index) => StorageRentBox.key(height, index) }
+      .getOrElse(StorageRentBox.key(0, 0L))
     extraStore.scanFrom(
       start,
       limit,
-      keyFilter = key =>
-        key.length == StorageRentBox.KeyLength &&
-          key(0) == StorageRentBox.KeyMarker &&
-          java.nio.ByteBuffer.wrap(key, 1, 4).getInt <= creationHeight,
-      continueScan = key => key.nonEmpty && key(0) == StorageRentBox.KeyMarker
+      keyFilter = key => rentRowWithin(key, creationHeight) &&
+        !after.exists(_ => java.util.Arrays.equals(key, start)),
+      continueScan = key => inRentHeightPrefix(key, creationHeight)
     ).map { case (_, bytes) =>
       ExtraIndexSerializer.parseBytes(bytes).asInstanceOf[StorageRentBox]
     }
+  }
+
+  /**
+    * Inspect at most `rawLimit + 2` raw extra-store keys, including any
+    * range-boundary key. Resume strictly after the last page key; a deleted
+    * cursor seeks to its successor. The two extra keys cover an inclusive
+    * cursor and one lookahead, even after deletion.
+    */
+  def storageRentBoxesPage(creationHeight: Int,
+                           rawLimit: Int,
+                           after: Option[Vector[Byte]]): StorageRentScanPage = {
+    require(rawLimit > 0 && rawLimit <= Int.MaxValue - 2)
+    val start = after.map(_.toArray).getOrElse(StorageRentBox.key(0, 0L))
+    var rawKeysRead = 0
+    val scanned = extraStore.scanFrom(start, rawLimit + 2,
+      keyFilter = _ => true,
+      continueScan = key => {
+        rawKeysRead += 1
+        inRentHeightPrefix(key, creationHeight)
+      })
+    val fresh = if (scanned.headOption.exists { case (key, _) =>
+      after.exists(cursor => java.util.Arrays.equals(key, cursor.toArray))
+    }) scanned.tail else scanned
+    val visited = fresh.take(rawLimit)
+    val hasMore = fresh.length > rawLimit
+    val rows = visited.collect { case (key, bytes) if rentRowWithin(key, creationHeight) =>
+      ExtraIndexSerializer.parseBytes(bytes).asInstanceOf[StorageRentBox]
+    }
+    StorageRentScanPage(rows,
+      if (hasMore) visited.lastOption.map(_._1.toVector) else None,
+      hasMore, rawKeysRead)
   }
 
   /**

@@ -1,28 +1,34 @@
 package org.ergoplatform.mining
 
-import akka.actor.{Actor, ActorRef, ActorSystem, Props}
+import java.lang.reflect.{InvocationHandler, Method, Proxy}
+import java.nio.file.Files
+
+import akka.actor.{Actor, ActorIdentity, ActorRef, ActorSystem, Identify, Props}
 import akka.pattern.{StatusReply, ask}
 import akka.testkit.{TestKit, TestProbe}
 import akka.util.Timeout
 import org.bouncycastle.util.BigIntegers
 import org.ergoplatform.mining.CandidateGenerator.{Candidate, GenerateCandidate}
 import org.ergoplatform.modifiers.ErgoFullBlock
-import org.ergoplatform.modifiers.history.BlockTransactions
+import org.ergoplatform.modifiers.history.{BlockTransactions, HeaderChain}
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction, UnsignedErgoTransaction}
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{ChangedMempool, FullBlockApplied, LocalBlockApplied, SemanticallyFailedModification}
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.{EliminateTransactions, LocallyGeneratedTransaction}
 import org.ergoplatform.nodeView.ErgoReadersHolder.{GetReaders, Readers}
 import org.ergoplatform.nodeView.history.{ErgoHistory, ErgoHistoryReader}
+import org.ergoplatform.nodeView.history.extra.{ExtraIndex, StorageRentBox}
+import org.ergoplatform.nodeView.history.storage.HistoryStorage
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
-import org.ergoplatform.nodeView.state.{StateType, UtxoState}
+import org.ergoplatform.nodeView.state.{BoxHolder, ErgoStateContext, StateType, UtxoState, VotingData}
 import org.ergoplatform.nodeView.wallet.ErgoWalletReader
 import org.ergoplatform.nodeView.{ErgoNodeViewRef, ErgoReadersHolderRef, LocallyGeneratedModifier}
 import org.ergoplatform.settings.NetworkType.DevNet60
-import org.ergoplatform.settings.{ErgoSettings, ErgoSettingsReader}
+import org.ergoplatform.settings.{Constants, ErgoSettings, ErgoSettingsReader}
 import org.ergoplatform.utils.ErgoTestHelpers
 import org.ergoplatform.utils.generators.ValidBlocksGenerators.{createUtxoState, validFullBlock, validTransactionsFromBoxHolder}
 import org.ergoplatform.utils.generators.ChainGenerator.{applyChain, genHeaderChain}
+import org.ergoplatform.utils.generators.ErgoCoreTransactionGenerators._
 import org.ergoplatform.utils.{HistoryTestHelpers, RandomWrapper}
 import org.ergoplatform.validation.MalformedModifierError
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, ErgoTreePredef, Input}
@@ -31,9 +37,11 @@ import org.scalatest.flatspec.AnyFlatSpec
 import sigma.ast.ErgoTree
 import org.scalatest.matchers.should.Matchers
 import scorex.util.encode.Base16
+import scorex.util.bytesToId
 import sigma.data.ProveDlog
 import sigma.serialization.ErgoTreeSerializer
 import sigmastate.crypto.DLogProtocol.DLogProverInput
+import sigmastate.helpers.TestingHelpers._
 import scorex.crypto.authds.{ADDigest, SerializedAdProof}
 
 import scala.concurrent.duration._
@@ -1294,6 +1302,131 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
     }
   }
 
+  private case class RentPageRead(after: Option[Vector[Byte]])
+  private case class RentRawPageWork(rawLimit: Int, rawKeysRead: Int)
+  private case object RentProofRead
+
+  private case class RentScanFixture(settings: ErgoSettings,
+                                     readers: Readers,
+                                     state: UtxoState,
+                                     storage: HistoryStorage,
+                                     claimable: ErgoBox,
+                                     earlierClaims: Seq[ErgoBox],
+                                     witness: ErgoTransaction,
+                                     cursors: Seq[Option[Vector[Byte]]]) {
+    def close(): Unit = {
+      storage.close()
+      state.closeStorage()
+    }
+  }
+
+  private def rentScanFixture(scanProbe: TestProbe,
+                              withPoolTransaction: Boolean,
+                              unclaimableRows: Int = 2 * StorageRentClaimBuilder.MaxClaims + 1,
+                              candidateInterval: FiniteDuration = 2.seconds,
+                              proofProbe: Option[TestProbe] = None,
+                              claimablePositions: Set[Int] = Set.empty,
+                              foreignKeysAfterFirst: Int = 0,
+                              workProbe: Option[TestProbe] = None,
+                              witnessSpendsClaimable: Boolean = false,
+                              witnessOverspends: Boolean = false)
+                             (implicit system: ActorSystem): RentScanFixture = {
+    val storageDir = Files.createTempDirectory("candidate-rent-scan-storage-")
+    val stateDir = Files.createTempDirectory("candidate-rent-scan-state-")
+    val baseSettings = testSettings(storageDir.toString)
+    val settings = baseSettings.copy(nodeSettings = baseSettings.nodeSettings.copy(
+      extraIndex = true,
+      storageRentCollection = true,
+      blockCandidateGenerationInterval = candidateInterval))
+    val height = 3 * Constants.StoragePeriod
+    val threshold = height - Constants.StoragePeriod
+    val dustCount = unclaimableRows
+    val unclaimable = (0 until dustCount).map { index =>
+      val value = if (claimablePositions.contains(index)) 10000000000L else 1L
+      testBox(value, Constants.TrueTree, threshold - dustCount + index,
+        Seq.empty, Map.empty)
+    }
+    val claimable = testBox(10000000000L, Constants.TrueTree, threshold,
+      Seq.empty, Map.empty)
+    val witnessBox = testBox(10000000000L, Constants.TrueTree, height - 2,
+      Seq.empty, Map.empty)
+    val witnessInput = if (witnessSpendsClaimable) claimable else witnessBox
+    val witness = ErgoTransaction(
+      IndexedSeq(Input(witnessInput.id, emptyProverResult)), IndexedSeq.empty,
+      IndexedSeq(new ErgoBoxCandidate(witnessInput.value + (if (witnessOverspends) 1L else 0L),
+        Constants.TrueTree, height)))
+    val baseState = UtxoState.fromBoxHolder(
+      BoxHolder(unclaimable ++ Seq(claimable, witnessBox)), None,
+      stateDir.toFile, settings, parameters)
+    val block = invalidErgoFullBlockGen.sample.get
+    val parentHeader = block.header.copy(height = height - 1)
+    val parentBlock = block.copy(parentHeader)
+    val agedContext = new ErgoStateContext(Seq(parentHeader), None,
+      genesisStateDigest, parameters, validationSettingsNoIl, VotingData.empty)(settings.chainSettings)
+    val state = new UtxoState(baseState.persistentProver, baseState.version,
+      baseState.store, settings) {
+      override def stateContext: ErgoStateContext = agedContext
+      override def emissionBoxOpt: Option[ErgoBox] = None
+      override def proofsForTransactions(txs: Seq[ErgoTransaction]) = {
+        proofProbe.foreach(_.ref ! RentProofRead)
+        super.proofsForTransactions(txs)
+      }
+    }
+    val storage = HistoryStorage(settings)
+    (unclaimable :+ claimable).zipWithIndex.foreach { case (box, index) =>
+      val entry = new StorageRentBox(box.creationHeight, index.toLong,
+        bytesToId(box.id), box.value, box.bytes.length)
+      storage.insertExtra(Array.empty[(Array[Byte], Array[Byte])], Array[ExtraIndex](entry))
+    }
+    if (foreignKeysAfterFirst > 0) {
+      val prefix = StorageRentBox.key(unclaimable.head.creationHeight, 0L)
+      val foreign = (0 until foreignKeysAfterFirst).map { n =>
+        (prefix ++ Array(n.toByte) ++ Array.fill(18)(1.toByte)) -> Array(1.toByte)
+      }
+      storage.insertExtra(foreign.toArray, Array.empty[ExtraIndex])
+    }
+    val history = Proxy.newProxyInstance(
+      classOf[ErgoHistoryReader].getClassLoader,
+      Array[Class[_]](classOf[ErgoHistoryReader]),
+      new InvocationHandler {
+        override def invoke(proxy: Any, method: Method, args: Array[AnyRef]): AnyRef =
+          method.getName match {
+            case "lastHeaders$default$2" => Int.box(0)
+            case "lastHeaders" => HeaderChain.empty
+            case "bestFullBlockOpt" => Some(parentBlock)
+            case "bestFullBlockAt" => Some(parentBlock)
+            case "storageRentBoxesUntil" =>
+              storage.storageRentBoxesUntil(args(0).asInstanceOf[Int], args(1).asInstanceOf[Int])
+            case "storageRentBoxesAfter" =>
+              val after = args(2).asInstanceOf[Option[(Int, Long)]]
+              storage.storageRentBoxesAfter(args(0).asInstanceOf[Int],
+                args(1).asInstanceOf[Int], after)
+            case "storageRentBoxesPage" =>
+              val after = args(2).asInstanceOf[Option[Vector[Byte]]]
+              val rawLimit = args(1).asInstanceOf[Int]
+              if (rawLimit > 1) scanProbe.ref ! RentPageRead(after)
+              val page = storage.storageRentBoxesPage(args(0).asInstanceOf[Int], rawLimit, after)
+              workProbe.foreach(_.ref ! RentRawPageWork(rawLimit, page.rawKeysRead))
+              page
+            case "typedModifierById" => None
+            case "requiredDifficultyAfter" => parentHeader.requiredDifficulty
+            case other => throw new UnsupportedOperationException(s"unexpected history read: $other")
+          }
+      }
+    ).asInstanceOf[ErgoHistoryReader]
+    val pool = ErgoMemPool.empty(settings)
+    val mempool = if (withPoolTransaction)
+      pool.put(Seq(UnconfirmedTransaction(witness, None))) else pool
+    val cursors: Seq[Option[Vector[Byte]]] = Seq(None) ++
+      (1 to dustCount / StorageRentClaimBuilder.MaxClaims).map { page =>
+        val index = page * StorageRentClaimBuilder.MaxClaims - 1
+        Some(StorageRentBox.key(unclaimable(index).creationHeight, index.toLong).toVector)
+      }
+    RentScanFixture(settings, Readers(history, state, mempool, walletStub),
+      state, storage, claimable, claimablePositions.toSeq.sorted.map(unclaimable(_)),
+      witness, cursors)
+  }
+
   private def walletStub(implicit system: ActorSystem): ErgoWalletReader = new ErgoWalletReader {
     val walletActor: ActorRef = system.deadLetters
   }
@@ -1562,6 +1695,562 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
     candidate.candidateBlock.transactions should have length 1
 
     system.terminate()
+  }
+
+  it should "continue rent scan after an empty startup candidate" in new TestKit(ActorSystem()) {
+    val scanProbe = TestProbe()
+    val senderProbe = TestProbe()
+    val viewHolderProbe = TestProbe()
+    val fixture = rentScanFixture(scanProbe, withPoolTransaction = false)
+    try {
+      val readersHolderRef = system.actorOf(Props(new FixedReadersHolder(fixture.readers)))
+      val candidateGenerator = CandidateGenerator(defaultMinerSecret.publicImage,
+        readersHolderRef, viewHolderProbe.ref, fixture.settings)
+
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(0)))
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(1)))
+      // No external request follows the empty first attempt. The third read must come
+      // from the actor's scheduled continuation, past both unclaimable pages.
+      scanProbe.expectMsg(8.seconds, RentPageRead(fixture.cursors(2)))
+
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false),
+        senderProbe.ref)
+      val candidate = senderProbe.expectMsgPF(6.seconds) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      CandidateGenerator.rentClaimSpentBoxIds(candidate.candidateBlock.transactions) should
+        contain(bytesToId(fixture.claimable.id))
+      scanProbe.expectNoMessage(200.millis)
+    } finally {
+      await(system.terminate())
+      fixture.close()
+    }
+  }
+
+  it should "bound each rent-only tick through interleaved foreign IDs and reach a later claim" in new TestKit(
+    ActorSystem()
+  ) {
+    val scanProbe = TestProbe()
+    val workProbe = TestProbe()
+    val fixture = rentScanFixture(scanProbe, withPoolTransaction = false,
+      unclaimableRows = 1, foreignKeysAfterFirst = 80, workProbe = Some(workProbe))
+    try {
+      var scan = CandidateGenerator.RentScanState()
+      var found = false
+      var attempts = 0
+      while (attempts < 8 && !found) {
+        val (attempt, progress) = CandidateGenerator.generateCandidateWithRentScan(
+          fixture.readers.h, fixture.state, fixture.readers.m,
+          defaultMinerSecret.publicImage, Seq.empty, None, fixture.settings, scan)
+        attempt.foreach(_.isSuccess shouldBe true)
+        found = attempt.exists(_.toOption.exists { case (candidate, _) =>
+          CandidateGenerator.rentClaimSpentBoxIds(candidate.candidateBlock.transactions)
+            .contains(bytesToId(fixture.claimable.id))
+        })
+        scan = progress.state
+        attempts += 1
+        if (attempts == 1) {
+          scan.after should not be None
+          scan.copy(after = scan.after.map(_.toArray.toVector)) shouldBe scan
+        }
+
+        val work = workProbe.receiveWhile(100.millis) {
+          case page: RentRawPageWork => page
+        }
+        work.count(_.rawLimit == 1) shouldBe 1 // the early candidate gate is bounded too
+        work.count(_.rawLimit == StorageRentClaimBuilder.MaxClaims) should be <= 2
+        work.foreach(page => page.rawKeysRead should be <= page.rawLimit + 2)
+        work.map(_.rawKeysRead).sum should be <= 3 + 2 * (StorageRentClaimBuilder.MaxClaims + 2)
+      }
+      attempts should be > 1
+      found shouldBe true
+    } finally {
+      await(system.terminate())
+      fixture.close()
+    }
+  }
+
+  it should "keep a rent cursor when the selected full chain advances behind another header branch" in {
+    val oldId = bytesToId(Array.fill(32)(0x11.toByte))
+    val nextId = bytesToId(Array.fill(32)(0x22.toByte))
+    var oldTipStillSelected = true
+    val history = Proxy.newProxyInstance(
+      classOf[ErgoHistoryReader].getClassLoader,
+      Array[Class[_]](classOf[ErgoHistoryReader]),
+      new InvocationHandler {
+        override def invoke(proxy: Any, method: Method, args: Array[AnyRef]): AnyRef =
+          method.getName match {
+            case "bestFullBlockAt" => None // best headers point to another branch here
+            case "isInSelectedFullChain" => Boolean.box(oldTipStillSelected && args(0) == oldId)
+            case other => throw new UnsupportedOperationException(s"unexpected history read: $other")
+          }
+      }
+    ).asInstanceOf[ErgoHistoryReader]
+
+    history.bestFullBlockAt(100) shouldBe None
+    val previous = Some(100 -> oldId)
+    val advanced = Some(101 -> nextId)
+    CandidateGenerator.continuesSelectedFullChain(history, previous, advanced) shouldBe true
+    oldTipStillSelected = false // the selected full chain really rolled back
+    CandidateGenerator.continuesSelectedFullChain(history, previous, advanced) shouldBe false
+    CandidateGenerator.continuesSelectedFullChain(history, previous, previous) shouldBe true
+  }
+
+  it should "advance independent rent cursors for alternating miner keys" in new TestKit(ActorSystem()) {
+    val scanProbe = TestProbe()
+    val fixture = rentScanFixture(scanProbe, withPoolTransaction = false,
+      unclaimableRows = 2 * StorageRentClaimBuilder.MaxClaims + 1)
+    val defaultPk = defaultMinerSecret.publicImage
+    val alternatePk = DLogProverInput(
+      BigIntegers.fromUnsignedByteArray("rent_alternate_key".getBytes())).publicImage
+    try {
+      var generatorState = CandidateGenerator.CandidateGeneratorState(
+        None, None, None, fixture.readers.h, fixture.state, fixture.readers.m,
+        1.second, None)
+      val found = Seq(defaultPk, alternatePk, defaultPk, alternatePk).map { pk =>
+        val (attempt, progress) = CandidateGenerator.generateCandidateWithRentScan(
+          fixture.readers.h, fixture.state, fixture.readers.m, pk,
+          Seq(fixture.witness), None, fixture.settings,
+          generatorState.rentScanFor(pk, defaultPk))
+        attempt should not be None
+        attempt.get.isSuccess shouldBe true
+        generatorState = generatorState.withRentScanFor(pk, defaultPk, progress.state)
+        CandidateGenerator.rentClaimSpentBoxIds(attempt.get.get._1.candidateBlock.transactions)
+          .contains(bytesToId(fixture.claimable.id))
+      }
+      found shouldBe Seq(false, false, true, true)
+      generatorState.alternateRentScans.length shouldBe 1
+    } finally {
+      await(system.terminate())
+      fixture.close()
+    }
+  }
+
+  it should "advance an alternate miner's rent scan despite cached API polls" in new TestKit(
+    ActorSystem()
+  ) {
+    val scanProbe = TestProbe()
+    val proofProbe = TestProbe()
+    val senderProbe = TestProbe()
+    val viewHolderProbe = TestProbe()
+    val fixture = rentScanFixture(scanProbe, withPoolTransaction = true,
+      unclaimableRows = 2 * StorageRentClaimBuilder.MaxClaims + 1,
+      candidateInterval = 60.seconds, proofProbe = Some(proofProbe))
+    val alternatePk = DLogProverInput(
+      BigIntegers.fromUnsignedByteArray("rent_actor_alternate_key".getBytes())).publicImage
+    try {
+      val readersHolderRef = system.actorOf(Props(new FixedReadersHolder(fixture.readers)))
+      val candidateGenerator = CandidateGenerator(defaultMinerSecret.publicImage,
+        readersHolderRef, viewHolderProbe.ref, fixture.settings)
+
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(0)))
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(1)))
+      scanProbe.expectMsg(8.seconds, RentPageRead(fixture.cursors(2)))
+
+      def poll(optPk: Option[ProveDlog]): Candidate = {
+        candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false,
+          optPk = optPk), senderProbe.ref)
+        senderProbe.expectMsgPF(6.seconds) {
+          case StatusReply.Success(c: Candidate) => c
+        }
+      }
+
+      val claimableId = bytesToId(fixture.claimable.id)
+      CandidateGenerator.rentClaimSpentBoxIds(poll(None).candidateBlock.transactions) should
+        contain(claimableId)
+      CandidateGenerator.rentClaimSpentBoxIds(poll(Some(alternatePk)).candidateBlock.transactions)
+        .contains(claimableId) shouldBe false
+
+      var alternateClaimFound = false
+      var polls = 0
+      val deadline = System.nanoTime() + 6.seconds.toNanos
+      while (!alternateClaimFound && System.nanoTime() < deadline) {
+        Thread.sleep(100)
+        alternateClaimFound = CandidateGenerator.rentClaimSpentBoxIds(
+          poll(Some(alternatePk)).candidateBlock.transactions).contains(claimableId)
+        polls += 1
+      }
+      polls should be > 0
+      alternateClaimFound shouldBe true
+      proofProbe.receiveWhile(250.millis) {
+        case RentProofRead => RentProofRead
+      }.size should be <= 5
+    } finally {
+      await(system.terminate())
+      fixture.close()
+    }
+  }
+
+  it should "rebuild a pending rent claim only when a scan tick has lost its cache owner" in new TestKit(
+    ActorSystem()
+  ) {
+    val scanProbe = TestProbe()
+    val proofProbe = TestProbe()
+    val fixture = rentScanFixture(scanProbe, withPoolTransaction = true,
+      unclaimableRows = 1, proofProbe = Some(proofProbe))
+    try {
+      val minerPk = defaultMinerSecret.publicImage
+      val (initial, discovered) = CandidateGenerator.generateCandidateWithRentScan(
+        fixture.readers.h, fixture.state, fixture.readers.m, minerPk,
+        Seq.empty, None, fixture.settings, CandidateGenerator.RentScanState())
+      initial.get.isSuccess shouldBe true
+      discovered.state.pendingClaims should not be empty
+
+      val (cachedTick, sameState) = CandidateGenerator.generateCandidateWithRentScan(
+        fixture.readers.h, fixture.state, fixture.readers.m, minerPk,
+        Seq.empty, None, fixture.settings, discovered.state,
+        rentScanOnly = true, rentCacheOwnerMatches = true)
+      cachedTick shouldBe None
+      sameState.state.pendingClaims shouldBe discovered.state.pendingClaims
+
+      val (rebuild, _) = CandidateGenerator.generateCandidateWithRentScan(
+        fixture.readers.h, fixture.state, fixture.readers.m, minerPk,
+        Seq.empty, None, fixture.settings, discovered.state,
+        rentScanOnly = true, rentCacheOwnerMatches = false)
+      rebuild.get.isSuccess shouldBe true
+      CandidateGenerator.rentClaimSpentBoxIds(rebuild.get.get._1.candidateBlock.transactions) should
+        contain(bytesToId(fixture.claimable.id))
+      proofProbe.receiveN(2, 6.seconds) shouldBe Seq(RentProofRead, RentProofRead)
+      proofProbe.expectNoMessage(200.millis)
+    } finally {
+      await(system.terminate())
+      fixture.close()
+    }
+  }
+
+  it should "continue rent scan past a cached non-rent candidate" in new TestKit(ActorSystem()) {
+    val scanProbe = TestProbe()
+    val senderProbe = TestProbe()
+    val viewHolderProbe = TestProbe()
+    val fixture = rentScanFixture(scanProbe, withPoolTransaction = true)
+    try {
+      val readersHolderRef = system.actorOf(Props(new FixedReadersHolder(fixture.readers)))
+      val candidateGenerator = CandidateGenerator(defaultMinerSecret.publicImage,
+        readersHolderRef, viewHolderProbe.ref, fixture.settings)
+
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(0)))
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(1)))
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false),
+        senderProbe.ref)
+      val first = senderProbe.expectMsgPF(6.seconds) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      first.candidateBlock.transactions.map(_.id) should contain(fixture.witness.id)
+      CandidateGenerator.rentClaimSpentBoxIds(first.candidateBlock.transactions) shouldBe empty
+
+      // The cached candidate must not suppress the scheduled forced regeneration.
+      scanProbe.expectMsg(8.seconds, RentPageRead(fixture.cursors(2)))
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false),
+        senderProbe.ref)
+      val continued = senderProbe.expectMsgPF(6.seconds) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      continued.candidateBlock.transactions.map(_.id) should contain(fixture.witness.id)
+      CandidateGenerator.rentClaimSpentBoxIds(continued.candidateBlock.transactions) should
+        contain(bytesToId(fixture.claimable.id))
+      scanProbe.expectNoMessage(200.millis)
+    } finally {
+      await(system.terminate())
+      fixture.close()
+    }
+  }
+
+  it should "accept an issued solution after two autonomous rent candidate refreshes" in new TestKit(
+    ActorSystem()
+  ) {
+    val scanProbe = TestProbe()
+    val proofProbe = TestProbe()
+    val senderProbe = TestProbe()
+    val viewHolderProbe = TestProbe()
+    val fixture = rentScanFixture(scanProbe, withPoolTransaction = true,
+      unclaimableRows = 50, claimablePositions = Set(20, 30),
+      candidateInterval = 60.seconds, proofProbe = Some(proofProbe))
+    try {
+      val readersHolderRef = system.actorOf(Props(new FixedReadersHolder(fixture.readers)))
+      val candidateGenerator = CandidateGenerator(defaultMinerSecret.publicImage,
+        readersHolderRef, viewHolderProbe.ref, fixture.settings)
+
+      def cachedCandidate(): Candidate = {
+        candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false),
+          senderProbe.ref)
+        senderProbe.expectMsgPF(6.seconds) {
+          case StatusReply.Success(c: Candidate) => c
+        }
+      }
+
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(0)))
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(1)))
+      val issued = cachedCandidate()
+      CandidateGenerator.rentClaimSpentBoxIds(issued.candidateBlock.transactions) shouldBe empty
+      fixture.earlierClaims.size shouldBe 2
+
+      scanProbe.expectMsg(8.seconds, RentPageRead(fixture.cursors(2)))
+      scanProbe.expectMsg(8.seconds, RentPageRead(fixture.cursors(3)))
+      proofProbe.receiveN(3, 6.seconds) shouldBe Seq(RentProofRead, RentProofRead, RentProofRead)
+
+      val powScheme = fixture.settings.chainSettings.powScheme
+      val solvedIssued = powScheme.proveCandidate(issued.candidateBlock,
+        defaultMinerSecret.w, 0, 1000).get
+      powScheme.validate(solvedIssued.header).isSuccess shouldBe true
+      candidateGenerator.tell(solvedIssued.header.powSolution, senderProbe.ref)
+      senderProbe.expectMsgPF(6.seconds) {
+        case StatusReply.Success(()) =>
+      }
+      viewHolderProbe.expectMsg(LocallyGeneratedModifier(solvedIssued.header))
+    } finally {
+      await(system.terminate())
+      fixture.close()
+    }
+  }
+
+  it should "keep a valid mempool transaction after a normal rent candidate prefers its box" in new TestKit(
+    ActorSystem()
+  ) {
+    val scanProbe = TestProbe()
+    val senderProbe = TestProbe()
+    val viewHolderProbe = TestProbe()
+    val fixture = rentScanFixture(scanProbe, withPoolTransaction = true,
+      unclaimableRows = 1, candidateInterval = 60.seconds,
+      witnessSpendsClaimable = true)
+    try {
+      val readersHolderRef = system.actorOf(Props(new FixedReadersHolder(fixture.readers)))
+      val candidateGenerator = CandidateGenerator(defaultMinerSecret.publicImage,
+        readersHolderRef, viewHolderProbe.ref, fixture.settings)
+
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false),
+        senderProbe.ref)
+      val issued = senderProbe.expectMsgPF(6.seconds) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(0)))
+      CandidateGenerator.rentClaimSpentBoxIds(issued.candidateBlock.transactions) should
+        contain(bytesToId(fixture.claimable.id))
+      issued.candidateBlock.transactions.map(_.id) should not contain fixture.witness.id
+
+      val eliminated = viewHolderProbe.receiveWhile(500.millis) {
+        case e: EliminateTransactions => e
+      }.flatMap(_.ids)
+      eliminated should not contain fixture.witness.id
+    } finally {
+      await(system.terminate())
+      fixture.close()
+    }
+  }
+
+  it should "eliminate an intrinsically invalid mempool transaction despite a normal rent claim conflict" in new TestKit(
+    ActorSystem()
+  ) {
+    val scanProbe = TestProbe()
+    val senderProbe = TestProbe()
+    val viewHolderProbe = TestProbe()
+    val fixture = rentScanFixture(scanProbe, withPoolTransaction = true,
+      unclaimableRows = 1, candidateInterval = 60.seconds,
+      witnessSpendsClaimable = true, witnessOverspends = true)
+    try {
+      fixture.witness.statelessValidity().isSuccess shouldBe true
+      val upcoming = fixture.state.stateContext.simplifiedUpcoming()
+      fixture.state.validateWithCost(fixture.witness, upcoming,
+        parameters.maxBlockCost, None).isFailure shouldBe true
+
+      val readersHolderRef = system.actorOf(Props(new FixedReadersHolder(fixture.readers)))
+      val candidateGenerator = CandidateGenerator(defaultMinerSecret.publicImage,
+        readersHolderRef, viewHolderProbe.ref, fixture.settings)
+
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false),
+        senderProbe.ref)
+      val issued = senderProbe.expectMsgPF(6.seconds) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(0)))
+      CandidateGenerator.rentClaimSpentBoxIds(issued.candidateBlock.transactions) should
+        contain(bytesToId(fixture.claimable.id))
+      issued.candidateBlock.transactions.map(_.id) should not contain fixture.witness.id
+
+      val eliminated = viewHolderProbe.receiveWhile(500.millis) {
+        case e: EliminateTransactions => e
+      }.flatMap(_.ids)
+      eliminated should contain(fixture.witness.id)
+    } finally {
+      await(system.terminate())
+      fixture.close()
+    }
+  }
+
+  it should "keep a valid mempool transaction when an unpublished rent claim conflicts with it" in new TestKit(
+    ActorSystem()
+  ) {
+    val scanProbe = TestProbe()
+    val proofProbe = TestProbe()
+    val senderProbe = TestProbe()
+    val viewHolderProbe = TestProbe()
+    val barrierProbe = TestProbe()
+    val fixture = rentScanFixture(scanProbe, withPoolTransaction = true,
+      candidateInterval = 60.seconds, proofProbe = Some(proofProbe),
+      witnessSpendsClaimable = true)
+    try {
+      val readersHolderRef = system.actorOf(Props(new FixedReadersHolder(fixture.readers)))
+      val candidateGenerator = CandidateGenerator(defaultMinerSecret.publicImage,
+        readersHolderRef, viewHolderProbe.ref, fixture.settings)
+
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(0)))
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(1)))
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false),
+        senderProbe.ref)
+      val issued = senderProbe.expectMsgPF(6.seconds) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      issued.candidateBlock.transactions.map(_.id) should contain(fixture.witness.id)
+      CandidateGenerator.rentClaimSpentBoxIds(issued.candidateBlock.transactions) shouldBe empty
+
+      // The next autonomous page discovers a valid rent claim for the witness input.
+      // Identify is processed after the scan tick, without requesting or publishing new work.
+      scanProbe.expectMsg(8.seconds, RentPageRead(fixture.cursors(2)))
+      proofProbe.receiveN(2, 6.seconds) shouldBe Seq(RentProofRead, RentProofRead)
+      barrierProbe.send(candidateGenerator, Identify("deferred-rent-claim"))
+      barrierProbe.expectMsg(ActorIdentity("deferred-rent-claim", Some(candidateGenerator)))
+      val eliminated = viewHolderProbe.receiveWhile(500.millis) {
+        case e: EliminateTransactions => e
+      }.flatMap(_.ids)
+      eliminated should not contain fixture.witness.id
+
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false),
+        senderProbe.ref)
+      val promoted = senderProbe.expectMsgPF(6.seconds) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      CandidateGenerator.rentClaimSpentBoxIds(promoted.candidateBlock.transactions) should
+        contain(bytesToId(fixture.claimable.id))
+    } finally {
+      await(system.terminate())
+      fixture.close()
+    }
+  }
+
+  it should "continue rent scan after forced generation advances a pending cursor" in new TestKit(
+    ActorSystem()
+  ) {
+    val scanProbe = TestProbe()
+    val senderProbe = TestProbe()
+    val viewHolderProbe = TestProbe()
+    val fixture = rentScanFixture(scanProbe, withPoolTransaction = true,
+      unclaimableRows = 4 * StorageRentClaimBuilder.MaxClaims + 1)
+    try {
+      val readersHolderRef = system.actorOf(Props(new FixedReadersHolder(fixture.readers)))
+      val candidateGenerator = CandidateGenerator(defaultMinerSecret.publicImage,
+        readersHolderRef, viewHolderProbe.ref, fixture.settings)
+
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(0)))
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(1)))
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false),
+        senderProbe.ref)
+      val first = senderProbe.expectMsgPF(6.seconds) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      first.candidateBlock.transactions.map(_.id) should contain(fixture.witness.id)
+      CandidateGenerator.rentClaimSpentBoxIds(first.candidateBlock.transactions) shouldBe empty
+
+      // Advance from S1 (after row 20) to S2 (after row 40) while S1's timer is pending.
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = true),
+        senderProbe.ref)
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(2)))
+      scanProbe.expectMsg(6.seconds, RentPageRead(fixture.cursors(3)))
+      val forced = senderProbe.expectMsgPF(6.seconds) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      CandidateGenerator.rentClaimSpentBoxIds(forced.candidateBlock.transactions) shouldBe empty
+
+      // A stale S1 timer cannot be allowed to suppress continuation from S2.
+      scanProbe.expectMsg(8.seconds, RentPageRead(fixture.cursors(4)))
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false),
+        senderProbe.ref)
+      val continued = senderProbe.expectMsgPF(6.seconds) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      CandidateGenerator.rentClaimSpentBoxIds(continued.candidateBlock.transactions) should
+        contain(bytesToId(fixture.claimable.id))
+      scanProbe.expectNoMessage(200.millis)
+    } finally {
+      await(system.terminate())
+      fixture.close()
+    }
+  }
+
+  it should "cross a thousand indexed rows within the default interval without empty-page proofs" in new TestKit(
+    ActorSystem()
+  ) {
+    val scanProbe = TestProbe()
+    val proofProbe = TestProbe()
+    val senderProbe = TestProbe()
+    val viewHolderProbe = TestProbe()
+    val rows = 1000
+    val fixture = rentScanFixture(scanProbe, withPoolTransaction = true,
+      unclaimableRows = rows, candidateInterval = 60.seconds,
+      proofProbe = Some(proofProbe))
+    try {
+      val readersHolderRef = system.actorOf(Props(new FixedReadersHolder(fixture.readers)))
+      val candidateGenerator = CandidateGenerator(defaultMinerSecret.publicImage,
+        readersHolderRef, viewHolderProbe.ref, fixture.settings)
+      val expectedReads = (rows + 1 + StorageRentClaimBuilder.MaxClaims - 1) /
+        StorageRentClaimBuilder.MaxClaims
+      val reads = scanProbe.receiveN(expectedReads, 55.seconds)
+      reads.head shouldBe RentPageRead(None)
+      reads.last shouldBe RentPageRead(fixture.cursors.last)
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false),
+        senderProbe.ref)
+      val candidate = senderProbe.expectMsgPF(6.seconds) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      CandidateGenerator.rentClaimSpentBoxIds(candidate.candidateBlock.transactions) should
+        contain(bytesToId(fixture.claimable.id))
+      proofProbe.receiveN(2, 6.seconds) shouldBe Seq(RentProofRead, RentProofRead)
+      proofProbe.expectNoMessage(200.millis)
+    } finally {
+      await(system.terminate())
+      fixture.close()
+    }
+  }
+
+  it should "rotate four unmined claims so a fifth eligible group enters a candidate" in new TestKit(
+    ActorSystem()
+  ) {
+    val scanProbe = TestProbe()
+    val fixture = rentScanFixture(scanProbe, withPoolTransaction = false,
+      unclaimableRows = 50, claimablePositions = Set(0, 10, 20, 30, 40))
+    try {
+      var scan = CandidateGenerator.RentScanState()
+      val candidates = (1 to 5).map { _ =>
+        val (attempt, progress) = CandidateGenerator.generateCandidateWithRentScan(
+          fixture.readers.h, fixture.state, fixture.readers.m,
+          defaultMinerSecret.publicImage, Seq(fixture.witness), None,
+          fixture.settings, scan)
+        attempt should not be None
+        attempt.get.isSuccess shouldBe true
+        scan = progress.state
+        attempt.get.get._1
+      }
+      val claimedIds = candidates.map(candidate =>
+        CandidateGenerator.rentClaimSpentBoxIds(candidate.candidateBlock.transactions))
+      fixture.earlierClaims.zipWithIndex.foreach { case (box, index) =>
+        claimedIds(index) should contain(bytesToId(box.id))
+      }
+      claimedIds.last should contain(bytesToId(fixture.earlierClaims.last.id))
+      claimedIds.last should not contain bytesToId(fixture.earlierClaims.head.id)
+      scan.pendingClaims.length shouldBe 4
+
+      val rentClaims = candidates.last.candidateBlock.transactions
+        .filter(CandidateGenerator.isStorageRentClaim)
+      val upcoming = fixture.state.stateContext.simplifiedUpcoming()
+      val oneClaimCost = fixture.state.validateWithCost(rentClaims.head, upcoming,
+        parameters.maxBlockCost, None).get
+      val (budgeted, _) = CandidateGenerator.collectTxs(
+        defaultMinerSecret.publicImage, oneClaimCost + 1,
+        parameters.maxBlockSize, fixture.state, upcoming, rentClaims)
+      CandidateGenerator.rentClaimSpentBoxIds(budgeted) should
+        contain(bytesToId(fixture.earlierClaims.last.id))
+    } finally {
+      await(system.terminate())
+      fixture.close()
+    }
   }
 
 }
