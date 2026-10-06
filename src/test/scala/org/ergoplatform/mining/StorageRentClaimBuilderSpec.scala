@@ -211,6 +211,22 @@ class StorageRentClaimBuilderSpec extends ErgoCorePropertyTest {
     buildAndValidate(Seq(b)) shouldBe None
   }
 
+  property("a tokenized box at its own minimum may still have a valid rent-burn payout") {
+    val tokenIds = (1 to 10).map(_.toByte)
+    var b = boxWithTokens(10000000000L, Constants.StoragePeriod, tokenIds)
+    while (b.value > minValueOf(b)) {
+      b = boxWithTokens(minValueOf(b), Constants.StoragePeriod, tokenIds)
+    }
+    b.value should be <= minValueOf(b)
+    b.value - feeOf(b) should be <= 0L
+
+    val tx = buildAndValidate(Seq(b)).get
+    tx.inputs.map(_.boxId) should contain(b.id)
+    tx.outputCandidates should have length 1
+    tx.outputCandidates.head.value shouldBe b.value
+    tx.outputCandidates.head.ergoTree shouldBe MinerTree
+  }
+
   property("box at or below the minimum value does not block other claims") {
     val bad = atMinValueBox(Constants.StoragePeriod)
     val good = agedBox(10000000000L)
@@ -436,8 +452,8 @@ class StorageRentClaimBuilderSpec extends ErgoCorePropertyTest {
   }
 
   property("isPermanentlyUnclaimable marks junk and spares claimable boxes") {
-    // value at or below the minimum
-    CandidateGenerator.isPermanentlyUnclaimable(atMinValueBox(Constants.StoragePeriod), parameters, None) shouldBe true
+    // output shape decides whether a minimum-valued box can fund a burn payout
+    CandidateGenerator.isPermanentlyUnclaimable(atMinValueBox(Constants.StoragePeriod), parameters, None) shouldBe false
     // storage fee wrapping non-positive in 32-bit arithmetic
     val tokens = (0 until 70).map(i =>
       (Digest32Coll @@ Colls.fromArray(Array.fill(32)(i.toByte))) -> 1L)

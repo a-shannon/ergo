@@ -34,9 +34,9 @@ import scala.collection.mutable.ArrayBuffer
   *
   * The builder is pure (no I/O): callers pass resolved eligible boxes and get back a
   * transaction ready for block-assembly validation. A box is silently skipped when claiming
-  * it would produce an output the consensus validator rejects: box too young, box value at
-  * or below the minimum allowed value, storage fee wrapping to non-positive in 32-bit
-  * arithmetic (consensus-uncollectable), recreated output below the dust floor or past the
+  * it would produce an output the consensus validator rejects: box too young, storage fee
+  * wrapping to non-positive in 32-bit arithmetic (consensus-uncollectable), recreated output
+  * below the dust floor or past the
   * box size cap, or (EIP-27 networks) a box still carrying re-emission tokens, which is
   * consensus-unclaimable outright. If recreation fees do not
   * clear the dust floor, the recreations are dropped; if nothing remains, no claim is
@@ -115,20 +115,18 @@ object StorageRentClaimBuilder extends ScorexLogging {
       val age = currentHeight - box.creationHeight
       val oldEnough = age >= Constants.StoragePeriod
       val carriesReemissionToken = reemissionTokenIdOpt.exists(box.tokens.contains(_))
-      // minimum allowed value in 32-bit arithmetic; like the storage fee below, it can
-      // wrap to non-positive for huge boxes - such boxes can not be charged safely
-      // (the recreated output's dust floor would be mispriced), so they are skipped
+      // A box at its own minimum can still fund a smaller P2PK output when the storage
+      // fee consumes the entire input. The minimum-value check therefore applies only
+      // to recreation, not to the full-consume branch.
       val minValue = parameters.minValuePerByte * box.bytes.length
-      // a box at or below the minimum allowed value can neither be charged nor recreated;
-      // it is skipped (the caller drops such broken eligibility entries from the index)
       val aboveMinValue = minValue > 0 && box.value > minValue.toLong
-      if (oldEnough && !carriesReemissionToken && aboveMinValue) {
+      if (oldEnough && !carriesReemissionToken) {
         // storage fee in 32-bit arithmetic, exactly as the consensus interpreter computes it;
         // a non-positive fee means the box is consensus-uncollectable and must be skipped
         val storageFee = parameters.storageFeeFactor * box.bytes.length
         if (storageFee > 0) {
           val afterFee = box.value - storageFee
-          if (afterFee > 0) {
+          if (afterFee > 0 && aboveMinValue) {
             // recreate branch: output preserves script/tokens/registers, sits at the current
             // height, carries the value minus the storage fee; the miner keeps the fee
             val outputIndex = claimed.length.toShort
@@ -147,7 +145,7 @@ object StorageRentClaimBuilder extends ScorexLogging {
               sweptFees += box.value - recreatedBox.value
               claimed += ((box, true, recreatedBox))
             }
-          } else {
+          } else if (afterFee <= 0) {
             // full-consume branch: the box can not cover its storage fee - it is destroyed
             // and its non-whitelisted tokens are burned with it; whitelisted tokens are
             // salvaged into the proceeds output. The box gets its own proceeds output

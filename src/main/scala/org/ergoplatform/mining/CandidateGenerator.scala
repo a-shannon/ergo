@@ -28,7 +28,7 @@ import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, ErgoTreePredef, Input}
 import scorex.crypto.authds.{ADDigest, ADKey, SerializedAdProof}
 import scorex.crypto.hash.Digest32
 import scorex.util.encode.Base16
-import scorex.util.{ModifierId, ScorexLogging, bytesToId, idToBytes}
+import scorex.util.{ModifierId, ScorexLogging, idToBytes}
 import sigma.ast.syntax.ErgoBoxRType
 import sigma.Extensions.ArrayOps
 import sigma.crypto.CryptoFacade
@@ -427,21 +427,18 @@ object CandidateGenerator extends ScorexLogging {
     tx.inputs.forall(inp => s.boxById(inp.boxId).isDefined)
 
   /**
-    * Whether a box can never be claimed by storage-rent collection, so its eligibility
-    * entry should be deleted from the index when encountered: value at or below the
-    * minimum allowed value (can neither be charged nor recreated), minimum value or
+    * Whether a box should be skipped by the current storage-rent claim: minimum value or
     * storage fee wrapping non-positive in 32-bit arithmetic (mispriced/uncollectable), or
     * carrying the re-emission token on EIP-27 networks (consensus-unclaimable outright).
-    * Boxes failing these checks are skipped by [[StorageRentClaimBuilder]] anyway; this
-    * predicate only decides which skipped rows may be dropped permanently.
+    * A box at its own minimum is not skipped here because a smaller full-consume output
+    * may still satisfy the dust rule.
     */
   def isPermanentlyUnclaimable(box: ErgoBox,
                                parameters: Parameters,
                                reemissionTokenIdOpt: Option[ModifierId]): Boolean = {
     val minValue = parameters.minValuePerByte * box.bytes.length
     val storageFee = parameters.storageFeeFactor * box.bytes.length
-    minValue <= 0 || box.value <= minValue.toLong ||
-      storageFee <= 0 ||
+    minValue <= 0 || storageFee <= 0 ||
       reemissionTokenIdOpt.exists(box.tokens.contains(_))
   }
 
@@ -708,8 +705,7 @@ object CandidateGenerator extends ScorexLogging {
             // index; entries whose box row is gone resolve to nothing and are skipped.
             // The scan window is wider than the claim cap: the builder stops at
             // MaxClaims CLAIMED boxes, so permanently-unclaimable rows in the window do
-            // not starve later claimable ones - and they are deleted below on encounter,
-            // so the window advances across candidates.
+            // not starve later claimable ones within the scan window.
             val scanned = history.storageRentBoxesAtOrBefore(threshold, 4 * StorageRentClaimBuilder.MaxClaims)
               .toSeq
               .flatMap(entry => NumericBoxIndex.getBoxByNumber(history, entry.globalIndex))
@@ -717,13 +713,8 @@ object CandidateGenerator extends ScorexLogging {
             val params = upcomingContext.currentParameters
             val reemissionTokenIdOpt =
               Option(ergoSettings.chainSettings.reemission.reemissionTokenId).filter(_.nonEmpty)
-            val (unclaimable, eligible) = scanned.partition(b =>
+            val eligible = scanned.filterNot(b =>
               isPermanentlyUnclaimable(b, params, reemissionTokenIdOpt))
-            if (unclaimable.nonEmpty) {
-              log.warn(s"Removing ${unclaimable.length} storage-rent eligibility entries " +
-                s"for permanently unclaimable boxes: ${unclaimable.map(b => bytesToId(b.id))}")
-              history.removeStorageRentBoxes(unclaimable.map(b => bytesToId(b.id)))
-            }
             StorageRentClaimBuilder.buildClaim(
               eligible,
               upcomingHeight,
@@ -754,12 +745,10 @@ object CandidateGenerator extends ScorexLogging {
         500000
       }
 
-      // A storage-rent claim rejected during candidate assembly gets its input boxes dropped
-      // from the storage-rent index, so a broken eligibility entry is not retried in every
-      // candidate. Removal is idempotent, so a claim re-rejected by the retry pass below is
-      // handled by the same code without any extra bookkeeping.
+      // Candidate-local conflicts and transient validation failures cannot change the
+      // persistent unspent index. The extra indexer owns deletion on selected-chain spends.
       def collectPoolTxs: (Seq[ErgoTransaction], Seq[ModifierId]) = {
-        val res = collectTxs(
+        collectTxs(
           minerPk,
           state.stateContext.currentParameters.maxBlockCost - safeGap,
           state.stateContext.currentParameters.maxBlockSize,
@@ -767,15 +756,6 @@ object CandidateGenerator extends ScorexLogging {
           upcomingContext,
           emissionTxs ++ prioritizedTransactions ++ rentClaimTxs ++ poolTxs.map(_.transaction)
         )
-        val rejectedRentClaimTxIds = res._2.filter(id => rentClaimTxs.exists(_.id == id))
-        if (rejectedRentClaimTxIds.nonEmpty) {
-          val boxIds = rentClaimTxs.filter(tx => rejectedRentClaimTxIds.contains(tx.id))
-            .flatMap(tx => tx.inputs.map(in => bytesToId(in.boxId)))
-          log.warn(s"Storage-rent claim transactions $rejectedRentClaimTxIds rejected during candidate assembly, " +
-            s"removing their ${boxIds.length} input boxes from the storage-rent index")
-          history.removeStorageRentBoxes(boxIds)
-        }
-        res
       }
 
       val (txs, toEliminate) = collectPoolTxs
