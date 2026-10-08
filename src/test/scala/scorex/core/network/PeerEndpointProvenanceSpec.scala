@@ -9,13 +9,15 @@ import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{DisconnectedPe
 import org.ergoplatform.network.message.{GetPeersSpec, Message, PeersSpec}
 import org.ergoplatform.network.message.MessageConstants.MessageCode
 import org.ergoplatform.network.peer.{LocalAddressPeerFeature, PeerDatabase, PeerInfo, PeerManagerRef}
-import org.ergoplatform.network.{Handshake, HandshakeSerializer, PeerSpec}
+import org.ergoplatform.network.{Handshake, HandshakeSerializer, PeerSpec, PeerSpecSerializer}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.utils.ErgoNodeTestConstants.{defaultPeerSpec, settings}
+import scorex.db.LDBFactory
 import scorex.core.app.ScorexContext
 import scorex.testkit.utils.AkkaFixture
+import scorex.util.serialization.VLQByteStringWriter
 
-import java.io.File
+import java.io.{ByteArrayOutputStream, File, ObjectOutputStream}
 import java.net.InetSocketAddress
 import scala.concurrent.Await
 import scala.concurrent.duration._
@@ -34,7 +36,9 @@ class PeerEndpointProvenanceSpec extends ErgoCorePropertyTest with DBSpec {
   private class Fixture(maxKnownPeers: Int = 2,
                         allowLocal: Boolean = settings.scorexSettings.network.allowLocal,
                         bindAddress: InetSocketAddress = settings.scorexSettings.network.bindAddress,
-                        persistedPeers: Seq[PeerInfo] = Seq.empty) extends AkkaFixture {
+                        persistedPeers: Seq[PeerInfo] = Seq.empty,
+                        legacyPeers: Seq[PeerInfo] = Seq.empty,
+                        externalNodeAddress: Option[InetSocketAddress] = None) extends AkkaFixture {
     implicit val ec = system.dispatcher
     implicit val actorSystem: ActorSystem = system
 
@@ -55,8 +59,26 @@ class PeerEndpointProvenanceSpec extends ErgoCorePropertyTest with DBSpec {
     initialDb.addOrUpdateKnownPeer(PeerInfo.fromAddress(connected))
     persistedPeers.foreach(info => initialDb.addOrUpdateKnownPeer(info))
     initialDb.close()
+    if (legacyPeers.nonEmpty) {
+      val rawStore = LDBFactory.createKvDb(s"${directory.getAbsolutePath}/peers")
+      try {
+        legacyPeers.foreach { info =>
+          val address = info.peerSpec.address.get
+          val keyStream = new ByteArrayOutputStream()
+          val objectStream = new ObjectOutputStream(keyStream)
+          objectStream.writeObject(address)
+          objectStream.close()
+          val oldWriter = new VLQByteStringWriter
+          oldWriter.putLong(info.lastHandshake)
+          oldWriter.putOption(info.connectionType)((writer, direction) =>
+            writer.putBoolean(direction.isIncoming))
+          PeerSpecSerializer.serialize(info.peerSpec, oldWriter)
+          rawStore.insert(keyStream.toByteArray, oldWriter.toBytes)
+        }
+      } finally rawStore.close()
+    }
 
-    val context = ScorexContext(Seq.empty, None, None)
+    val context = ScorexContext(Seq.empty, None, externalNodeAddress)
     val peerManager: ActorRef = system.actorOf(PeerManagerRef.props(config, context, maxKnownPeers))
     val tcpManager = TestProbe("TcpManager")
     val events = TestProbe("PeerEvents")
@@ -292,6 +314,186 @@ class PeerEndpointProvenanceSpec extends ErgoCorePropertyTest with DBSpec {
       f.allPeers(dialed).verifiedOutboundEndpoint shouldBe true
       query.send(f.peerManager, SeenPeers(10))
       query.expectMsgType[Seq[PeerInfo]].flatMap(_.peerSpec.declaredAddress) should contain(dialed)
+    } finally {
+      Await.result(f.system.terminate(), Duration.Inf)
+      deleteRecursive(f.directory)
+    }
+  }
+
+  property("a legacy local-address feature cannot redirect the outbound dial after reopen") {
+    val historicalHandshake = System.currentTimeMillis() - 24.hours.toMillis
+    val declared = new InetSocketAddress("198.51.100.80", 9080)
+    val redirected = new InetSocketAddress("203.0.113.81", 9081)
+    val plain = new InetSocketAddress("198.51.100.82", 9082)
+    val legacyRedirect = PeerInfo(
+      defaultPeerSpec.copy(
+        declaredAddress = Some(declared),
+        features = Seq(LocalAddressPeerFeature(redirected))
+      ), historicalHandshake, Some(Outgoing)
+    )
+    val legacyPlain = PeerInfo(
+      defaultPeerSpec.copy(declaredAddress = Some(plain)),
+      historicalHandshake, Some(Outgoing)
+    )
+    val f = new Fixture(maxKnownPeers = 5, legacyPeers = Seq(legacyRedirect, legacyPlain))
+    try {
+      val reopened = f.allPeers
+      reopened(declared).verifiedOutboundEndpoint shouldBe false
+      reopened(declared).peerSpec.localAddressOpt shouldBe Some(redirected)
+      reopened(plain).verifiedOutboundEndpoint shouldBe false
+
+      val selector = org.ergoplatform.network.peer.PeerManager.ReceivableMessages
+        .RandomPeerExcluding(Seq.empty)
+      val plainChoice = selector.choose(reopened.filter(_._1 == plain), Seq.empty, f.context).get
+      f.controller ! ConnectTo(plainChoice)
+      f.tcpManager.expectMsgType[Tcp.Connect].remoteAddress shouldBe plain
+
+      val redirectedChoice = selector.choose(reopened.filter(_._1 == declared), Seq.empty, f.context).get
+      f.controller ! ConnectTo(redirectedChoice)
+      f.tcpManager.expectMsgType[Tcp.Connect].remoteAddress shouldBe declared
+    } finally {
+      Await.result(f.system.terminate(), Duration.Inf)
+      deleteRecursive(f.directory)
+    }
+  }
+
+  property("a legacy LAN-only row remains dialable when local peers are enabled") {
+    val local = new InetSocketAddress("192.168.44.83", 9083)
+    val legacy = PeerInfo(
+      defaultPeerSpec.copy(
+        declaredAddress = None,
+        features = Seq(LocalAddressPeerFeature(local))
+      ), System.currentTimeMillis() - 24.hours.toMillis, Some(Outgoing)
+    )
+    val f = new Fixture(maxKnownPeers = 3, allowLocal = true, legacyPeers = Seq(legacy))
+    try {
+      val reopened = f.allPeers(local)
+      reopened.verifiedOutboundEndpoint shouldBe false
+      f.controller ! ConnectTo(reopened)
+      f.tcpManager.expectMsgType[Tcp.Connect].remoteAddress shouldBe local
+    } finally {
+      Await.result(f.system.terminate(), Duration.Inf)
+      deleteRecursive(f.directory)
+    }
+  }
+
+  property("an unverified same-NAT claim cannot dial LAN but an explicit LAN dial can") {
+    val ownExternal = new InetSocketAddress("198.51.100.90", 9030)
+    val peerExternal = new InetSocketAddress(ownExternal.getAddress, 9084)
+    val peerLocal = new InetSocketAddress("192.168.44.84", 9084)
+    val legacy = PeerInfo(
+      defaultPeerSpec.copy(
+        declaredAddress = Some(peerExternal),
+        features = Seq(LocalAddressPeerFeature(peerLocal))
+      ), System.currentTimeMillis() - 24.hours.toMillis, Some(Outgoing)
+    )
+    val f = new Fixture(
+      maxKnownPeers = 5,
+      allowLocal = true,
+      legacyPeers = Seq(legacy),
+      externalNodeAddress = Some(ownExternal)
+    )
+    try {
+      val reopened = f.allPeers(peerExternal)
+      reopened.verifiedOutboundEndpoint shouldBe false
+      f.controller ! ConnectTo(reopened)
+      f.tcpManager.expectNoMessage(500.millis)
+
+      // The operator may explicitly dial a known LAN endpoint. Merely adding
+      // it to knownPeers after this nonempty database is reopened does not seed it.
+      f.controller ! ConnectTo(PeerInfo.fromAddress(peerLocal))
+      f.tcpManager.expectMsgType[Tcp.Connect].remoteAddress shouldBe peerLocal
+    } finally {
+      Await.result(f.system.terminate(), Duration.Inf)
+      deleteRecursive(f.directory)
+    }
+  }
+
+  property("a WAN peer cannot relay private local-address dial candidates") {
+    val public = new InetSocketAddress("198.51.100.93", 9093)
+    val localOnly = new InetSocketAddress("192.168.44.93", 9093)
+    val pairedLocal = new InetSocketAddress("192.168.44.94", 9094)
+    val privateDeclared = new InetSocketAddress("192.168.44.95", 9095)
+    val f = new Fixture(maxKnownPeers = 8, allowLocal = true)
+    try {
+      val source = f.incoming(
+        new InetSocketAddress("203.0.113.92", 5592),
+        defaultPeerSpec.copy(declaredAddress = None)
+      )
+      val relayed = Seq(
+        defaultPeerSpec.copy(
+          declaredAddress = None,
+          features = Seq(LocalAddressPeerFeature(localOnly))
+        ),
+        defaultPeerSpec.copy(
+          declaredAddress = Some(public),
+          features = Seq(LocalAddressPeerFeature(pairedLocal))
+        ),
+        defaultPeerSpec.copy(
+          declaredAddress = Some(privateDeclared),
+          features = Seq.empty
+        )
+      )
+      val network = TestProbe()(f.system)
+      val synchronizer = f.system.actorOf(
+        PeerSynchronizerRef.props(network.ref, f.peerManager, f.config.scorexSettings.network)(f.ec)
+      )
+      val spec = new PeersSpec(f.config.scorexSettings.network.maxPeerSpecObjects)
+      synchronizer ! Message(spec, Left(spec.toBytes(relayed)), Some(source.remote))
+
+      val poll = TestProbe()(f.system)
+      poll.awaitAssert(f.allPeers.keySet should contain(public))
+      f.allPeers.keySet should not contain localOnly
+      f.allPeers.keySet should not contain pairedLocal
+      f.allPeers.keySet should not contain privateDeclared
+      f.allPeers(public).peerSpec.localAddressOpt shouldBe None
+      f.controller ! ConnectTo(f.allPeers(public))
+      f.tcpManager.expectMsgType[Tcp.Connect].remoteAddress shouldBe public
+    } finally {
+      Await.result(f.system.terminate(), Duration.Inf)
+      deleteRecursive(f.directory)
+    }
+  }
+
+  property("a LAN peer can relay separate public and LAN dial candidates") {
+    val sourceAddress = new InetSocketAddress("192.168.44.96", 5596)
+    val public = new InetSocketAddress("198.51.100.96", 9096)
+    val pairedLocal = new InetSocketAddress(sourceAddress.getAddress, 9097)
+    val localOnly = new InetSocketAddress(sourceAddress.getAddress, 9098)
+    val thirdPartyLocal = new InetSocketAddress("192.168.44.97", 9099)
+    val f = new Fixture(maxKnownPeers = 8, allowLocal = true)
+    try {
+      val source = f.incoming(sourceAddress, defaultPeerSpec.copy(declaredAddress = None))
+      val relayed = Seq(
+        defaultPeerSpec.copy(
+          declaredAddress = Some(public),
+          features = Seq(LocalAddressPeerFeature(pairedLocal))
+        ),
+        defaultPeerSpec.copy(
+          declaredAddress = None,
+          features = Seq(LocalAddressPeerFeature(localOnly))
+        ),
+        defaultPeerSpec.copy(
+          declaredAddress = Some(thirdPartyLocal),
+          features = Seq.empty
+        )
+      )
+      val network = TestProbe()(f.system)
+      val synchronizer = f.system.actorOf(
+        PeerSynchronizerRef.props(network.ref, f.peerManager, f.config.scorexSettings.network)(f.ec)
+      )
+      val spec = new PeersSpec(f.config.scorexSettings.network.maxPeerSpecObjects)
+      synchronizer ! Message(spec, Left(spec.toBytes(relayed)), Some(source.remote))
+
+      val poll = TestProbe()(f.system)
+      poll.awaitAssert(f.allPeers.keySet should contain(localOnly))
+      poll.awaitAssert(f.allPeers.keySet should contain(pairedLocal))
+      f.allPeers.keySet should contain(public)
+      f.allPeers.keySet should not contain thirdPartyLocal
+      f.allPeers(public).peerSpec.localAddressOpt shouldBe None
+      f.allPeers(pairedLocal).peerSpec.localAddressOpt shouldBe None
+      f.controller ! ConnectTo(f.allPeers(pairedLocal))
+      f.tcpManager.expectMsgType[Tcp.Connect].remoteAddress shouldBe pairedLocal
     } finally {
       Await.result(f.system.terminate(), Duration.Inf)
       deleteRecursive(f.directory)

@@ -591,23 +591,25 @@ class NetworkController(ergoSettings: ErgoSettings,
   }
 
   /**
-    * Returns local address of peer for local connections and WAN address of peer for
-    * external connections. When local address is not known, try to ask it at the UPnP gateway
+    * Prefer a declared endpoint over an unverified local-address feature.
+    * A peer without a declared endpoint can use its local address when allowed.
+    * For a peer sharing our external IP, try the UPnP gateway mapping.
     *
     * @param peer - known information about peer
     * @return socket address of the peer
     */
   private def getPeerAddress(peer: PeerInfo): Option[InetSocketAddress] = {
-    (peer.peerSpec.localAddressOpt, peer.peerSpec.declaredAddress) match {
-      case (Some(localAddr), _) =>
-        Some(localAddr)
-
-      case (None, Some(declaredAddress))
+    (peer.peerSpec.declaredAddress, peer.peerSpec.localAddressOpt) match {
+      // A stored local-address feature may predate endpoint provenance and was
+      // supplied by the peer. It must not redirect a dial away from a declared
+      // address. LAN-only entries remain dialable when local peers are allowed.
+      case (Some(declaredAddress), _)
         if scorexContext.externalNodeAddress.exists(_.getAddress == declaredAddress.getAddress) =>
 
         scorexContext.upnpGateway.flatMap(_.getLocalAddressForExternalPort(declaredAddress.getPort))
 
-      case _ => peer.peerSpec.declaredAddress
+      case (Some(declaredAddress), _) => Some(declaredAddress)
+      case (None, localAddress) => localAddress
     }
   }
 
