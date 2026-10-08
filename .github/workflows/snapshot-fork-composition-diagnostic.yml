@@ -1,0 +1,60 @@
+name: Snapshot fork control diagnostic
+
+on:
+  push:
+    branches: [feat/snapshot-fork-2671-control-20261008]
+
+permissions:
+  contents: read
+
+jobs:
+  deep-rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: snapshot-fork-sbt-${{ runner.os }}-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
+      - name: Build image and exercise the exact failing integration case
+        timeout-minutes: 43
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic tmp
+          git rev-parse HEAD > diagnostic/commit.txt
+          TMPDIR="$GITHUB_WORKSPACE/tmp" timeout --signal=TERM --kill-after=30s 40m \
+            sbt -Denv=test clean ++2.12.20 docker \
+            'it:testOnly org.ergoplatform.it.DeepRollBackSpec' \
+            2>&1 | tee diagnostic/test.log
+      - name: Save remaining node logs
+        if: failure() || cancelled()
+        run: |
+          mkdir -p diagnostic/containers
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              docker inspect --format '{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' "$id" || true
+              docker logs --timestamps "$id" > "diagnostic/containers/$name.log" 2>&1 || true
+            done
+      - name: Retain the focused evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-fork-composition-${{ github.sha }}
+          path: |
+            diagnostic/
+            target/logs/
+            target/it-reports/
+          if-no-files-found: ignore
+          retention-days: 14
