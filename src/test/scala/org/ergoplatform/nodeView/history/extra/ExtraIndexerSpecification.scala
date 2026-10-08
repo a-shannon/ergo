@@ -24,6 +24,7 @@ import scorex.util.{ModifierId, bytesToId}
 import scorex.db.ByteArrayWrapper
 import spire.implicits.cfor
 
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.{Condition, ReentrantLock}
 import java.nio.ByteBuffer
 import java.nio.file.Files
@@ -88,6 +89,14 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     lock.lock()
     try condition.await()
     finally lock.unlock()
+  }
+
+  def awaitConditionAfter(condition: Condition)(send: => Unit): Unit = {
+    lock.lock()
+    try {
+      send
+      condition.await(2, TimeUnit.MINUTES) shouldBe true
+    } finally lock.unlock()
   }
 
   def manualIndex(limit: Int): (ID_LL, // address -> (erg,tokenSum)
@@ -953,20 +962,16 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
   }
 
   property("storage rent eligibility index") {
-    indexer ! CreateDB(HEIGHT)
-    indexer ! Index()
-    lock.lock()
-    done.await()
+    awaitConditionAfter(created) { indexer ! CreateDB(HEIGHT) }
+    awaitConditionAfter(done) { indexer ! Index() }
     checkRentIndex()
     checkRentIndexAgainstChain(HEIGHT)
     indexer ! Reset()
   }
 
   property("rent index entries are removable by box id") {
-    indexer ! CreateDB(HEIGHT)
-    indexer ! Index()
-    lock.lock()
-    done.await()
+    awaitConditionAfter(created) { indexer ! CreateDB(HEIGHT) }
+    awaitConditionAfter(done) { indexer ! Index() }
 
     val before = history.storageRentBoxesAtOrBefore(Int.MaxValue, Int.MaxValue)
     before.length should be > 2
@@ -994,46 +999,37 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
 
   property("rent index rows are not written when rent collection is off") {
     val noRentIndexer = system.actorOf(Props.create(classOf[ExtraIndexerTestActor], this, Boolean.box(false)))
-    noRentIndexer ! CreateDB(HEIGHT)
-    noRentIndexer ! Index()
-    lock.lock()
-    done.await()
+    awaitConditionAfter(created) { noRentIndexer ! CreateDB(HEIGHT) }
+    awaitConditionAfter(done) { noRentIndexer ! Index() }
+    IndexerState.fromHistory(_history).indexedHeight shouldBe HEIGHT
     // the extra index is fully built, but no storage-rent rows are written
     history.storageRentBoxesAtOrBefore(Int.MaxValue, 1000) shouldBe empty
     noRentIndexer ! Reset()
   }
 
   property("rent index is trimmed to the unspent set after a rollback") {
-    indexer ! CreateDB(HEIGHT)
-    indexer ! Index()
-    lock.lock()
-    done.await()
+    awaitConditionAfter(created) { indexer ! CreateDB(HEIGHT) }
+    awaitConditionAfter(done) { indexer ! Index() }
     checkRentIndexAgainstChain(HEIGHT)
 
     // rolling back discards the blocks that created some boxes, so those rows must go
     val back = BRANCHPOINT
-    indexer ! Rollback(history.bestHeaderIdAtHeight(back).get)
-    lock.lock()
-    done.await()
+    awaitConditionAfter(done) { indexer ! ForceRollback(back) }
 
     checkRentIndexAgainstChain(back)
     indexer ! Reset()
   }
 
   property("rent index stays correct across repeated rollbacks") {
-    indexer ! CreateDB(HEIGHT)
-    indexer ! Index()
-    lock.lock()
-    done.await()
+    awaitConditionAfter(created) { indexer ! CreateDB(HEIGHT) }
+    awaitConditionAfter(done) { indexer ! Index() }
     checkRentIndexAgainstChain(HEIGHT)
 
     // each rollback must re-derive the rent rows of the surviving range only; rolling
     // forward again is separate (the chain generator cannot extend a rolled-back chain,
     // so this covers successive rollbacks, as rollbackWithPattern does)
     Seq(HEIGHT - 10, BRANCHPOINT, 8, 1).foreach { back =>
-      indexer ! Rollback(history.bestHeaderIdAtHeight(back).get)
-      lock.lock()
-      done.await()
+      awaitConditionAfter(done) { indexer ! ForceRollback(back) }
       checkRentIndexAgainstChain(back)
     }
     indexer ! Reset()
