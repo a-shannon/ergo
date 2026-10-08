@@ -8,7 +8,7 @@ import org.ergoplatform.utils.ErgoNodeTestConstants._
 import scorex.db.LDBFactory
 
 import java.io.File
-import java.net.InetSocketAddress
+import java.net.{InetSocketAddress, URL}
 
 class PeerDatabaseSpec extends ErgoCorePropertyTest with DBSpec {
 
@@ -26,6 +26,14 @@ class PeerDatabaseSpec extends ErgoCorePropertyTest with DBSpec {
 
   private def peerInfo(spec: PeerSpec, lastHandshake: Long): PeerInfo = {
     PeerInfo(spec, lastHandshake, None, 0L)
+  }
+
+  private def oversizedPeerInfo(address: InetSocketAddress, lastHandshake: Long): PeerInfo = {
+    val url = RestApiUrlPeerFeature(new URL("http://example.com/" + ("x" * 220)))
+    peerInfo(
+      defaultPeerSpec.copy(declaredAddress = Some(address), features = Seq.fill(80)(url)),
+      lastHandshake
+    )
   }
 
   private def withDb[T](maxKnownPeers: Int = PeerDatabase.MaxKnownPeers)
@@ -234,6 +242,48 @@ class PeerDatabaseSpec extends ErgoCorePropertyTest with DBSpec {
       checkStore.close()
     } finally {
       deleteRecursive(dir)
+    }
+  }
+
+  property("PeerDatabase should reject an oversized peer value before evicting a stored peer") {
+    val dir = createTempDir
+    val dbSettings = testSettings(dir)
+    val stored = new InetSocketAddress("8.8.8.1", 9001)
+    val oversizedAddress = new InetSocketAddress("8.8.8.2", 9002)
+    val oversized = oversizedPeerInfo(oversizedAddress, Long.MaxValue)
+    PeerInfoSerializer.toBytes(oversized).length should be > PeerDatabase.MaxSerializedPeerInfoSize
+    try {
+      val db1 = new PeerDatabase(dbSettings, maxKnownPeers = 1)
+      db1.addOrUpdateKnownPeer(peerInfo(stored, 1L))
+      db1.addOrUpdateKnownPeer(oversized)
+      db1.knownPeers.keys should contain(stored)
+      db1.knownPeers.keys should not contain oversizedAddress
+      db1.close()
+
+      val db2 = new PeerDatabase(dbSettings, maxKnownPeers = 1)
+      db2.knownPeers.keys should contain(stored)
+      db2.knownPeers.keys should not contain oversizedAddress
+      db2.close()
+    } finally {
+      deleteRecursive(dir)
+    }
+  }
+
+  property("PeerDatabase should retain an existing peer when an oversized update arrives") {
+    val address = new InetSocketAddress("8.8.8.3", 9003)
+    val original = peerInfo(address, 1L)
+    withDb() { db =>
+      db.addOrUpdateKnownPeer(original)
+      db.addOrUpdateKnownPeer(oversizedPeerInfo(address, 2L))
+      db.get(address) shouldBe Some(original)
+    }
+  }
+
+  property("PeerDatabase should reject an oversized serialized address before storing it") {
+    val oversizedAddress = InetSocketAddress.createUnresolved("x" * 1100, 9003)
+    withDb() { db =>
+      db.addOrUpdateKnownPeer(peerInfo(oversizedAddress, 1L))
+      db.knownPeers.keys should not contain oversizedAddress
     }
   }
 

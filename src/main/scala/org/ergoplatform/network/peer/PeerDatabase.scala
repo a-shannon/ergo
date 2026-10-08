@@ -184,23 +184,44 @@ final class PeerDatabase(
   ): Unit = {
     if (!peerInfo.peerSpec.declaredAddress.exists(x => isBlacklisted(x.getAddress))) {
       peerInfo.peerSpec.address.foreach { address =>
-        if (peers.contains(address)) {
-          log.debug(s"Updating peer info for $address")
-          updatePeer(address, peerInfo)
-        } else if (peers.size < maxKnownPeers ||
-                   makeRoomForPeer(peerInfo.lastHandshake, connectedPeers)) {
-          log.debug(s"Adding peer info for $address")
-          updatePeer(address, peerInfo)
-        } else {
-          log.debug(s"Peer database is full, ignoring $address")
+        boundedSerializedPeer(address, peerInfo).foreach { case (keyBytes, valueBytes) =>
+          if (peers.contains(address)) {
+            log.debug(s"Updating peer info for $address")
+            updatePeer(address, peerInfo, keyBytes, valueBytes)
+          } else if (peers.size < maxKnownPeers ||
+                     makeRoomForPeer(peerInfo.lastHandshake, connectedPeers)) {
+            log.debug(s"Adding peer info for $address")
+            updatePeer(address, peerInfo, keyBytes, valueBytes)
+          } else {
+            log.debug(s"Peer database is full, ignoring $address")
+          }
         }
       }
     }
   }
 
-  private def updatePeer(address: InetSocketAddress, peerInfo: PeerInfo): Unit = {
+  private def boundedSerializedPeer(
+    address: InetSocketAddress,
+    peerInfo: PeerInfo
+  ): Option[(Array[Byte], Array[Byte])] = {
+    Try(serialize(address) -> PeerInfoSerializer.toBytes(peerInfo)) match {
+      case Success((keyBytes, valueBytes))
+          if keyBytes.length <= PeerDatabase.MaxSerializedPeerAddressSize &&
+             valueBytes.length <= PeerDatabase.MaxSerializedPeerInfoSize =>
+        Some(keyBytes -> valueBytes)
+      case Success((keyBytes, valueBytes)) =>
+        log.warn(s"Ignoring oversized peer record: key=${keyBytes.length}, value=${valueBytes.length}")
+        None
+      case Failure(ex) =>
+        log.warn(s"Ignoring unserializable peer record (${ex.getClass.getSimpleName})")
+        None
+    }
+  }
+
+  private def updatePeer(address: InetSocketAddress, peerInfo: PeerInfo,
+                         keyBytes: Array[Byte], valueBytes: Array[Byte]): Unit = {
     peers += address -> peerInfo
-    persistentStore.insert(serialize(address), PeerInfoSerializer.toBytes(peerInfo))
+    persistentStore.insert(keyBytes, valueBytes)
   }
 
   /**
@@ -390,6 +411,7 @@ object PeerDatabase {
     * Serialized peer info size must stay below this bound. The value is twice
     * the maximum handshake size (8KB) to leave a comfortable margin while still
     * preventing a single malformed/crafted entry from consuming a lot of memory.
+    * Enforced both while loading and before an insertion or update can evict a peer.
     */
   private[peer] val MaxSerializedPeerInfoSize: Int = 16384
 
