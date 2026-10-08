@@ -11,6 +11,7 @@ class LocalPeerFilteringSpecification extends ErgoCorePropertyTest {
   private val siteLocalAddress = new InetSocketAddress("192.168.1.1", 9002)
   private val linkLocalAddress = new InetSocketAddress("169.254.1.1", 9003)
   private val loopbackAddress = new InetSocketAddress("127.0.0.1", 9004)
+  private val uniqueLocalAddress = new InetSocketAddress("fd12:3456::1", 9005)
 
   property("local addresses are correctly classified") {
     NetworkUtils.isLocal(remoteAddress, allowLocal = false) shouldBe false
@@ -18,8 +19,10 @@ class LocalPeerFilteringSpecification extends ErgoCorePropertyTest {
     NetworkUtils.isLocal(siteLocalAddress, allowLocal = false) shouldBe true
     NetworkUtils.isLocal(linkLocalAddress, allowLocal = false) shouldBe true
     NetworkUtils.isLocal(loopbackAddress, allowLocal = false) shouldBe true
+    NetworkUtils.isLocal(uniqueLocalAddress, allowLocal = false) shouldBe true
 
     NetworkUtils.isLocal(siteLocalAddress, allowLocal = true) shouldBe false
+    NetworkUtils.isLocal(uniqueLocalAddress, allowLocal = true) shouldBe false
   }
 
 }

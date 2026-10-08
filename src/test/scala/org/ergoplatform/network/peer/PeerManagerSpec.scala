@@ -110,7 +110,7 @@ class PeerManagerSpec extends ErgoCorePropertyTest with DBSpec {
     }
   }
 
-  property("PeerManager should protect an inbound peer whose advertised address differs from the socket address") {
+  property("PeerManager should not protect an inbound advertised address from old-peer cleanup") {
     withFixture { f =>
       import f._
       // for an inbound connection the transport endpoint carries the peer's ephemeral
@@ -132,7 +132,7 @@ class PeerManagerSpec extends ErgoCorePropertyTest with DBSpec {
       probe.send(peerManager, CleanupOldPeers)
       probe.send(peerManager, GetAllPeers)
       val peers1 = probe.expectMsgType[Map[InetSocketAddress, PeerInfo]]
-      peers1.keys should contain(advertised)
+      peers1.keys should not contain advertised
 
       probe.send(peerManager, DisconnectedPeer(inbound))
       probe.send(peerManager, CleanupOldPeers)

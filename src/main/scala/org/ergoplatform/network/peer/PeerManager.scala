@@ -21,11 +21,13 @@ import scala.util.Random
   * Peer manager takes care of peers connected and in process, and also chooses a random peer to connect
   * Must be singleton
   */
-class PeerManager(settings: ErgoSettings, scorexContext: ScorexContext) extends Actor with ScorexLogging {
+class PeerManager(settings: ErgoSettings,
+                  scorexContext: ScorexContext,
+                  maxKnownPeers: Int = PeerDatabase.MaxKnownPeers) extends Actor with ScorexLogging {
 
   import PeerManager.ReceivableMessages._
 
-  private val peerDatabase = new PeerDatabase(settings)
+  private val peerDatabase = new PeerDatabase(settings, maxKnownPeers)
   private var connectedPeerAddresses = Set.empty[InetSocketAddress]
 
   override def preStart(): Unit = {
@@ -81,20 +83,29 @@ class PeerManager(settings: ErgoSettings, scorexContext: ScorexContext) extends 
         peerDatabase.addOrUpdateKnownPeer(peerInfo, connectedPeerAddresses)
       }
 
+    case AddVerifiedOutboundPeer(peerInfo, dialedAddress) =>
+      // Only the endpoint of an accepted outbound connection is known to answer
+      // at its listening address. The controller removes claimed local features.
+      if (peerInfo.connectionType.exists(_.isOutgoing) &&
+          peerInfo.peerSpec.declaredAddress.contains(dialedAddress) &&
+          peerInfo.peerSpec.localAddressOpt.isEmpty &&
+          !isSelf(dialedAddress) && !isLocal(dialedAddress)) {
+        connectedPeerAddresses += dialedAddress
+        peerDatabase.addOrUpdateKnownPeer(peerInfo, connectedPeerAddresses)
+      }
+
     case CleanupOldPeers =>
       peerDatabase.removeOldPeers(connectedPeerAddresses)
 
     case HandshakedPeer(remote) =>
-      // Track both the transport endpoint and the advertised address (the database
-      // key). For inbound connections they differ: the socket address carries the
-      // peer's ephemeral source port, while the database is keyed by the advertised
-      // listening address from the handshake. Both must be protected from eviction.
-      connectedPeerAddresses += remote.connectionId.remoteAddress
-      remote.peerInfo.flatMap(_.peerSpec.address).foreach(connectedPeerAddresses += _)
+      if (remote.connectionId.direction.isOutgoing) {
+        connectedPeerAddresses += remote.connectionId.remoteAddress
+      }
 
     case DisconnectedPeer(connectedPeer) =>
-      connectedPeerAddresses -= connectedPeer.connectionId.remoteAddress
-      connectedPeer.peerInfo.flatMap(_.peerSpec.address).foreach(connectedPeerAddresses -= _)
+      if (connectedPeer.connectionId.direction.isOutgoing) {
+        connectedPeerAddresses -= connectedPeer.connectionId.remoteAddress
+      }
 
     case Penalize(peer, penaltyType) =>
       log.info(s"$peer penalized, penalty: $penaltyType")
@@ -162,6 +173,8 @@ object PeerManager {
 
     // peerListOperations messages
     case class AddOrUpdatePeer(data: PeerInfo)
+
+    case class AddVerifiedOutboundPeer(data: PeerInfo, dialedAddress: InetSocketAddress)
 
     case class AddPeerIfEmpty(data: PeerSpec)
 
@@ -283,8 +296,10 @@ object PeerManager {
 
 object PeerManagerRef {
 
-  def props(settings: ErgoSettings, scorexContext: ScorexContext): Props = {
-    Props(new PeerManager(settings, scorexContext))
+  def props(settings: ErgoSettings,
+            scorexContext: ScorexContext,
+            maxKnownPeers: Int = PeerDatabase.MaxKnownPeers): Props = {
+    Props(new PeerManager(settings, scorexContext, maxKnownPeers))
   }
 
   def apply(settings: ErgoSettings, scorexContext: ScorexContext)
