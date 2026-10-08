@@ -5,7 +5,7 @@ import org.ergoplatform.nodeView.state.{ErgoStateContext, VotingData}
 import org.ergoplatform.settings.{Constants, ErgoValidationSettingsUpdate, Parameters, ValidationRules}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
-import org.ergoplatform.ErgoBox
+import org.ergoplatform.{ErgoBox, ErgoBoxCandidate}
 import scorex.util.{ModifierId, bytesToId}
 import sigma.Colls
 import sigma.ast.{ErgoTree, ShortConstant}
@@ -623,5 +623,38 @@ class StorageRentClaimBuilderSpec extends ErgoCorePropertyTest {
     // both are recreatable, so the whitelist does not apply and both are recreated
     tx.inputs.length shouldBe 2
     outputTokens(tx) shouldBe (whitelisted.tokens ++ ordinary.tokens)
+  }
+
+  property("full-consume proceeds above the maximum box size are left unclaimed") {
+    val dummyTxId = bytesToId(Array.fill(32)(0.toByte))
+    val value = 10000000L
+    val probes = for {
+      tokenCount <- 90 to 130
+      firstAmount <- Seq(1L, 128L, 16384L, 268435456L)
+    } yield {
+      val tokens = (1 to tokenCount).map { i =>
+        val amount = if (i == 1) firstAmount else 1L
+        (Digest32Coll @@ Colls.fromArray(Array.fill(32)(i.toByte))) -> amount
+      }
+      val box = testBox(value, Constants.TrueTree, H - Constants.StoragePeriod,
+        tokens, Map.empty)
+      val proceeds = new ErgoBoxCandidate(value, MinerTree, H,
+        box.additionalTokens, Map.empty)
+      (box, proceeds, tokenCount, firstAmount)
+    }
+    val witness = probes.find { case (box, proceeds, _, _) =>
+      val fee = parameters.storageFeeFactor * box.bytes.length
+      box.bytes.length <= ErgoBox.MaxBoxSize &&
+        box.value > minValueOf(box) && fee > 0 && box.value <= fee &&
+        proceeds.toBox(dummyTxId, 0).bytes.length > ErgoBox.MaxBoxSize
+    }.getOrElse(fail("bounded token-count search found no near-limit input"))
+
+    val (box, proceeds, tokenCount, firstAmount) = witness
+    info(s"tokenCount=$tokenCount firstAmount=$firstAmount inputBytes=${box.bytes.length} " +
+      s"outputBytes=${proceeds.toBox(dummyTxId, 0).bytes.length} maxBytes=${ErgoBox.MaxBoxSize}")
+    proceeds.toBox(dummyTxId, 0).bytes.length should be > ErgoBox.MaxBoxSize
+    box.value should be >= parameters.minValuePerByte.toLong * proceeds.toBox(dummyTxId, 0).bytes.length
+    StorageRentClaimBuilder.buildClaim(Seq(box), H, parameters,
+      minerPk, None, box.tokens.keySet) shouldBe None
   }
 }

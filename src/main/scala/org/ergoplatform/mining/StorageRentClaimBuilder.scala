@@ -152,8 +152,8 @@ object StorageRentClaimBuilder extends ScorexLogging {
             // and its non-whitelisted tokens are burned with it; whitelisted tokens are
             // salvaged into the proceeds output. The box gets its own proceeds output
             // carrying exactly its value (plus the salvaged tokens) to the miner's P2PK.
-            // A box whose value does not clear the dust floor for such an output can not
-            // be claimed at all and is left behind.
+            // A box whose proceeds do not clear the dust floor or exceed the maximum
+            // box size can not be claimed and is left behind.
             val salvagedTokens: Coll[(ErgoBox.TokenId, Long)] =
               if (tokenWhitelist.isEmpty) {
                 Colls.emptyColl // nothing can be salvaged - skip filtering altogether
@@ -161,7 +161,8 @@ object StorageRentClaimBuilder extends ScorexLogging {
                 box.additionalTokens.filter(t => tokenWhitelist.contains(t._1.toModifierId))
               }
             val burnOutput = new ErgoBoxCandidate(box.value, minerTree, currentHeight, salvagedTokens, Map.empty)
-            if (box.value >= dustLimit(burnOutput, claimed.length.toShort, parameters)) {
+            if (box.value >= dustLimit(burnOutput, claimed.length.toShort, parameters) &&
+              boxSize(burnOutput, claimed.length.toShort) <= ErgoBox.MaxBoxSize) {
               claimed += ((box, false, burnOutput))
             }
           }
