@@ -49,6 +49,18 @@ final class PeerDatabase(
         Map.empty[InetSocketAddress, PeerInfo]
     }
 
+  private def gossipEligible(address: InetSocketAddress, info: PeerInfo): Boolean =
+    info.verifiedOutboundEndpoint &&
+      info.connectionType.exists(_.isOutgoing) &&
+      info.lastHandshake > 0L &&
+      info.peerSpec.declaredAddress.contains(address) &&
+      info.peerSpec.localAddressOpt.isEmpty
+
+  // Keep selection bounded even while most upgraded rows still lack endpoint proof.
+  private var verifiedPeerIndex = peers.filter { case (address, info) =>
+    gossipEligible(address, info)
+  }
+
   /**
     * penalized peer ip -> (accumulated penalty score, last penalty timestamp)
     */
@@ -181,6 +193,29 @@ final class PeerDatabase(
   def addOrUpdateKnownPeer(
     peerInfo: PeerInfo,
     connectedPeers: Set[InetSocketAddress] = Set.empty
+  ): Unit = addOrUpdateKnownPeerInternal(
+    peerInfo.copy(verifiedOutboundEndpoint = false), connectedPeers
+  )
+
+  private[peer] def addOrUpdateVerifiedOutboundPeer(
+    peerInfo: PeerInfo,
+    dialedAddress: InetSocketAddress,
+    connectedPeers: Set[InetSocketAddress]
+  ): Unit = {
+    if (peerInfo.connectionType.exists(_.isOutgoing) &&
+        peerInfo.lastHandshake > 0L &&
+        peerInfo.peerSpec.declaredAddress.contains(dialedAddress) &&
+        peerInfo.peerSpec.address.contains(dialedAddress) &&
+        peerInfo.peerSpec.localAddressOpt.isEmpty) {
+      addOrUpdateKnownPeerInternal(
+        peerInfo.copy(verifiedOutboundEndpoint = true), connectedPeers
+      )
+    }
+  }
+
+  private def addOrUpdateKnownPeerInternal(
+    peerInfo: PeerInfo,
+    connectedPeers: Set[InetSocketAddress]
   ): Unit = {
     if (!peerInfo.peerSpec.declaredAddress.exists(x => isBlacklisted(x.getAddress))) {
       peerInfo.peerSpec.address.foreach { address =>
@@ -221,6 +256,11 @@ final class PeerDatabase(
   private def updatePeer(address: InetSocketAddress, peerInfo: PeerInfo,
                          keyBytes: Array[Byte], valueBytes: Array[Byte]): Unit = {
     peers += address -> peerInfo
+    if (gossipEligible(address, peerInfo)) {
+      verifiedPeerIndex += address -> peerInfo
+    } else {
+      verifiedPeerIndex -= address
+    }
     persistentStore.insert(keyBytes, valueBytes)
   }
 
@@ -313,10 +353,13 @@ final class PeerDatabase(
 
   def remove(address: InetSocketAddress): Unit = {
     peers -= address
+    verifiedPeerIndex -= address
     persistentStore.remove(Array(serialize(address)))
   }
 
   def knownPeers: Map[InetSocketAddress, PeerInfo] = peers
+
+  private[peer] def verifiedPeers: Map[InetSocketAddress, PeerInfo] = verifiedPeerIndex
 
   /**
     * Close the underlying persistent store.

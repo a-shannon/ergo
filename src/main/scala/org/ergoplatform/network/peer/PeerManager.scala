@@ -87,11 +87,13 @@ class PeerManager(settings: ErgoSettings,
       // Only the endpoint of an accepted outbound connection is known to answer
       // at its listening address. The controller removes claimed local features.
       if (peerInfo.connectionType.exists(_.isOutgoing) &&
+          peerInfo.lastHandshake > 0L &&
           peerInfo.peerSpec.declaredAddress.contains(dialedAddress) &&
           peerInfo.peerSpec.localAddressOpt.isEmpty &&
           !isSelf(dialedAddress) && !isLocal(dialedAddress)) {
         connectedPeerAddresses += dialedAddress
-        peerDatabase.addOrUpdateKnownPeer(peerInfo, connectedPeerAddresses)
+        peerDatabase.addOrUpdateVerifiedOutboundPeer(peerInfo, dialedAddress,
+          connectedPeerAddresses)
       }
 
     case CleanupOldPeers =>
@@ -126,6 +128,9 @@ class PeerManager(settings: ErgoSettings,
     case RemovePeer(address) =>
       log.info(s"$address removed from peers database")
       peerDatabase.remove(address)
+
+    case get: SeenPeers =>
+      sender() ! get.choose(peerDatabase.verifiedPeers, peerDatabase.blacklistedPeers, scorexContext)
 
     case get: GetPeers[_] =>
       sender() ! get.choose(peerDatabase.knownPeers, peerDatabase.blacklistedPeers, scorexContext)
@@ -196,9 +201,9 @@ object PeerManager {
       *
       * Used in peer propagation: peers chosen are recommended to a peer asking our node about more peers.
       *
-      * Note: only a bounded window of the database is scanned. If that window happens
-      * to contain no eligible peers, the result is empty even when eligible peers exist
-      * elsewhere in the database. This is an accepted bounded-work tradeoff.
+      * Note: only a bounded window of proof-eligible peers is scanned. If the
+      * window contains only currently blacklisted peers, the result can be empty
+      * even when other eligible peers exist. This is an accepted bounded-work tradeoff.
       */
     case class SeenPeers(howMany: Int) extends GetPeers[Seq[PeerInfo]] with ScorexLogging {
 
@@ -229,12 +234,18 @@ object PeerManager {
           def isBlacklisted(p: PeerInfo): Boolean =
             blacklistedPeers.exists(ip => p.peerSpec.declaredAddress.exists(_.getAddress == ip))
 
-          val candidates = knownPeers.valuesIterator
+          // Recheck stored proof and row shape even when the database passes its index.
+          val candidates = knownPeers.iterator
             .drop(start)
             .take(window)
             .toSeq
-            .filter { p =>
-              (p.connectionType.isDefined || p.lastHandshake > 0) && !isBlacklisted(p)
+            .collect { case (address, p)
+                if p.verifiedOutboundEndpoint &&
+                   p.connectionType.exists(_.isOutgoing) &&
+                   p.lastHandshake > 0L &&
+                   p.peerSpec.declaredAddress.contains(address) &&
+                   p.peerSpec.localAddressOpt.isEmpty &&
+                   !isBlacklisted(p) => p
             }
 
           val recentCandidates = candidates.filter(_.lastStoredActivityTime > cutoff)

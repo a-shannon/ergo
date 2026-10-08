@@ -1,11 +1,13 @@
 package org.ergoplatform.network.peer
 
 import org.ergoplatform.db.DBSpec
-import org.ergoplatform.network.PeerSpec
+import org.ergoplatform.network.{PeerSpec, PeerSpecSerializer}
 import org.ergoplatform.settings.ErgoSettings
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.utils.ErgoNodeTestConstants._
 import scorex.db.LDBFactory
+import scorex.core.network.Outgoing
+import scorex.util.serialization.VLQByteStringWriter
 
 import java.io.File
 import java.net.{InetSocketAddress, URL}
@@ -142,6 +144,75 @@ class PeerDatabaseSpec extends ErgoCorePropertyTest with DBSpec {
     }
   }
 
+  property("PeerInfoSerializer should read pre-proof rows as unverified and reject invalid trailers") {
+    val address = new InetSocketAddress("8.8.8.9", 9009)
+    val info = peerInfo(address, 123456789L).copy(connectionType = Some(Outgoing))
+    // Build the old record independently: handshake, direction, then PeerSpec, no proof byte.
+    val oldWriter = new VLQByteStringWriter
+    oldWriter.putLong(info.lastHandshake)
+    oldWriter.putOption(info.connectionType)((writer, direction) =>
+      writer.putBoolean(direction.isIncoming))
+    PeerSpecSerializer.serialize(info.peerSpec, oldWriter)
+    val oldBytes = oldWriter.toBytes
+
+    val parsed = PeerInfoSerializer.parseBytesTry(oldBytes).get
+    parsed shouldBe info
+    parsed.verifiedOutboundEndpoint shouldBe false
+    val rewritten = PeerInfoSerializer.toBytes(parsed)
+    rewritten.length shouldBe oldBytes.length + 1
+    rewritten.dropRight(1).sameElements(oldBytes) shouldBe true
+    rewritten.last shouldBe 0.toByte
+
+    PeerInfoSerializer.parseBytesTry(oldBytes :+ 1.toByte).get
+      .verifiedOutboundEndpoint shouldBe true
+    PeerInfoSerializer.parseBytesTry(oldBytes :+ 2.toByte).isFailure shouldBe true
+    PeerInfoSerializer.parseBytesTry(oldBytes ++ Array[Byte](0, 0)).isFailure shouldBe true
+  }
+
+  property("generic peer update clears verified proof even with a local redirect") {
+    val dir = createTempDir
+    val dbSettings = testSettings(dir)
+    val address = new InetSocketAddress("8.8.8.10", 9010)
+    val redirect = new InetSocketAddress("192.168.1.10", 9010)
+    val verified = peerInfo(address, 123456789L)
+      .copy(connectionType = Some(Outgoing), verifiedOutboundEndpoint = true)
+    try {
+      val db1 = new PeerDatabase(dbSettings)
+      db1.addOrUpdateVerifiedOutboundPeer(verified, address, Set.empty)
+      db1.get(address).get.verifiedOutboundEndpoint shouldBe true
+      db1.verifiedPeers.keySet shouldBe Set(address)
+
+      val wrongKey = verified.copy(peerSpec = verified.peerSpec.copy(
+        declaredAddress = Some(redirect)))
+      db1.addOrUpdateVerifiedOutboundPeer(wrongKey, address, Set.empty)
+      db1.get(redirect) shouldBe None
+      val untrustedRedirect = verified.copy(peerSpec = verified.peerSpec.copy(
+        features = Seq(LocalAddressPeerFeature(redirect))))
+      db1.addOrUpdateVerifiedOutboundPeer(untrustedRedirect, address, Set.empty)
+      db1.get(address).get.peerSpec.localAddressOpt shouldBe None
+
+      db1.addOrUpdateKnownPeer(untrustedRedirect)
+      db1.get(address).get.verifiedOutboundEndpoint shouldBe false
+      db1.get(address).get.peerSpec.localAddressOpt shouldBe Some(redirect)
+      db1.verifiedPeers shouldBe empty
+
+      db1.addOrUpdateVerifiedOutboundPeer(verified, address, Set.empty)
+      db1.verifiedPeers.keySet shouldBe Set(address)
+      db1.remove(address)
+      db1.verifiedPeers shouldBe empty
+      db1.addOrUpdateKnownPeer(untrustedRedirect)
+      db1.close()
+
+      val db2 = new PeerDatabase(dbSettings)
+      db2.get(address).get.verifiedOutboundEndpoint shouldBe false
+      db2.get(address).get.peerSpec.localAddressOpt shouldBe Some(redirect)
+      db2.verifiedPeers shouldBe empty
+      db2.close()
+    } finally {
+      deleteRecursive(dir)
+    }
+  }
+
   property("PeerDatabase should not reload removed peers") {
     val dir = createTempDir
     val dbSettings = testSettings(dir)
@@ -266,6 +337,45 @@ class PeerDatabaseSpec extends ErgoCorePropertyTest with DBSpec {
       db2.close()
     } finally {
       deleteRecursive(dir)
+    }
+  }
+
+  property("a proof byte above the exact peer-row cap is rejected before storage") {
+    val address = new InetSocketAddress("8.8.8.11", 9011)
+    val baseUrl = "http://a.b/"
+    val maxPadding = 255 - baseUrl.length
+    def feature(padding: Int): RestApiUrlPeerFeature =
+      RestApiUrlPeerFeature(new URL(baseUrl + ("x" * padding)))
+    def sizedPeer(longFeatures: Int, firstPadding: Int, secondPadding: Int): PeerInfo =
+      peerInfo(defaultPeerSpec.copy(
+        declaredAddress = Some(address),
+        features = Seq.fill(longFeatures)(feature(maxPadding)) ++
+          Seq(feature(firstPadding), feature(secondPadding))
+      ), 1L)
+
+    val cap = PeerDatabase.MaxSerializedPeerInfoSize
+    val longFeatures = (0 to 125).find { count =>
+      val gap = cap + 1 - PeerInfoSerializer.toBytes(sizedPeer(count, 0, 0)).length
+      gap >= 0 && gap <= 2 * maxPadding
+    }.get
+    val gap = cap + 1 - PeerInfoSerializer.toBytes(sizedPeer(longFeatures, 0, 0)).length
+    val overCap = (math.max(0, gap - 4) to gap).iterator.flatMap { totalPadding =>
+      (0 to maxPadding).iterator.flatMap { firstPadding =>
+        val secondPadding = totalPadding - firstPadding
+        if (secondPadding >= 0 && secondPadding <= maxPadding) {
+          Some(sizedPeer(longFeatures, firstPadding, secondPadding))
+        } else None
+      }
+    }.find(info => PeerInfoSerializer.toBytes(info).length == cap + 1).get
+    val bytes = PeerInfoSerializer.toBytes(overCap)
+    bytes.length shouldBe cap + 1
+    val oldBytes = bytes.dropRight(1)
+    oldBytes.length shouldBe cap
+    PeerInfoSerializer.parseBytesTry(oldBytes).get.verifiedOutboundEndpoint shouldBe false
+
+    withDb() { db =>
+      db.addOrUpdateKnownPeer(overCap)
+      db.get(address) shouldBe None
     }
   }
 

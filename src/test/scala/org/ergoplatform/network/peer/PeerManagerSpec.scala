@@ -66,6 +66,12 @@ class PeerManagerSpec extends ErgoCorePropertyTest with DBSpec {
       lastActivity
     )
 
+  private def seenPeerInfo(address: InetSocketAddress,
+                           lastActivity: Long = 0L): PeerInfo =
+    peerInfo(address, lastHandshake = 1L, connectionType = Some(Outgoing),
+      lastActivity = lastActivity)
+      .copy(verifiedOutboundEndpoint = true)
+
   private def address(i: Int): InetSocketAddress = new InetSocketAddress(s"8.8.${i / 256}.${i % 256}", 9000 + i)
 
   private def seenPeers(howMany: Int,
@@ -170,14 +176,14 @@ class PeerManagerSpec extends ErgoCorePropertyTest with DBSpec {
   }
 
   property("SeenPeers should return at most howMany peers") {
-    val peers = (1 to 10).map(i => address(i) -> peerInfo(address(i), lastHandshake = 1L)).toMap
+    val peers = (1 to 10).map(i => address(i) -> seenPeerInfo(address(i))).toMap
     val chosen = seenPeers(3, peers)
     chosen.size should be <= 3
     chosen.size should be > 0
   }
 
   property("SeenPeers should not return peers with neither handshake nor connection type") {
-    val good = (1 to 5).map(i => address(i) -> peerInfo(address(i), lastHandshake = 1L)).toMap
+    val good = (1 to 5).map(i => address(i) -> seenPeerInfo(address(i))).toMap
     val bad = (6 to 10).map(i => address(i) -> peerInfo(address(i))).toMap
     val chosen = seenPeers(10, good ++ bad)
     chosen.map(_.peerSpec.declaredAddress.get).toSet.intersect(bad.keys.toSet) shouldBe empty
@@ -187,7 +193,7 @@ class PeerManagerSpec extends ErgoCorePropertyTest with DBSpec {
   property("SeenPeers should exclude blacklisted peers") {
     val peers = (1 to 10).map { i =>
       val addr = address(i)
-      addr -> peerInfo(addr, lastHandshake = 1L)
+      addr -> seenPeerInfo(addr)
     }.toMap
     val blacklistedIp = InetAddress.getByName("8.8.8.1")
     val chosen = (1 to 100).flatMap(_ => seenPeers(10, peers, Seq(blacklistedIp))).toSet
@@ -196,34 +202,34 @@ class PeerManagerSpec extends ErgoCorePropertyTest with DBSpec {
 
   property("SeenPeers should prefer recently active peers") {
     val now = System.currentTimeMillis()
-    val recent = (1 to 5).map(i => address(i) -> peerInfo(address(i), lastHandshake = 1L, lastActivity = now)).toMap
-    val old = (6 to 10).map(i => address(i) -> peerInfo(address(i), lastHandshake = 1L, lastActivity = 0L)).toMap
+    val recent = (1 to 5).map(i => address(i) -> seenPeerInfo(address(i), now)).toMap
+    val old = (6 to 10).map(i => address(i) -> seenPeerInfo(address(i))).toMap
     val chosen = seenPeers(10, recent ++ old)
     chosen.size shouldBe 5
     chosen.map(_.lastStoredActivityTime).toSet should contain only now
   }
 
   property("SeenPeers should be able to reach any peer in a small DB over multiple calls") {
-    val peers = (1 to 50).map(i => address(i) -> peerInfo(address(i), lastHandshake = 1L)).toMap
+    val peers = (1 to 50).map(i => address(i) -> seenPeerInfo(address(i))).toMap
     val returned = (1 to 200).flatMap(_ => seenPeers(5, peers)).map(_.peerSpec.declaredAddress.get).toSet
     returned.size should be >= 45
   }
 
   property("SeenPeers should handle a large DB without materializing the full map") {
-    val peers = (1 to 5000).map(i => address(i) -> peerInfo(address(i), lastHandshake = 1L)).toMap
+    val peers = (1 to 5000).map(i => address(i) -> seenPeerInfo(address(i))).toMap
     val chosen = seenPeers(8, peers)
     chosen.size shouldBe 8
     chosen.toSet.size shouldBe 8
   }
 
   property("SeenPeers should return all peers when howMany exceeds eligible count") {
-    val peers = (1 to 5).map(i => address(i) -> peerInfo(address(i), lastHandshake = 1L)).toMap
+    val peers = (1 to 5).map(i => address(i) -> seenPeerInfo(address(i))).toMap
     seenPeers(10, peers).size shouldBe 5
   }
 
   property("SeenPeers may skip eligible peers outside the bounded scan window") {
     val eligibleAddr = address(1)
-    val eligible = Map(eligibleAddr -> peerInfo(eligibleAddr, lastHandshake = 1L))
+    val eligible = Map(eligibleAddr -> seenPeerInfo(eligibleAddr))
     // all other peers are ineligible (never handshaked, no connection record)
     val ineligible = (2 to 2000).map(i => address(i) -> peerInfo(address(i))).toMap
     val peers = eligible ++ ineligible
@@ -234,6 +240,25 @@ class PeerManagerSpec extends ErgoCorePropertyTest with DBSpec {
     val chosen = (1 to 20).flatMap(_ => seenPeers(5, peers))
     chosen.size should be <= 20
     chosen.forall(_.peerSpec.declaredAddress.contains(eligibleAddr)) shouldBe true
+  }
+
+  property("SeenPeers requires proof for the exact row without a local redirect") {
+    val valid = seenPeerInfo(address(1))
+    val wrongAddress = seenPeerInfo(address(2)).copy(peerSpec = peerSpec(address(3)))
+    val localRedirect = seenPeerInfo(address(3)).copy(peerSpec = peerSpec(address(3)).copy(
+      features = Seq(LocalAddressPeerFeature(address(7)))))
+    val inbound = seenPeerInfo(address(4)).copy(connectionType = Some(Incoming))
+    val noHandshake = seenPeerInfo(address(5)).copy(lastHandshake = 0L)
+    val noProof = seenPeerInfo(address(6)).copy(verifiedOutboundEndpoint = false)
+    val peers = Map(
+      address(1) -> valid,
+      address(2) -> wrongAddress,
+      address(3) -> localRedirect,
+      address(4) -> inbound,
+      address(5) -> noHandshake,
+      address(6) -> noProof
+    )
+    seenPeers(10, peers) shouldBe Seq(valid)
   }
 
 }

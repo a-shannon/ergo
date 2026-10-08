@@ -6,7 +6,7 @@ import akka.testkit.{TestActorRef, TestProbe}
 import akka.util.ByteString
 import org.ergoplatform.db.DBSpec
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{DisconnectedPeer, HandshakedPeer}
-import org.ergoplatform.network.message.{GetPeersSpec, Message}
+import org.ergoplatform.network.message.{GetPeersSpec, Message, PeersSpec}
 import org.ergoplatform.network.message.MessageConstants.MessageCode
 import org.ergoplatform.network.peer.{LocalAddressPeerFeature, PeerDatabase, PeerInfo, PeerManagerRef}
 import org.ergoplatform.network.{Handshake, HandshakeSerializer, PeerSpec}
@@ -23,7 +23,7 @@ import scala.concurrent.duration._
 class PeerEndpointProvenanceSpec extends ErgoCorePropertyTest with DBSpec {
 
   import org.ergoplatform.network.peer.PeerManager.ReceivableMessages.{GetAllPeers, SeenPeers}
-  import scorex.core.network.NetworkController.ReceivableMessages.ConnectTo
+  import scorex.core.network.NetworkController.ReceivableMessages.{ConnectTo, SendToNetwork}
 
   private val claimed = new InetSocketAddress("198.51.100.20", 9030)
   private val connected = new InetSocketAddress("203.0.113.21", 9031)
@@ -33,7 +33,8 @@ class PeerEndpointProvenanceSpec extends ErgoCorePropertyTest with DBSpec {
 
   private class Fixture(maxKnownPeers: Int = 2,
                         allowLocal: Boolean = settings.scorexSettings.network.allowLocal,
-                        bindAddress: InetSocketAddress = settings.scorexSettings.network.bindAddress) extends AkkaFixture {
+                        bindAddress: InetSocketAddress = settings.scorexSettings.network.bindAddress,
+                        persistedPeers: Seq[PeerInfo] = Seq.empty) extends AkkaFixture {
     implicit val ec = system.dispatcher
     implicit val actorSystem: ActorSystem = system
 
@@ -52,6 +53,7 @@ class PeerEndpointProvenanceSpec extends ErgoCorePropertyTest with DBSpec {
     private val initialDb = new PeerDatabase(config, maxKnownPeers)
     initialDb.addOrUpdateKnownPeer(PeerInfo.fromAddress(claimed).copy(lastHandshake = oldHandshake))
     initialDb.addOrUpdateKnownPeer(PeerInfo.fromAddress(connected))
+    persistedPeers.foreach(info => initialDb.addOrUpdateKnownPeer(info))
     initialDb.close()
 
     val context = ScorexContext(Seq.empty, None, None)
@@ -173,6 +175,7 @@ class PeerEndpointProvenanceSpec extends ErgoCorePropertyTest with DBSpec {
       stored(dialed).peerSpec.localAddressOpt shouldBe None
       stored(dialed).connectionType shouldBe Some(Outgoing)
       stored(dialed).lastHandshake should be > 0L
+      stored(dialed).verifiedOutboundEndpoint shouldBe true
       f.connectedPeers.size shouldBe 3
     } finally {
       Await.result(f.system.terminate(), Duration.Inf)
@@ -196,6 +199,7 @@ class PeerEndpointProvenanceSpec extends ErgoCorePropertyTest with DBSpec {
       candidate.connectionType shouldBe None
       candidate.peerSpec.declaredAddress shouldBe Some(candidateAddress)
       candidate.peerSpec.localAddressOpt shouldBe None
+      candidate.verifiedOutboundEndpoint shouldBe false
       f.allPeers(claimed).lastHandshake shouldBe f.oldHandshake
 
       val query = TestProbe()(f.system)
@@ -207,6 +211,161 @@ class PeerEndpointProvenanceSpec extends ErgoCorePropertyTest with DBSpec {
       verified.lastHandshake should be > 0L
       verified.connectionType shouldBe Some(Outgoing)
       verified.peerSpec.address shouldBe Some(candidateAddress)
+      verified.verifiedOutboundEndpoint shouldBe true
+    } finally {
+      Await.result(f.system.terminate(), Duration.Inf)
+      deleteRecursive(f.directory)
+    }
+  }
+
+  property("reloaded legacy rows stay dialable but do not reach peer gossip") {
+    val historicalHandshake = System.currentTimeMillis() - 24.hours.toMillis
+    val legacyInboundAddress = new InetSocketAddress("8.8.8.61", 9061)
+    val legacyOutboundAddress = new InetSocketAddress("8.8.8.62", 9062)
+    val legacyInbound = PeerInfo(
+      defaultPeerSpec.copy(declaredAddress = Some(legacyInboundAddress)),
+      historicalHandshake,
+      Some(Incoming)
+    )
+    val legacyOutbound = PeerInfo(
+      defaultPeerSpec.copy(declaredAddress = Some(legacyOutboundAddress)),
+      historicalHandshake,
+      Some(Outgoing)
+    )
+    val f = new Fixture(maxKnownPeers = 5, persistedPeers = Seq(legacyInbound, legacyOutbound))
+    try {
+      // The manager opened the same store after the seed database was closed.
+      val reopened = f.allPeers
+      reopened(legacyInboundAddress).connectionType shouldBe Some(Incoming)
+      reopened(legacyOutboundAddress).connectionType shouldBe Some(Outgoing)
+      reopened(legacyInboundAddress).lastHandshake shouldBe historicalHandshake
+      reopened(legacyOutboundAddress).lastHandshake shouldBe historicalHandshake
+      reopened(legacyInboundAddress).verifiedOutboundEndpoint shouldBe false
+      reopened(legacyOutboundAddress).verifiedOutboundEndpoint shouldBe false
+
+      val selection = org.ergoplatform.network.peer.PeerManager.ReceivableMessages
+        .RandomPeerExcluding(Seq.empty).choose(
+          reopened.filter { case (address, _) =>
+            address == legacyInboundAddress || address == legacyOutboundAddress
+          },
+          Seq.empty,
+          f.context
+        )
+      selection.flatMap(_.peerSpec.declaredAddress).get should (
+        be(legacyInboundAddress) or be(legacyOutboundAddress)
+      )
+
+      val inboundSource = new InetSocketAddress(connected.getAddress, 55013)
+      val inbound = f.incoming(
+        inboundSource,
+        defaultPeerSpec.copy(declaredAddress = Some(connected))
+      )
+      inbound.remote.connectionId.direction shouldBe Incoming
+
+      val query = TestProbe()(f.system)
+      query.send(f.peerManager, SeenPeers(10))
+      val chosen = query.expectMsgType[Seq[PeerInfo]].flatMap(_.peerSpec.declaredAddress).toSet
+      chosen should not contain legacyInboundAddress
+      chosen should not contain legacyOutboundAddress
+
+      val network = TestProbe()(f.system)
+      val synchronizer = f.system.actorOf(
+        PeerSynchronizerRef.props(network.ref, f.peerManager, f.config.scorexSettings.network)(f.ec)
+      )
+      synchronizer ! Message[Unit](GetPeersSpec, Left(Array.empty[Byte]), Some(inbound.remote))
+      val sent = network.fishForMessage(5.seconds) {
+        case SendToNetwork(message, _) if message.spec.messageCode == PeersSpec.messageCode => true
+        case _ => false
+      }.asInstanceOf[SendToNetwork]
+      // This observes the synchronizer output, not TCP delivery or wire serialization.
+      sent.sendingStrategy shouldBe SendToPeer(inbound.remote)
+      val shared = sent.message.input.right.get.asInstanceOf[Seq[PeerSpec]]
+        .flatMap(_.declaredAddress).toSet
+      shared should not contain legacyInboundAddress
+      shared should not contain legacyOutboundAddress
+
+      // The controller-accepted outbound handshake is the positive control after legacy selection.
+      val accepted = f.outgoing(dialed, defaultPeerSpec.copy(declaredAddress = Some(dialed)))
+      accepted.remote.connectionId.direction shouldBe Outgoing
+      f.allPeers(dialed).connectionType shouldBe Some(Outgoing)
+      f.allPeers(dialed).lastHandshake should be > historicalHandshake
+      f.allPeers(dialed).verifiedOutboundEndpoint shouldBe true
+      query.send(f.peerManager, SeenPeers(10))
+      query.expectMsgType[Seq[PeerInfo]].flatMap(_.peerSpec.declaredAddress) should contain(dialed)
+    } finally {
+      Await.result(f.system.terminate(), Duration.Inf)
+      deleteRecursive(f.directory)
+    }
+  }
+
+  property("an alternate outbound advertisement stays unverified beside the dialed endpoint") {
+    val f = new Fixture(maxKnownPeers = 4)
+    try {
+      f.outgoing(dialed, defaultPeerSpec.copy(declaredAddress = Some(otherClaim)))
+      val stored = f.allPeers
+      stored(dialed).verifiedOutboundEndpoint shouldBe true
+      stored(dialed).peerSpec.declaredAddress shouldBe Some(dialed)
+      stored(otherClaim).verifiedOutboundEndpoint shouldBe false
+
+      val query = TestProbe()(f.system)
+      query.send(f.peerManager, SeenPeers(10))
+      val shared = query.expectMsgType[Seq[PeerInfo]].flatMap(_.peerSpec.declaredAddress)
+      shared should contain(dialed)
+      shared should not contain otherClaim
+    } finally {
+      Await.result(f.system.terminate(), Duration.Inf)
+      deleteRecursive(f.directory)
+    }
+  }
+
+  property("verified outbound endpoint survives database and actor-system reopen") {
+    val f = new Fixture(maxKnownPeers = 3)
+    var restartedSystem: Option[ActorSystem] = None
+    try {
+      f.outgoing(dialed, defaultPeerSpec.copy(declaredAddress = Some(dialed)))
+      f.allPeers(dialed).verifiedOutboundEndpoint shouldBe true
+      Await.result(f.system.terminate(), Duration.Inf)
+
+      val reopenedDb = new PeerDatabase(f.config, 3)
+      try {
+        reopenedDb.get(dialed).get.verifiedOutboundEndpoint shouldBe true
+      } finally {
+        reopenedDb.close()
+      }
+
+      val restarted = ActorSystem("PeerEndpointProvenanceRestart")
+      restartedSystem = Some(restarted)
+      val manager = restarted.actorOf(PeerManagerRef.props(f.config, f.context, 3))
+      val query = TestProbe()(restarted)
+      query.send(manager, GetAllPeers)
+      val reopened = query.expectMsgType[Map[InetSocketAddress, PeerInfo]]
+      reopened(dialed).verifiedOutboundEndpoint shouldBe true
+      query.send(manager, SeenPeers(10))
+      query.expectMsgType[Seq[PeerInfo]].flatMap(_.peerSpec.declaredAddress) should contain(dialed)
+    } finally {
+      restartedSystem.foreach(s => Await.result(s.terminate(), Duration.Inf))
+      Await.result(f.system.terminate(), Duration.Inf)
+      deleteRecursive(f.directory)
+    }
+  }
+
+  property("one verified outbound endpoint remains reachable among many legacy rows") {
+    val historicalHandshake = System.currentTimeMillis() - 24.hours.toMillis
+    val legacyPeers = (1 to 2048).map { i =>
+      val address = new InetSocketAddress(s"198.18.${i / 256}.${i % 256}", 9000 + i)
+      PeerInfo(defaultPeerSpec.copy(declaredAddress = Some(address)),
+        historicalHandshake, Some(Outgoing))
+    }
+    val f = new Fixture(maxKnownPeers = 2051, persistedPeers = legacyPeers)
+    try {
+      f.outgoing(dialed, defaultPeerSpec.copy(declaredAddress = Some(dialed)))
+      f.allPeers.size shouldBe 2051
+
+      val query = TestProbe()(f.system)
+      (1 to 8).foreach { _ =>
+        query.send(f.peerManager, SeenPeers(8))
+        query.expectMsgType[Seq[PeerInfo]].flatMap(_.peerSpec.declaredAddress) shouldBe Seq(dialed)
+      }
     } finally {
       Await.result(f.system.terminate(), Duration.Inf)
       deleteRecursive(f.directory)
