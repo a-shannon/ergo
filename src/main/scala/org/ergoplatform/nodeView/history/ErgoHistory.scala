@@ -325,7 +325,7 @@ object ErgoHistory extends ScorexLogging {
   }
 
   // A retained alternative fork may continue above the selected full-block tip.
-  // Only an invalid or truly missing continuation is safe to remove during repair.
+  // Keep a continuation only when it has a readable, matching header and is not invalid.
   protected[nodeView] def repairIfNeeded(history: ErgoHistory): Boolean = history.historyStorage.synchronized {
     val bestHeaderHeight = history.headersHeight
     val bestFullBlockHeight = history.bestFullBlockOpt.map(_.height).getOrElse(-1)
@@ -334,14 +334,17 @@ object ErgoHistory extends ScorexLogging {
     val removableContinuations = afterHeaders.nonEmpty && afterHeaders.forall { id =>
       history.isSemanticallyValid(id) match {
         case ModifierSemanticValidity.Invalid => true
-        case ModifierSemanticValidity.Absent => !history.historyStorage.contains(id)
-        case _ => false
+        case _ => !history.historyStorage.modifierById(id).exists {
+          case header: Header => header.id == id
+          case _ => false
+        }
       }
     }
 
     if (bestHeaderHeight == bestFullBlockHeight && removableContinuations) {
-      log.warn("Found invalid or missing continuation, clearing it...")
-      afterHeaders.map { hId =>
+      log.warn("Found invalid or unreadable continuation, clearing it...")
+      // Iterator.toSeq is a lazy Stream on Scala 2.12; force every deletion before dropping the row.
+      afterHeaders.foreach { hId =>
         history.forgetHeader(hId)
       }
       history.historyStorage.remove(Array(history.heightIdsKey(bestHeaderHeight + 1)), Array.empty[ModifierId])

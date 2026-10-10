@@ -136,6 +136,31 @@ class StartupContinuationRepairSpecification extends ErgoCorePropertyTest with F
     }
   }
 
+  property("startup removes every invalid continuation sharing the cleared height row") {
+    withFork(withSibling = true) { (history, a8, b7, siblingOpt, settings) =>
+      val sibling = siblingOpt.get
+      val removable = Seq(a8, sibling)
+      removable.foreach { block =>
+        invalidate(history, block)
+        history.isSemanticallyValid(block.id) shouldBe ModifierSemanticValidity.Invalid
+        history.historyStorage.contains(block.id) shouldBe true
+      }
+      history.headerIdsAtHeight(a8.height) should contain allOf (a8.id, sibling.id)
+      history.closeStorage()
+      val reopened = ErgoHistory.readOrGenerate(settings)(null)
+      try {
+        reopened.headerIdsAtHeight(a8.height) shouldBe empty
+        removable.foreach { block =>
+          withClue(s"Invalid continuation ${block.id} must be removed: ") {
+            reopened.historyStorage.modifierTypeAndBytesById(block.id) shouldBe None
+            reopened.isSemanticallyValid(block.id) shouldBe ModifierSemanticValidity.Absent
+          }
+        }
+        reopened.bestFullBlockIdOpt shouldBe Some(b7.id)
+      } finally reopened.closeStorage()
+    }
+  }
+
   property("startup removes a continuation row left behind by interrupted header cleanup") {
     withFork(withSibling = false) { (history, a8, b7, _, settings) =>
       invalidate(history, a8)
@@ -166,6 +191,24 @@ class StartupContinuationRepairSpecification extends ErgoCorePropertyTest with F
       try {
         reopened.headerIdsAtHeight(a8.height) should contain(a8.id)
         reopened.historyStorage.contains(a8.id) shouldBe true
+        reopened.bestFullBlockIdOpt shouldBe Some(b7.id)
+      } finally reopened.closeStorage()
+    }
+  }
+
+  property("startup removes an unparseable continuation header so it can be requested again") {
+    withFork(withSibling = false) { (history, a8, b7, _, settings) =>
+      history.isSemanticallyValid(a8.id) shouldBe ModifierSemanticValidity.Unknown
+      history.closeStorage()
+      val disk = HistoryStorage(settings)
+      try {
+        disk.insert(a8.header.serializedId, HistoryModifierSerializer.toBytes(a8.header).take(1)).get
+        disk.contains(a8.id) shouldBe true
+      } finally disk.close()
+      val reopened = ErgoHistory.readOrGenerate(settings)(null)
+      try {
+        reopened.headerIdsAtHeight(a8.height) should not contain a8.id
+        reopened.historyStorage.contains(a8.id) shouldBe false
         reopened.bestFullBlockIdOpt shouldBe Some(b7.id)
       } finally reopened.closeStorage()
     }
