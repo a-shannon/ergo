@@ -10,12 +10,13 @@ import org.iq80.leveldb.{DB, Options}
 import scorex.db.{ByteArrayWrapper, LDBFactory, LDBKVStore}
 
 import scala.util.{Failure, Try}
+import scala.util.control.ControlThrowable
 
 class HistoryInsertionRecoverySpec extends ErgoCorePropertyTest with DBSpec {
   import org.ergoplatform.utils.ErgoNodeTestConstants.settings
   import org.ergoplatform.utils.generators.ErgoCoreGenerators.defaultHeaderGen
 
-  private case class Fault(role: String, call: Int, afterWrite: Boolean, error: IOException)
+  private case class Fault(role: String, call: Int, afterWrite: Boolean, error: Throwable)
   private class Store(db: DB, role: String, fault: Option[Fault], before: () => Unit) extends LDBKVStore(db) {
     private var calls = 0
     override def updateDurable(keys: Array[K], values: Array[V], removals: Array[K]): Try[Unit] = {
@@ -94,6 +95,32 @@ class HistoryInsertionRecoverySpec extends ErgoCorePropertyTest with DBSpec {
         reopened.storage.getIndex(indexKey).map(_.toSeq) shouldBe (if (prepared) Some(Seq[Byte](9)) else None)
         reopened.index.get(HistoryInsertionJournal.key) shouldBe None
         reopened.storage.insert(Array(indexKey -> Array[Byte](9)), Array[BlockSection](header)).get
+      } finally reopened.close()
+    }
+  }
+
+  for ((role, call) <- Seq("index" -> 1, "objects" -> 1, "index" -> 2);
+       kind <- Seq("interruption", "control")) {
+    property(s"insertion quarantines $kind after $role write $call completes") {
+      val root = createTempDir
+      val cause: Throwable = if (kind == "interruption") new InterruptedException("durable write interrupted")
+        else new ControlThrowable {}
+      val opened = new Opened(root, Some(Fault(role, call, afterWrite = true, cause)))
+      val header = defaultHeaderGen.sample.get
+      try {
+        val observed = intercept[Throwable] {
+          opened.storage.insert(Array(indexKey -> Array[Byte](9)), Array[BlockSection](header))
+        }
+        observed shouldBe cause
+        intercept[CriticalSystemException](opened.storage.contains(header.id)).getCause shouldBe cause
+        intercept[CriticalSystemException](opened.storage.getIndex(indexKey)).getCause shouldBe cause
+        opened.storage.insert(Array.empty[(ByteArrayWrapper, Array[Byte])],
+          Array.empty[BlockSection]).failed.get shouldBe a[CriticalSystemException]
+      } finally opened.close()
+      val reopened = HistoryStorage(settings.copy(directory = root.getPath))
+      try {
+        reopened.contains(header.id) shouldBe true
+        reopened.getIndex(indexKey).get.toSeq shouldBe Seq[Byte](9)
       } finally reopened.close()
     }
   }

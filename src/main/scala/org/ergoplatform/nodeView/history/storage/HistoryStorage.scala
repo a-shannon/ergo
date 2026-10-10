@@ -194,12 +194,18 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
         val modifiers = decodedObjects(intent)
         (intent, modifiers, HistoryInsertionJournal.encode(intent))
       }.flatMap { case (intent, modifiers, encoded) =>
-        Try {
+        try {
           indexStore.updateDurable(Array(HistoryInsertionJournal.key), Array(encoded), Array.empty).get
           finish(intent)
           modifiers.foreach(cacheModifier)
           intent.indexes.foreach { case (key, value) => indexCache.put(ByteArrayWrapper(key), value) }
-        }.recoverWith { case NonFatal(error) => Failure(quarantine(error)) }
+          Success(())
+        } catch {
+          case NonFatal(error) => Failure(quarantine(error))
+          case control: Throwable =>
+            quarantine(control)
+            throw control
+        }
       }
     }
   }
