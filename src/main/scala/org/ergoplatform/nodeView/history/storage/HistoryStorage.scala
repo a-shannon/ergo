@@ -305,9 +305,10 @@ object HistoryStorage {
       storage.initialize()
       storage
     } catch {
-      case NonFatal(error) =>
+      case error: Throwable =>
+        // Ownership has not transferred; close every acquired store even after a control throwable.
         acquired.reverseIterator.foreach { store =>
-          try store.close() catch { case NonFatal(cleanup) => if (cleanup ne error) error.addSuppressed(cleanup) }
+          try store.close() catch { case cleanup: Throwable => if (cleanup ne error) error.addSuppressed(cleanup) }
         }
         throw error
     }

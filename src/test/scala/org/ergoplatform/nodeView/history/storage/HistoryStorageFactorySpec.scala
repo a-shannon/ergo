@@ -1,14 +1,20 @@
 package org.ergoplatform.nodeView.history.storage
 
-import java.io.IOException
+import java.io.{File, IOException}
 import org.ergoplatform.CriticalSystemException
+import org.ergoplatform.db.DBSpec
+import org.ergoplatform.modifiers.history.HistoryModifierSerializer
 import org.ergoplatform.utils.ErgoCorePropertyTest
-import scorex.db.LDBKVStore
+import org.iq80.leveldb.Options
+import scorex.db.{LDBFactory, LDBKVStore}
 
 import scala.collection.mutable.ArrayBuffer
+import scala.util.Try
+import scala.util.control.ControlThrowable
 
-class HistoryStorageFactorySpec extends ErgoCorePropertyTest {
+class HistoryStorageFactorySpec extends ErgoCorePropertyTest with DBSpec {
   import org.ergoplatform.utils.ErgoNodeTestConstants.settings
+  import org.ergoplatform.utils.generators.ErgoCoreGenerators.defaultHeaderGen
 
   for (failedAcquisition <- Seq(2, 3)) {
     property(s"factory closes acquired stores in reverse order when acquisition $failedAcquisition fails") {
@@ -55,5 +61,83 @@ class HistoryStorageFactorySpec extends ErgoCorePropertyTest {
     error.getCause shouldBe failure
     closed.toSeq shouldBe Seq(3, 2, 1)
     error.getSuppressed.toSeq shouldBe Seq(extraCleanup, objectCleanup)
+  }
+
+  for (kind <- Seq("interruption", "control")) {
+    property(s"factory closes every store when replaying a durable journal ends with $kind") {
+      val root = createTempDir
+      val localSettings = settings.copy(directory = root.getPath)
+      val indexPath = new File(root, "history/index")
+      indexPath.mkdirs()
+      val header = defaultHeaderGen.sample.get
+      val indexKey = Array.fill[Byte](32)(42)
+      val intent = HistoryInsertionJournal.Intent(
+        Vector(header.serializedId -> HistoryModifierSerializer.toBytes(header)),
+        Vector(indexKey -> Array[Byte](7))
+      )
+      val prepared = LDBFactory.createKvDb(indexPath.getPath)
+      try prepared.insert(HistoryInsertionJournal.key, HistoryInsertionJournal.encode(intent)).get
+      finally prepared.close()
+
+      val cause: Throwable = if (kind == "interruption") new InterruptedException("replay write interrupted")
+        else new ControlThrowable {}
+      val opened = ArrayBuffer.empty[LDBKVStore]
+      val closed = ArrayBuffer.empty[String]
+      def create(path: String): LDBKVStore = {
+        val dir = new File(path)
+        dir.mkdirs()
+        val role = dir.getName
+        val store = new LDBKVStore(LDBFactory.factory.open(dir, new Options().createIfMissing(true))) {
+          private var wasClosed = false
+          override def updateDurable(keys: Array[K], values: Array[V], removals: Array[K]): Try[Unit] = {
+            val result = super.updateDurable(keys, values, removals)
+            if (role == "objects") {
+              result.get
+              throw cause
+            }
+            result
+          }
+          override def close(): Unit = if (!wasClosed) {
+            wasClosed = true
+            closed += role
+            super.close()
+          }
+        }
+        opened += store
+        store
+      }
+      try {
+        intercept[Throwable](HistoryStorage.open(localSettings, create)) shouldBe cause
+        closed.toSeq shouldBe Seq("extra", "objects", "index")
+      } finally opened.reverseIterator.foreach(_.close())
+
+      val recovered = HistoryStorage(localSettings)
+      try {
+        recovered.contains(header.id) shouldBe true
+        recovered.getIndex(scorex.db.ByteArrayWrapper(indexKey)).get.toSeq shouldBe Seq[Byte](7)
+      } finally recovered.close()
+    }
+  }
+
+  property("factory continues cleanup when one close throws a control throwable") {
+    val closed = ArrayBuffer.empty[Int]
+    var created = 0
+    val failure = new IOException("journal read failed")
+    val cleanup = new ControlThrowable {}
+    def create(path: String): LDBKVStore = {
+      created += 1
+      val id = created
+      new LDBKVStore(null) {
+        override def get(key: K): Option[V] = throw failure
+        override def close(): Unit = {
+          closed += id
+          if (id == 3) throw cleanup
+        }
+      }
+    }
+    val error = intercept[CriticalSystemException](HistoryStorage.open(settings, create))
+    error.getCause shouldBe failure
+    closed.toSeq shouldBe Seq(3, 2, 1)
+    error.getSuppressed.toSeq shouldBe Seq(cleanup)
   }
 }
