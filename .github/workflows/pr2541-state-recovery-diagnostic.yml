@@ -1,0 +1,50 @@
+name: PR 2541 state-recovery diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2541-ci-diagnostic-20261011
+
+jobs:
+  integration:
+    name: Run integration tests and retain state-recovery logs
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact PR 2541 head
+        uses: actions/checkout@v4
+        with:
+          repository: a-shannon/ergo
+          ref: b2347d8904e1be1679a0abc74487c391e2a074f2
+          path: it
+          fetch-depth: 0
+
+      - name: Setup Java and Scala
+        uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run the same integration suite
+        run: |
+          cd it
+          mkdir tmp
+          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++2.12.20 it:test
+
+      - name: Upload state-recovery node logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-recovery-node-logs
+          path: it/target/logs/StateRecoveryDigestNodeSpec-*.log
+          if-no-files-found: ignore
+          retention-days: 1
