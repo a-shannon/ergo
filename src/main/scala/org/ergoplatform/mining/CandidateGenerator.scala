@@ -291,14 +291,6 @@ class CandidateGenerator(
 object CandidateGenerator extends ScorexLogging {
 
   /**
-    * Memoized extra-index sync flag for the storage-rent sweep in [[createCandidate]]: the
-    * sweep is skipped while the extra indexer is catching up with the chain; once caught up,
-    * the indexer tracks the chain continuously, so the flag is sticky and the index progress
-    * key is not read from the database again.
-    */
-  private var extraIndexSynced: Boolean = false
-
-  /**
     * Holder for both candidate block and data for external miners derived from it
     * (to avoid possibly costly recalculation)
     *
@@ -692,17 +684,24 @@ object CandidateGenerator extends ScorexLogging {
         // Collect rent only when the extra index is (almost) in sync with the chain: against
         // a lagging index a temporarily unresolvable box would be mistaken for permanently
         // unclaimable and evicted below. One block of lag is tolerated, as the indexer may
-        // simply not have processed the chain tip yet. The check is memoized: once synced,
-        // the indexer tracks the chain continuously and the database is not read again.
-        if (!extraIndexSynced) {
-          val indexedHeight = ExtraIndexer.getIndex(ExtraIndexer.IndexedHeightKey, history).getInt
+        // simply not have processed the chain tip yet. Recheck every enabled sweep because
+        // the indexer can later stall or roll back, including to a different fork.
+        val rentIndexReady = ergoSettings.nodeSettings.storageRentCollection && {
+          val rollbackTo = ExtraIndexer.getIndex(ExtraIndexer.RollbackToKey, history).getInt
           val fullHeight = history.fullBlockHeight
-          extraIndexSynced = indexedHeight == fullHeight || indexedHeight + 1 == fullHeight
-          if (!extraIndexSynced) {
-            log.debug(s"Skipping storage-rent collection: extra index at $indexedHeight, chain at $fullHeight")
+          val checkpointHeight = if (rollbackTo == 0)
+            ExtraIndexer.selectedCheckpointHeight(history) else None
+          val ready = checkpointHeight.exists { height =>
+            val nearTip = height == fullHeight || height == fullHeight - 1
+            nearTip && ExtraIndexer.getIndex(ExtraIndexer.IndexedHeightKey, history).getInt == height &&
+              ExtraIndexer.getIndex(ExtraIndexer.RollbackToKey, history).getInt == 0
           }
+          if (!ready) {
+            log.debug(s"Skipping storage-rent collection: selected checkpoint at $checkpointHeight, chain at $fullHeight, rollback target $rollbackTo")
+          }
+          ready
         }
-        if (ergoSettings.nodeSettings.storageRentCollection && extraIndexSynced) {
+        if (rentIndexReady) {
           val upcomingHeight = upcomingContext.currentHeight
           val threshold = upcomingHeight - Constants.StoragePeriod
           if (threshold > 0) {
