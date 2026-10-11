@@ -1,0 +1,44 @@
+name: PR 2541 release-composition restart diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2541-release-restart-diagnostic-20261011
+
+jobs:
+  process-restart:
+    name: Replay history insertion after a process restart
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout release composition
+        uses: actions/checkout@v4
+
+      - name: Setup Java and Scala
+        uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run process-restart integration fixture
+        run: |
+          mkdir tmp
+          TMPDIR=$(pwd)/tmp sbt -Denv=test ++2.12.20 "it:testOnly *HistoryInsertionProcessRestartSpec"
+
+      - name: Upload node logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: history-insertion-process-restart-logs
+          path: target/logs/HistoryInsertionProcessRestartSpec-*.log
+          if-no-files-found: ignore
+          retention-days: 1
