@@ -394,6 +394,32 @@ class Docker(
     synchronized { startedContainers = startedContainers.filterNot(_._1 == containerId) }
   }
 
+  def allowHostAccessToMountedVolume(localVolume: String, remoteVolume: String): Unit = {
+    val hostConfig =
+      new HostConfig().withBinds(new Bind(localVolume, new Volume(remoteVolume)))
+    val helperId = client
+      .createContainerCmd(ErgoImageLatest)
+      .withHostConfig(hostConfig)
+      .withUser("0:0")
+      .withEntrypoint("chmod", "-R", "a+rwX", s"$remoteVolume/history")
+      .exec()
+      .getId
+
+    val waitCallback = waitContainer(helperId)
+    try {
+      client.startContainerCmd(helperId).exec()
+      val exitCode = waitCallback.awaitStatusCode(60, TimeUnit.SECONDS)
+      if (exitCode != 0) {
+        throw new IllegalStateException(
+          s"Volume permission update failed with exit code $exitCode"
+        )
+      }
+    } finally {
+      waitCallback.close()
+      client.removeContainerCmd(helperId).withForce(true).exec()
+    }
+  }
+
   def removeFromMountedVolume(
     localVolume: String,
     remoteVolume: String,

@@ -62,6 +62,7 @@ class HistoryInsertionProcessRestartSpec extends AnyFlatSpec with IntegrationSui
 
     // Closing the first container releases every LevelDB lock before offline mutation.
     docker.forceStopNode(miner.containerId)
+    docker.allowHostAccessToMountedVolume(localVolume, remoteVolume)
 
     val headerKey = selectedHeader.serializedId
     val headerBytesAndTxId = {
@@ -128,6 +129,7 @@ class HistoryInsertionProcessRestartSpec extends AnyFlatSpec with IntegrationSui
       selectedHeight
 
     docker.forceStopNode(restarted.containerId)
+    docker.allowHostAccessToMountedVolume(localVolume, remoteVolume)
 
     val restoredObjects = LDBFactory.createKvDb(s"$localVolume/history/objects")
     try restoredObjects.get(headerKey).get.toSeq shouldBe headerBytes.toSeq
