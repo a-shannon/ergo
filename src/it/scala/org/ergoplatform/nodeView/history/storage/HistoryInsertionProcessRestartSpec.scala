@@ -105,7 +105,7 @@ class HistoryInsertionProcessRestartSpec extends AnyFlatSpec with IntegrationSui
       recoveryConfig, specialVolumeOpt = Some((localVolume, remoteVolume))).get
     restarted.containerId should not be miner.containerId
     Await.result(restarted.waitForStartup, 90.seconds)
-    Await.result(restarted.info, 20.seconds).isMining shouldBe Some(false)
+    Await.result(restarted.info, 20.seconds).isMining.contains(false) shouldBe true
 
     val restoredHeader = Await.result(restarted.headerById(selectedId), 30.seconds)
     restoredHeader.encodedId shouldBe selectedId
