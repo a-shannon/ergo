@@ -32,7 +32,7 @@ jobs:
       - name: Run process-restart integration fixture
         run: |
           mkdir tmp
-          TMPDIR=$(pwd)/tmp sbt -Denv=test ++2.12.20 "it:testOnly *HistoryInsertionProcessRestartSpec"
+          TMPDIR=$(pwd)/tmp sbt -Denv=test ++2.12.20 docker "it:testOnly *HistoryInsertionProcessRestartSpec"
 
       - name: Upload node logs
         if: always()
