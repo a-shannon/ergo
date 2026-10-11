@@ -1,6 +1,7 @@
 package org.ergoplatform.nodeView.history.storage
 
 import com.github.benmanes.caffeine.cache.Caffeine
+import org.ergoplatform.CriticalSystemException
 import org.ergoplatform.modifiers.{BlockSection, NetworkObjectTypeId}
 import org.ergoplatform.modifiers.history.HistoryModifierSerializer
 import org.ergoplatform.modifiers.history.header.Header
@@ -11,6 +12,7 @@ import scorex.db.{ByteArrayWrapper, LDBFactory, LDBKVStore}
 import scorex.util.{ModifierId, ScorexLogging, idToBytes}
 
 import scala.util.{Failure, Success, Try}
+import scala.util.control.NonFatal
 import spire.syntax.all.cfor
 
 import java.io.File
@@ -31,6 +33,53 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
   extends ScorexLogging
     with AutoCloseable
     with ScorexEncoding {
+
+  private var initialized = false
+  private var unavailable: Option[CriticalSystemException] = None
+
+  private def quarantine(cause: Throwable): CriticalSystemException = {
+    val error = CriticalSystemException("History insertion persistence is incomplete; reopen storage to recover")
+    error.initCause(cause)
+    unavailable = Some(error)
+    error
+  }
+
+  private def rejectReserved(key: Array[Byte]): Unit =
+    require(!HistoryInsertionJournal.isReserved(key), "Reserved history insertion journal key")
+
+  private def finish(intent: HistoryInsertionJournal.Intent): Unit = {
+    objectsStore.updateDurable(intent.objects.map(_._1).toArray, intent.objects.map(_._2).toArray, Array.empty).get
+    indexStore.updateDurable(intent.indexes.map(_._1).toArray, intent.indexes.map(_._2).toArray,
+      Array(HistoryInsertionJournal.key)).get
+  }
+
+  private def decodedObjects(intent: HistoryInsertionJournal.Intent): Vector[BlockSection] =
+    intent.objects.map { case (key, bytes) =>
+      val modifier = HistoryModifierSerializer.parseBytesTry(bytes).get
+      require(java.util.Arrays.equals(key, modifier.serializedId), "History journal object identity mismatch")
+      modifier
+    }
+
+  private def initialize(): Unit = synchronized {
+    unavailable.foreach(throw _)
+    if (!initialized) {
+      try {
+        indexStore.get(HistoryInsertionJournal.key).foreach { bytes =>
+          val intent = HistoryInsertionJournal.decode(bytes)
+          decodedObjects(intent)
+          finish(intent)
+        }
+        initialized = true
+      } catch {
+        case NonFatal(error) => throw quarantine(error)
+      }
+    }
+  }
+
+  private def ready[A](operation: => A): A = synchronized {
+    initialize()
+    operation
+  }
 
   private lazy val headersCache =
     Caffeine.newBuilder()
@@ -80,18 +129,18 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     extraCache.invalidate(id)
   }
 
-  def modifierBytesById(id: ModifierId): Option[Array[Byte]] = {
+  def modifierBytesById(id: ModifierId): Option[Array[Byte]] = ready {
     objectsStore.get(idToBytes(id)).map(_.tail).orElse(extraStore.get(idToBytes(id))) // removing modifier type byte with .tail (only in objectsStore)
   }
 
   /**
     * @return bytes and type of a network object stored in the database with identifier `id`
     */
-  def modifierTypeAndBytesById(id: ModifierId): Option[(NetworkObjectTypeId.Value, Array[Byte])] = {
+  def modifierTypeAndBytesById(id: ModifierId): Option[(NetworkObjectTypeId.Value, Array[Byte])] = ready {
     objectsStore.get(idToBytes(id)).map(bs => (NetworkObjectTypeId.fromByte(bs.head), bs.tail)) // first byte is type id, tail is modifier bytes
   }
 
-  def modifierById(id: ModifierId): Option[BlockSection] =
+  def modifierById(id: ModifierId): Option[BlockSection] = ready {
     lookupModifier(id) orElse objectsStore.get(idToBytes(id)).flatMap { bytes =>
       HistoryModifierSerializer.parseBytesTry(bytes) match {
         case Success(pm) =>
@@ -103,39 +152,44 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
           None
       }
     }
+  }
 
-  def getExtraIndex(id: ModifierId): Option[ExtraIndex] = withExtraCacheReadLock {
-    Option(extraCache.getIfPresent(id)) orElse extraStore.get(idToBytes(id)).flatMap { bytes =>
-      ExtraIndexSerializer.parseBytesTry(bytes) match {
-        case Success(pm) =>
-          log.trace(s"Cache miss for existing index $id")
-          if(!pm.isInstanceOf[Segment[_]]){
-            extraCache.put(pm.id, pm) // cache non-segment objects
-          }
-          Some(pm)
-        case Failure(_) =>
-          log.warn(s"Failed to parse index ${encoder.encode(id)} from db (bytes are: ${Algos.encode(bytes)})")
-          None
+  def getExtraIndex(id: ModifierId): Option[ExtraIndex] = ready {
+    withExtraCacheReadLock {
+      Option(extraCache.getIfPresent(id)) orElse extraStore.get(idToBytes(id)).flatMap { bytes =>
+        ExtraIndexSerializer.parseBytesTry(bytes) match {
+          case Success(pm) =>
+            log.trace(s"Cache miss for existing index $id")
+            if(!pm.isInstanceOf[Segment[_]]){
+              extraCache.put(pm.id, pm) // cache non-segment objects
+            }
+            Some(pm)
+          case Failure(_) =>
+            log.warn(s"Failed to parse index ${encoder.encode(id)} from db (bytes are: ${Algos.encode(bytes)})")
+            None
+        }
       }
     }
   }
 
-  def getIndex(id: ByteArrayWrapper): Option[Array[Byte]] =
+  def getIndex(id: ByteArrayWrapper): Option[Array[Byte]] = ready {
+    rejectReserved(id.data)
     Option(indexCache.getIfPresent(id)).orElse {
       indexStore.get(id.data).map { value =>
         indexCache.put(id, value)
         value
       }
     }
+  }
 
   /**
     * @return object with `id` if it is in the objects database
     */
-  def get(id: ModifierId): Option[Array[Byte]] = {
+  def get(id: ModifierId): Option[Array[Byte]] = ready {
     val idBytes = idToBytes(id)
     objectsStore.get(idBytes).orElse(extraStore.get(idBytes))
   }
-  def get(id: Array[Byte]): Option[Array[Byte]] = objectsStore.get(id).orElse(extraStore.get(id))
+  def get(id: Array[Byte]): Option[Array[Byte]] = ready { objectsStore.get(id).orElse(extraStore.get(id)) }
 
   /**
     * @return if object with `id` is in the objects database
@@ -144,27 +198,37 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
   def contains(id: ModifierId): Boolean = get(id).isDefined
 
   def insert(indexesToInsert: Array[(ByteArrayWrapper, Array[Byte])],
-             objectsToInsert: Array[BlockSection]): Try[Unit] = {
-    objectsStore.insert(
-      objectsToInsert.map(mod => mod.serializedId),
-      objectsToInsert.map(mod => HistoryModifierSerializer.toBytes(mod))
-    ).flatMap { _ =>
-      cfor(0)(_ < objectsToInsert.length, _ + 1) { i => cacheModifier(objectsToInsert(i))}
-      if (indexesToInsert.nonEmpty) {
-        indexStore.insert(
-          indexesToInsert.map(_._1.data),
-          indexesToInsert.map(_._2)
-        ).map { _ =>
-          cfor(0)(_ < indexesToInsert.length, _ + 1) { i =>
-            indexCache.put(indexesToInsert(i)._1, indexesToInsert(i)._2)
-          }
+             objectsToInsert: Array[BlockSection]): Try[Unit] = synchronized {
+    Try(initialize()).flatMap { _ =>
+      // Freeze and validate everything before the first write; serialization failures leave no usable intent.
+      Try {
+        val indexes = indexesToInsert.toVector.map { case (key, value) =>
+          rejectReserved(key.data)
+          key.data.clone() -> value.clone()
         }
-      } else Success(())
+        val objects = objectsToInsert.toVector.map(mod => mod.serializedId.clone() -> HistoryModifierSerializer.toBytes(mod))
+        val intent = HistoryInsertionJournal.Intent(objects, indexes)
+        val modifiers = decodedObjects(intent)
+        (intent, modifiers, HistoryInsertionJournal.encode(intent))
+      }.flatMap { case (intent, modifiers, encoded) =>
+        try {
+          indexStore.updateDurable(Array(HistoryInsertionJournal.key), Array(encoded), Array.empty).get
+          finish(intent)
+          modifiers.foreach(cacheModifier)
+          intent.indexes.foreach { case (key, value) => indexCache.put(ByteArrayWrapper(key), value) }
+          Success(())
+        } catch {
+          case NonFatal(error) => Failure(quarantine(error))
+          case control: Throwable =>
+            quarantine(control)
+            throw control
+        }
+      }
     }
   }
 
   def insertExtra(indexesToInsert: Array[(Array[Byte], Array[Byte])],
-                  objectsToInsert: Array[ExtraIndex]): Unit = {
+                  objectsToInsert: Array[ExtraIndex]): Unit = ready {
     insertExtraTry(indexesToInsert, objectsToInsert).failed.foreach { error =>
       log.error("Failed to insert extra indexes", error)
     }
@@ -175,7 +239,7 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
   }
 
   def insertExtraTry(indexesToInsert: Array[(Array[Byte], Array[Byte])],
-                     objectsToInsert: Array[ExtraIndex]): Try[Unit] = {
+                     objectsToInsert: Array[ExtraIndex]): Try[Unit] = Try(ready {
     val objectIds = objectsToInsert.iterator.flatMap(obj => Try(obj.id).toOption).toArray
     Try {
       val keys = objectsToInsert.map(_.serializedId) ++ indexesToInsert.map(_._1)
@@ -191,21 +255,21 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
       invalidateExtraCache(objectIds)
       Failure(error)
     }
-  }
+  }).flatten
 
-  def removeExtra(indexesToRemove: Array[ModifierId]) : Unit = {
+  def removeExtra(indexesToRemove: Array[ModifierId]) : Unit = ready {
     removeExtraTry(indexesToRemove).failed.foreach { error =>
       log.error("Failed to remove extra indexes", error)
     }
   }
 
-  def removeExtraTry(indexesToRemove: Array[ModifierId]): Try[Unit] = {
+  def removeExtraTry(indexesToRemove: Array[ModifierId]): Try[Unit] = Try(ready {
     withExtraCacheWriteLock {
       extraStore.remove(indexesToRemove.map(idToBytes)).map { _ =>
         cfor(0)(_ < indexesToRemove.length, _ + 1) { i => removeModifier(indexesToRemove(i)) }
       }
     }
-  }
+  }).flatten
 
   /**
     * Insert single object to database. This version allows for efficient insert
@@ -216,7 +280,7 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     * @return - Success if insertion was successful, Failure otherwise
     */
   def insert(objectIdToInsert: Array[Byte],
-             objectToInsert: Array[Byte]): Try[Unit] = {
+             objectToInsert: Array[Byte]): Try[Unit] = ready {
     objectsStore.insert(objectIdToInsert, objectToInsert)
   }
 
@@ -228,7 +292,8 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     * @return
     */
   def remove(indicesToRemove: Array[ByteArrayWrapper],
-             idsToRemove: Array[ModifierId]): Try[Unit] = {
+             idsToRemove: Array[ModifierId]): Try[Unit] = ready {
+      indicesToRemove.foreach(key => rejectReserved(key.data))
 
       objectsStore.remove(idsToRemove.map(idToBytes)).map { _ =>
         cfor(0)(_ < idsToRemove.length, _ + 1) { i => removeModifier(idsToRemove(i))}
@@ -239,7 +304,7 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
       }
   }
 
-  override def close(): Unit = {
+  override def close(): Unit = synchronized {
     log.warn("Closing history storage...")
     extraStore.close()
     indexStore.close()
@@ -258,7 +323,7 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
   /**
     * Delete the extra index database and reopen it, preserving deletion failures.
     */
-  def deleteExtraDBTry(ergoSettings: ErgoSettings): Try[HistoryStorage] = {
+  def deleteExtraDBTry(ergoSettings: ErgoSettings): Try[HistoryStorage] = Try(ready {
     log.warn("Removing extra index database after an invalid checkpoint.")
     val root = new File(s"${ergoSettings.directory}/history/extra")
     Try(close()).flatMap { _ =>
@@ -267,7 +332,7 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
       log.info(s"Deleted ${root.toString}")
       HistoryStorage.apply(ergoSettings)
     }
-  }
+  }).flatten
 
 }
 
@@ -281,10 +346,29 @@ object HistoryStorage {
     require(!Files.exists(root), s"Could not delete $root")
   }
 
-  def apply(ergoSettings: ErgoSettings): HistoryStorage = {
-    val indexStore = LDBFactory.createKvDb(s"${ergoSettings.directory}/history/index")
-    val objectsStore = LDBFactory.createKvDb(s"${ergoSettings.directory}/history/objects")
-    val extraStore = LDBFactory.createKvDb(s"${ergoSettings.directory}/history/extra")
-    new HistoryStorage(indexStore, objectsStore, extraStore, ergoSettings.cacheSettings)
+  def apply(ergoSettings: ErgoSettings): HistoryStorage = open(ergoSettings, LDBFactory.createKvDb)
+
+  private[storage] def open(ergoSettings: ErgoSettings, createStore: String => LDBKVStore): HistoryStorage = {
+    val acquired = scala.collection.mutable.ArrayBuffer.empty[LDBKVStore]
+    def acquire(name: String): LDBKVStore = {
+      val store = createStore(s"${ergoSettings.directory}/history/$name")
+      acquired += store
+      store
+    }
+    try {
+      val indexStore = acquire("index")
+      val objectsStore = acquire("objects")
+      val extraStore = acquire("extra")
+      val storage = new HistoryStorage(indexStore, objectsStore, extraStore, ergoSettings.cacheSettings)
+      storage.initialize()
+      storage
+    } catch {
+      case error: Throwable =>
+        // Ownership has not transferred; close every acquired store even after a control throwable.
+        acquired.reverseIterator.foreach { store =>
+          try store.close() catch { case cleanup: Throwable => if (cleanup ne error) error.addSuppressed(cleanup) }
+        }
+        throw error
+    }
   }
 }
