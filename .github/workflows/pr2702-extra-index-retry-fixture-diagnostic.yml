@@ -1,0 +1,54 @@
+name: ExtraIndexer retry fixture diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2702-fixture-20261012
+
+permissions:
+  contents: read
+
+jobs:
+  extra_index_retry:
+    name: ExtraIndexer retry properties on current release composition
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact scratch branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run only the two ExtraIndexer retry properties
+        timeout-minutes: 25
+        run: |
+          set -o pipefail
+          sbt -Denv=test clean ++2.12.20 "testOnly org.ergoplatform.nodeView.history.extra.ExtraIndexerSpecification -- -z retries" 2>&1 | tee extraindex-fixture-test.log
+
+      - name: Upload focused test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: extraindex-retry-fixture-attempt-${{ github.run_attempt }}
+          path: |
+            extraindex-fixture-test.log
+            target/test-reports/
+          if-no-files-found: ignore
+          retention-days: 14
