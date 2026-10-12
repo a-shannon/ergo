@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feat/v2-deep-rollback-diagnostic-20261012
+      - feat/v2-deep-rollback-scanback-20261012
   workflow_dispatch:
 
 jobs:
