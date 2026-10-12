@@ -1,0 +1,70 @@
+name: PR 2694 mempool fixture composition diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2694-mempool-fixture-diagnostic-20261012
+
+jobs:
+  node:
+    name: Run node suite on PR 2694 plus PR 2535 fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact PR 2694 head
+        uses: actions/checkout@v4
+        with:
+          repository: ergoplatform/ergo
+          ref: cc5c3f0cc2bc1b7c4049c2ca77c0006510998536
+          path: source
+          fetch-depth: 0
+
+      - name: Compose exact fixture commit without changing PR 2694
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = cc5c3f0cc2bc1b7c4049c2ca77c0006510998536
+          git fetch https://github.com/a-shannon/ergo.git refs/heads/fix/shared-test-support
+          test "$(git rev-parse FETCH_HEAD)" = c7863cd8826c2a78f4574bd97ab415e78b101373
+          git cherry-pick --no-commit c7863cd8826c2a78f4574bd97ab415e78b101373
+          test "$(git diff --cached --name-only)" = src/test/scala/org/ergoplatform/nodeView/mempool/ErgoMemPoolSpec.scala
+          git diff --cached --check
+          git rev-parse HEAD | tee ../composition.txt
+          git rev-parse FETCH_HEAD | tee -a ../composition.txt
+          git diff --cached --binary | sha256sum | tee -a ../composition.txt
+          git status --short | tee -a ../composition.txt
+
+      - name: Setup Java and Scala
+        uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('**/project/build.properties') }}
+
+      - name: Run the upstream node suite
+        working-directory: source
+        shell: bash
+        run: |
+          set -o pipefail
+          sbt -Denv=test clean ++2.12.20 test 2>&1 | tee ../node-test.log
+
+      - name: Upload composition and failure logs
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr2694-mempool-fixture-node-diagnostic
+          path: |
+            composition.txt
+            node-test.log
+            source/**/target/test-reports/**
+          if-no-files-found: warn
+          retention-days: 7
