@@ -82,7 +82,8 @@ class ExtraIndexerDigestPrefixSpec extends ErgoCorePropertyTest with NodeViewTes
         val indexer = actorSystem.actorOf(Props(new ExtraIndexer(
           fixture.settings.cacheSettings,
           fixture.settings.chainSettings.addressEncoder,
-          Some(nodeViewHolderRef)
+          Some(nodeViewHolderRef),
+          fixture.settings.nodeSettings.storageRentCollection
         )))
         try {
           org.ergoplatform.utils.untilTimeout(10.seconds, 50.millis) {
