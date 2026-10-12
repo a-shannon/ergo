@@ -1786,13 +1786,122 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
       val tipBefore = fullChainHeaderAt(HEIGHT)
       val (addresses, templates, indexedTokens, txsIndexed, boxesIndexed) = manualIndex(HEIGHT)
       val originalTx = fullChainTransactionsAt(2).txs.find(_.inputs.nonEmpty).get
-      val inputId = bytesToId(originalTx.inputs.head.boxId)
-      val outputId = bytesToId(originalTx.outputs.head.id)
-      val originalTxIndex = history.typedExtraIndexById[IndexedErgoTransaction](originalTx.id).get.globalIndex
-      val originalOutputIndex = history.typedExtraIndexById[IndexedErgoBox](outputId).get.globalIndex
-      history.typedExtraIndexById[IndexedErgoBox](inputId).get.spendingHeightOpt shouldBe Some(2)
+      val inputIds = originalTx.inputs.map(input => bytesToId(input.boxId)).toVector
+      val outputIds = originalTx.outputs.map(output => bytesToId(output.id)).toVector
+      val involvedBoxIds = (inputIds ++ outputIds).distinct
+      val originalIndexedTx = history.typedExtraIndexById[IndexedErgoTransaction](originalTx.id).get
+      originalIndexedTx.height shouldBe 2
+      val originalTxIndex = originalIndexedTx.globalIndex
+      val originalBoxIndexes = involvedBoxIds.map { id =>
+        id -> history.typedExtraIndexById[IndexedErgoBox](id).get.globalIndex
+      }.toMap
+
+      case class TxRowSnapshot(raw: Option[Vector[Byte]],
+                               fields: Option[(Int, Int, Long, Vector[Long], Vector[Long], ModifierId)])
+      case class BoxRowSnapshot(raw: Option[Vector[Byte]],
+                                fields: Option[(Int, Long, Option[ModifierId], Option[Int], Boolean)])
+      case class ReplaySnapshot(state: IndexerState,
+                                transaction: TxRowSnapshot,
+                                boxes: Map[ModifierId, BoxRowSnapshot],
+                                originalNumericTx: Option[(Long, ModifierId)],
+                                originalNumericBoxes: Vector[(Long, Option[(Long, ModifierId)])],
+                                replayNumericTx: Option[(Long, ModifierId)],
+                                replayNumericBoxes: Vector[Option[(Long, ModifierId)]],
+                                derivedRows: Map[ModifierId, Option[Vector[Byte]]],
+                                rentRows: Vector[(Int, Long)])
+
+      def rawRow(id: ModifierId): Option[Vector[Byte]] =
+        _history.historyStorage.get(id).map(_.toVector)
+
+      def txRow: TxRowSnapshot = {
+        val indexed = history.typedExtraIndexById[IndexedErgoTransaction](originalTx.id)
+        TxRowSnapshot(
+          rawRow(originalTx.id),
+          indexed.map(tx =>
+            (tx.index, tx.height, tx.globalIndex, tx.inputNums.toVector, tx.outputNums.toVector, tx.blockId)))
+      }
+
+      def boxRow(id: ModifierId): BoxRowSnapshot = {
+        val indexed = history.typedExtraIndexById[IndexedErgoBox](id)
+        BoxRowSnapshot(
+          rawRow(id),
+          indexed.map(box =>
+            (box.inclusionHeight, box.globalIndex, box.spendingTxIdOpt,
+              box.spendingHeightOpt, box.spendingProofOpt.isDefined)))
+      }
+
+      def numericTx(index: Long): Option[(Long, ModifierId)] =
+        history.typedExtraIndexById[NumericTxIndex](bytesToId(NumericTxIndex.indexToBytes(index)))
+          .map(row => row.n -> row.m)
+
+      def numericBox(index: Long): Option[(Long, ModifierId)] =
+        history.typedExtraIndexById[NumericBoxIndex](bytesToId(NumericBoxIndex.indexToBytes(index)))
+          .map(row => row.n -> row.m)
+
+      def segmentRows[T <: Segment[T] : ClassTag](parentIds: Iterable[ModifierId]): Set[ModifierId] =
+        parentIds.flatMap { id =>
+          history.typedExtraIndexById[T](id).toSeq.flatMap { parent =>
+            Seq(parent.id) ++
+              (0 until parent.txSegmentCount).map(n => parent.factory(txSegmentId(parent.id, n)).id) ++
+              (0 until parent.boxSegmentCount).map(n => parent.factory(boxSegmentId(parent.id, n)).id)
+          }
+        }.toSet
+
+      def currentDerivedRowIds: Set[ModifierId] =
+        segmentRows[IndexedErgoAddress](addresses.keys) ++
+          segmentRows[IndexedContractTemplate](templates.keys) ++
+          segmentRows[IndexedToken](indexedTokens.keys)
+
+      def snapshot(derivedRowIds: Set[ModifierId]): ReplaySnapshot = ReplaySnapshot(
+        IndexerState.fromHistory(_history),
+        txRow,
+        involvedBoxIds.map(id => id -> boxRow(id)).toMap,
+        numericTx(originalTxIndex),
+        originalBoxIndexes.toVector.sortBy(_._2).map { case (_, index) => index -> numericBox(index) },
+        numericTx(txsIndexed.toLong),
+        originalTx.outputs.indices.map(i => numericBox(boxesIndexed.toLong + i)).toVector,
+        derivedRowIds.map(id => id -> rawRow(id)).toMap,
+        history.storageRentBoxesAtOrBefore(Int.MaxValue, Int.MaxValue)
+          .map(row => row.creationHeight -> row.globalIndex).toVector
+      )
+
+      def assertSnapshot(label: String, actual: ReplaySnapshot, expected: ReplaySnapshot): Unit = {
+        withClue(s"$label indexer state: ") { actual.state shouldBe expected.state }
+        withClue(s"$label original transaction row: ") {
+          actual.transaction shouldBe expected.transaction
+        }
+        withClue(s"$label input and output rows, including original spend proof: ") {
+          actual.boxes shouldBe expected.boxes
+        }
+        withClue(s"$label original numeric transaction row: ") {
+          actual.originalNumericTx shouldBe expected.originalNumericTx
+        }
+        withClue(s"$label original numeric box rows: ") {
+          actual.originalNumericBoxes shouldBe expected.originalNumericBoxes
+        }
+        withClue(s"$label replay numeric transaction row: ") {
+          actual.replayNumericTx shouldBe expected.replayNumericTx
+        }
+        withClue(s"$label replay numeric box rows: ") {
+          actual.replayNumericBoxes shouldBe expected.replayNumericBoxes
+        }
+        withClue(s"$label address, template, token, and segment rows: ") {
+          actual.derivedRows shouldBe expected.derivedRows
+        }
+        withClue(s"$label storage-rent eligibility rows: ") {
+          actual.rentRows shouldBe expected.rentRows
+        }
+      }
+
+      inputIds.foreach { id =>
+        history.typedExtraIndexById[IndexedErgoBox](id).get.spendingTxIdOpt shouldBe Some(originalTx.id)
+        history.typedExtraIndexById[IndexedErgoBox](id).get.spendingHeightOpt shouldBe Some(2)
+      }
+      val baselineDerivedRowIds = currentDerivedRowIds
+      val baseline = snapshot(baselineDerivedRowIds)
 
       val forged = ChainGenerator.forgeUnvalidatedBlockWithTransactions(_history, Seq(originalTx))
+      forged.header.height shouldBe HEIGHT + 1
       _history.fullBlockHeight shouldBe HEIGHT + 1
       _history.isSemanticallyValid(forged.header.id) shouldBe ModifierSemanticValidity.Unknown
 
@@ -1801,17 +1910,14 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
       org.ergoplatform.utils.untilTimeout(10.seconds, 50.millis) {
         IndexerState.fromHistory(_history).indexedHeight shouldBe HEIGHT + 1
       }
-
-      // Neither a duplicate tx id nor its identical output ids identify a new valid occurrence.
-      history.typedExtraIndexById[IndexedErgoBox](inputId).get.spendingHeightOpt shouldBe Some(2)
-      history.typedExtraIndexById[IndexedErgoTransaction](originalTx.id).get.globalIndex shouldBe originalTxIndex
-      history.typedExtraIndexById[IndexedErgoBox](outputId).get.globalIndex shouldBe originalOutputIndex
+      val allDerivedRowIds = baselineDerivedRowIds ++ currentDerivedRowIds
 
       _history.reportModifierIsInvalid(
         forged.header,
         ProgressInfo[BlockSection](None, Seq.empty, Seq.empty, Seq.empty)(
           org.ergoplatform.utils.ScorexEncoder.default)
       ).get
+      _history.fullBlockHeight shouldBe HEIGHT
       indexer ! Index()
       org.ergoplatform.utils.untilTimeout(10.seconds, 50.millis) {
         val state = IndexerState.fromHistory(_history)
@@ -1819,14 +1925,22 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
         state.indexedHeaderId shouldBe Some(tipBefore.id)
       }
 
-      val spentBox = history.typedExtraIndexById[IndexedErgoBox](inputId).get
-      spentBox.spendingTxIdOpt shouldBe Some(originalTx.id)
-      spentBox.spendingHeightOpt shouldBe Some(2)
-      history.typedExtraIndexById[IndexedErgoTransaction](originalTx.id).get.globalIndex shouldBe originalTxIndex
-      history.typedExtraIndexById[IndexedErgoBox](outputId).get.globalIndex shouldBe originalOutputIndex
-      val state = IndexerState.fromHistory(_history)
-      state.globalTxIndex shouldBe txsIndexed
-      state.globalBoxIndex shouldBe boxesIndexed
+      // Capture both durable stages before asserting so the failing release implementation
+      // still exercises rollback and storage reopen rather than stopping at the first overwrite.
+      val afterRollback = snapshot(allDerivedRowIds)
+      val probe = TestProbe()(system)
+      probe.send(indexer, ReopenCheckpoint())
+      val reopenedState = probe.expectMsgType[IndexerState]
+      val afterReopen = snapshot(allDerivedRowIds)
+      val expected = baseline.copy(
+        derivedRows = baseline.derivedRows ++
+          (allDerivedRowIds -- baselineDerivedRowIds).map(id => id -> None).toMap)
+
+      assertSnapshot("after rollback", afterRollback, expected)
+      withClue("reopened checkpoint state: ") { reopenedState shouldBe expected.state }
+      assertSnapshot("after reopen", afterReopen, expected)
+
+      // Re-run the independent semantic oracles against the reopened database.
       checkAddresses(addresses) shouldBe 0
       checkTemplates(templates) shouldBe 0
       checkTokens(indexedTokens) shouldBe 0

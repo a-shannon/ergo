@@ -1,0 +1,33 @@
+name: ExtraIndexer same-ID replay diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2640-same-tx-diagnostic-20261012
+
+permissions:
+  contents: read
+
+jobs:
+  extra-indexer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact diagnostic head
+        uses: actions/checkout@v7
+      - name: Set up Java and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Run ExtraIndexer specification
+        run: sbt ++2.12.20 "testOnly *ExtraIndexerSpecification"
+      - name: Preserve node and test logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: extra-indexer-same-id-${{ github.run_id }}
+          path: |
+            target/logs
+            target/test-reports
+          if-no-files-found: ignore
