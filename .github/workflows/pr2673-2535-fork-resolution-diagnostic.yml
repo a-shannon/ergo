@@ -1,0 +1,65 @@
+name: PR 2673 and 2535 fork resolution diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2673-pr2535-forkresolution-20261012
+
+permissions:
+  contents: read
+
+jobs:
+  fork_resolution:
+    name: ForkResolutionSpec on composed PR heads
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout exact scratch branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Build node image and run exact ForkResolutionSpec
+        timeout-minutes: 35
+        run: |
+          mkdir -p tmp
+          TMPDIR="$PWD/tmp" sbt -Denv=test clean ++2.12.20 docker "it:testOnly org.ergoplatform.it.ForkResolutionSpec"
+
+      - name: Save leftover node container logs
+        if: failure() || cancelled()
+        timeout-minutes: 3
+        run: |
+          mkdir -p target/logs/containers
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              docker inspect --format '{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} finished={{.State.FinishedAt}}' "$id" || true
+              docker logs --timestamps "$id" > "target/logs/containers/$name.log" 2>&1 || true
+            done
+
+      - name: Upload IT logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr2673-2535-fork-logs-attempt-${{ github.run_attempt }}
+          path: |
+            target/logs/
+            target/it-reports/
+          if-no-files-found: ignore
+          retention-days: 14
