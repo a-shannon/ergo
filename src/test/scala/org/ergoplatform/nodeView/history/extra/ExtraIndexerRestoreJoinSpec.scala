@@ -109,7 +109,12 @@ class ExtraIndexerRestoreJoinSpec extends ErgoCorePropertyTest with NodeViewTest
         stopNodeViewHolder()
         startNodeViewHolder()
         getCurrentState.version shouldBe idToVersion(block.id)
-        IndexerState.fromHistory(getHistory).indexedHeight shouldBe 0
+        val restoredHistory = getHistory
+        restoredHistory.bestFullBlockIdOpt shouldBe Some(block.id)
+        validityIds.foreach { id =>
+          restoredHistory.isSemanticallyValid(id) shouldBe ModifierSemanticValidity.Unknown
+        }
+        IndexerState.fromHistory(restoredHistory).indexedHeight shouldBe 0
 
         val indexer = actorSystem.actorOf(Props(new ExtraIndexer(
           settings.cacheSettings,
