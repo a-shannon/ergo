@@ -1,14 +1,14 @@
-name: V2 fork composition diagnostic
+name: V2 deep rollback composition diagnostic
 
 on:
   push:
     branches:
-      - feat/v2-exact-fork-composed
+      - feat/v2-deep-rollback-diagnostic-20261012
   workflow_dispatch:
 
 jobs:
-  fork_resolution:
-    name: ForkResolutionSpec on composed V2 fixes
+  deep_rollback:
+    name: DeepRollBackSpec on composed V2 fixes
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -33,11 +33,11 @@ jobs:
             ~/.cache/coursier/v1
           key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
 
-      - name: Build node image and run exact ForkResolutionSpec
+      - name: Build node image and run exact DeepRollBackSpec
         timeout-minutes: 35
         run: |
           mkdir -p tmp
-          TMPDIR="$PWD/tmp" sbt -Denv=test clean ++2.12.20 docker "it:testOnly org.ergoplatform.it.ForkResolutionSpec"
+          TMPDIR="$PWD/tmp" sbt -Denv=test clean ++2.12.20 docker "it:testOnly org.ergoplatform.it.DeepRollBackSpec"
 
       - name: Save leftover node container logs
         if: failure() || cancelled()
@@ -54,7 +54,7 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
-          name: v2-fork-logs-attempt-${{ github.run_attempt }}
+          name: v2-deep-rollback-logs-attempt-${{ github.run_attempt }}
           path: |
             target/logs/
             target/it-reports/

@@ -105,6 +105,34 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
     snapshot(phase, "A", nodeA, budget).zip(snapshot(phase, "B", nodeB, budget))
   }
 
+  private def waitForIsolatedHeight(
+    label: String,
+    miner: Node,
+    otherMiners: Seq[Node],
+    expectedHeight: Int,
+    retryingInterval: FiniteDuration = 1.second
+  ): Future[Int] = {
+    val isolatedMiners = miner +: otherMiners
+    miner.waitForProgress[(NodeInfo, Seq[Int]), (Option[Int], Option[String])](
+      s"$label isolated fullHeight >= $expectedHeight",
+      node => node.info.zip(Future.traverse(isolatedMiners)(_.connectedPeers.map(_.size))),
+      { case (info, peerCounts) =>
+        withClue(s"$label connected during isolated mining: ") {
+          peerCounts.foreach(_ shouldBe 0)
+        }
+        info.bestBlockHeightOpt.getOrElse(0) >= expectedHeight
+      },
+      retryingInterval
+    )(
+      { case (info, _) => Some(info.bestBlockHeightOpt -> info.bestBlockIdOpt) },
+      { case (info, peerCounts) =>
+        s"fullHeight=${info.bestBlockHeightOpt.getOrElse(0)} " +
+          s"bestFullHeaderId=${info.bestBlockIdOpt.getOrElse("none")} " +
+          s"connectedPeerCounts=${peerCounts.mkString(",")}"
+      }
+    ).map(_._1.bestBlockHeightOpt.getOrElse(0))
+  }
+
   private def waitForSameBestBlock(
     nodeA: Node,
     nodeB: Node,
@@ -175,15 +203,20 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
       val minerAIsolated: Node = docker.startDevNetNode(minerAConfig, isolatedPeersConfig,
         specialVolumeOpt = Some((localVolumeA, remoteVolumeA))).get
 
+      Async.await(minerAIsolated.connectedPeers) shouldBe empty
+
       // 1. Let nodeA mine `chainLength + delta` blocks in isolation
-      Async.await(minerAIsolated.waitForHeight(chainLength + delta))
+      Async.await(waitForIsolatedHeight("A", minerAIsolated, Seq.empty, chainLength + delta))
 
       val minerBIsolated: Node = docker.startDevNetNode(minerBConfig, isolatedPeersConfig,
         specialVolumeOpt = Some((localVolumeB, remoteVolumeB))).get
+      Async.await(minerAIsolated.connectedPeers) shouldBe empty
+      Async.await(minerBIsolated.connectedPeers) shouldBe empty
       Async.await(observeNodes("isolated miners started", minerAIsolated, minerBIsolated))
 
       // 2. Let nodeB mine `chainLength` blocks in isolation
-      Async.await(minerBIsolated.waitForHeight(chainLength, 100.millis))
+      Async.await(waitForIsolatedHeight("B", minerBIsolated, Seq(minerAIsolated),
+        chainLength, 100.millis))
 
       Async.await(minerAIsolated.connectedPeers) shouldBe empty
       Async.await(minerBIsolated.connectedPeers) shouldBe empty
@@ -193,6 +226,16 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
       val minerABestHeight = Async.await(minerAIsolated.fullHeight)
       val minerBBestHeight = Async.await(minerBIsolated.fullHeight)
       Async.await(observeNodes("isolated mining complete", minerAIsolated, minerBIsolated))
+
+      val minerBSelectedId = Async.await(minerBIsolated.info).bestBlockIdOpt.getOrElse(
+        fail("Isolated miner B has no selected full block"))
+      val minerAIdsAtBHeight = Async.await(minerAIsolated.headerIdsByHeight(minerBBestHeight))
+      minerAIdsAtBHeight.nonEmpty shouldBe true
+      withClue(s"No distinct isolated fork at height $minerBBestHeight: ") {
+        minerAIdsAtBHeight.contains(minerBSelectedId) shouldBe false
+      }
+      log.info(s"Distinct isolated fork at height $minerBBestHeight: " +
+        s"A=${minerAIdsAtBHeight.mkString(",")} B=$minerBSelectedId")
 
       docker.stopNode(minerAIsolated.containerId)
       docker.stopNode(minerBIsolated.containerId)
