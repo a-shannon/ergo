@@ -1,0 +1,60 @@
+name: PR 2698 isolation composition diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2698-isolation-composition-20261012
+
+permissions:
+  contents: read
+
+jobs:
+  fork-resolution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run ForkResolutionSpec on the composed scratch head
+        timeout-minutes: 35
+        run: |
+          mkdir -p tmp
+          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++2.12.20 "it:testOnly org.ergoplatform.it.ForkResolutionSpec"
+
+      - name: Save leftover node container logs
+        if: failure() || cancelled()
+        timeout-minutes: 3
+        run: |
+          mkdir -p target/logs/containers
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              docker inspect --format '{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} finished={{.State.FinishedAt}}' "$id" || true
+              docker logs --timestamps "$id" > "target/logs/containers/$name.log" 2>&1 || true
+            done
+
+      - name: Upload integration logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr2698-isolation-composition-logs
+          path: |
+            target/logs/
+            target/it-reports/
+          if-no-files-found: ignore
+          retention-days: 14
