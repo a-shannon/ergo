@@ -1778,6 +1778,65 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     indexer ! Reset()
   }
 
+  property("a rejected replay of an already indexed transaction preserves its original occurrence") {
+    indexer ! CreateDB(HEIGHT)
+    try {
+      indexer ! Index()
+      awaitCondition(done)
+      val tipBefore = fullChainHeaderAt(HEIGHT)
+      val (addresses, templates, indexedTokens, txsIndexed, boxesIndexed) = manualIndex(HEIGHT)
+      val originalTx = fullChainTransactionsAt(2).txs.find(_.inputs.nonEmpty).get
+      val inputId = bytesToId(originalTx.inputs.head.boxId)
+      val outputId = bytesToId(originalTx.outputs.head.id)
+      val originalTxIndex = history.typedExtraIndexById[IndexedErgoTransaction](originalTx.id).get.globalIndex
+      val originalOutputIndex = history.typedExtraIndexById[IndexedErgoBox](outputId).get.globalIndex
+      history.typedExtraIndexById[IndexedErgoBox](inputId).get.spendingHeightOpt shouldBe Some(2)
+
+      val forged = ChainGenerator.forgeUnvalidatedBlockWithTransactions(_history, Seq(originalTx))
+      _history.fullBlockHeight shouldBe HEIGHT + 1
+      _history.isSemanticallyValid(forged.header.id) shouldBe ModifierSemanticValidity.Unknown
+
+      indexer ! SetCaughtUp(false)
+      indexer ! Index()
+      org.ergoplatform.utils.untilTimeout(10.seconds, 50.millis) {
+        IndexerState.fromHistory(_history).indexedHeight shouldBe HEIGHT + 1
+      }
+
+      // Neither a duplicate tx id nor its identical output ids identify a new valid occurrence.
+      history.typedExtraIndexById[IndexedErgoBox](inputId).get.spendingHeightOpt shouldBe Some(2)
+      history.typedExtraIndexById[IndexedErgoTransaction](originalTx.id).get.globalIndex shouldBe originalTxIndex
+      history.typedExtraIndexById[IndexedErgoBox](outputId).get.globalIndex shouldBe originalOutputIndex
+
+      _history.reportModifierIsInvalid(
+        forged.header,
+        ProgressInfo[BlockSection](None, Seq.empty, Seq.empty, Seq.empty)(
+          org.ergoplatform.utils.ScorexEncoder.default)
+      ).get
+      indexer ! Index()
+      org.ergoplatform.utils.untilTimeout(10.seconds, 50.millis) {
+        val state = IndexerState.fromHistory(_history)
+        state.indexedHeight shouldBe HEIGHT
+        state.indexedHeaderId shouldBe Some(tipBefore.id)
+      }
+
+      val spentBox = history.typedExtraIndexById[IndexedErgoBox](inputId).get
+      spentBox.spendingTxIdOpt shouldBe Some(originalTx.id)
+      spentBox.spendingHeightOpt shouldBe Some(2)
+      history.typedExtraIndexById[IndexedErgoTransaction](originalTx.id).get.globalIndex shouldBe originalTxIndex
+      history.typedExtraIndexById[IndexedErgoBox](outputId).get.globalIndex shouldBe originalOutputIndex
+      val state = IndexerState.fromHistory(_history)
+      state.globalTxIndex shouldBe txsIndexed
+      state.globalBoxIndex shouldBe boxesIndexed
+      checkAddresses(addresses) shouldBe 0
+      checkTemplates(templates) shouldBe 0
+      checkTokens(indexedTokens) shouldBe 0
+      checkRentIndex()
+      checkRentIndexAgainstChain(HEIGHT)
+    } finally {
+      indexer ! Reset()
+    }
+  }
+
   property("box by number lookup tolerates a missing number row") {
     indexer ! CreateDB(2)
     awaitCondition(created)

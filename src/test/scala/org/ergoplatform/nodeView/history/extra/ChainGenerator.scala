@@ -244,6 +244,13 @@ object ChainGenerator extends ErgoTestHelpers with Matchers {
         IndexedSeq.empty,
         IndexedSeq(new ErgoBoxCandidate(MinTxAmount, selfAddressScript, height)))
     }
+    forgeUnvalidatedBlockWithTransactions(history, txs)
+  }
+
+  /** Append a valid-PoW but state-unapplied block containing the exact supplied transactions. */
+  def forgeUnvalidatedBlockWithTransactions(history: ErgoHistory,
+                                            txs: Seq[ErgoTransaction]): ErgoFullBlock = {
+    val parent = history.bestFullBlockOpt.get.header
     val nBits = DifficultySerializer.encodeCompactBits(history.requiredDifficultyAfter(parent))
     val interlinks = history.typedModifierById[Extension](parent.extensionId)
       .flatMap(ext => NipopowAlgos.unpackInterlinks(ext.fields).toOption)
