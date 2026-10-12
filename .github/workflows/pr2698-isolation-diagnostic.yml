@@ -35,7 +35,7 @@ jobs:
         timeout-minutes: 35
         run: |
           mkdir -p tmp
-          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++2.12.20 "it:testOnly org.ergoplatform.it.ForkResolutionSpec"
+          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++2.12.20 docker "it:testOnly org.ergoplatform.it.ForkResolutionSpec"
 
       - name: Save leftover node container logs
         if: failure() || cancelled()
