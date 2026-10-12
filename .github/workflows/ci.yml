@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - develop
+      - feat/pr2535-preisolation-diagnostic-20261012
   pull_request:
     types:
       - opened
@@ -16,6 +17,7 @@ env:
 jobs:
   test_wallet:
     name: Run wallet tests and publish a wallet snapshot
+    if: github.ref != 'refs/heads/feat/pr2535-preisolation-diagnostic-20261012'
     env:
       HAS_SECRETS: ${{ secrets.SONATYPE_PASSWORD != '' }}
     strategy:
@@ -60,6 +62,7 @@ jobs:
 
   test_core:
     name: Run ergo-core tests and publish a ergo-core snapshot
+    if: github.ref != 'refs/heads/feat/pr2535-preisolation-diagnostic-20261012'
     env:
       HAS_SECRETS: ${{ secrets.SONATYPE_PASSWORD != '' }}
     strategy:
@@ -104,6 +107,7 @@ jobs:
 
   test_node:
     name: Run node tests
+    if: github.ref != 'refs/heads/feat/pr2535-preisolation-diagnostic-20261012'
     strategy:
       matrix:
         os: [ubuntu-latest]
@@ -178,7 +182,11 @@ jobs:
          run: |
            cd it
            mkdir tmp
-           TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++${{ matrix.scala }} it:test
+           if [ "$GITHUB_REF" = 'refs/heads/feat/pr2535-preisolation-diagnostic-20261012' ]; then
+             TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++${{ matrix.scala }} docker 'it:testOnly org.ergoplatform.it.ForkResolutionSpec'
+           else
+             TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++${{ matrix.scala }} it:test
+           fi
 
        # logs of the containers that Docker.close() did not save and remove, e.g. after the
        # test step timed out (which does not stop sbt)
