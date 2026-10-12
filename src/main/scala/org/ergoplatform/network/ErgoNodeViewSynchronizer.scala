@@ -75,10 +75,10 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
   private var syncInfoV1CacheByHeadersHeight: Option[(Int, ErgoSyncInfoV1)] = Option.empty
 
-  // full and reduced V2 sync infos differ, so they are cached separately
-  private var fullSyncInfoV2CacheByHeadersHeight: Option[(Int, ErgoSyncInfoV2)] = Option.empty
+  // Full and reduced V2 sync infos differ, and either changes with the selected tip at the same height.
+  private var fullSyncInfoV2Cache: Option[((Int, Option[ModifierId]), ErgoSyncInfoV2)] = Option.empty
 
-  private var reducedSyncInfoV2CacheByHeadersHeight: Option[(Int, ErgoSyncInfoV2)] = Option.empty
+  private var reducedSyncInfoV2Cache: Option[((Int, Option[ModifierId]), ErgoSyncInfoV2)] = Option.empty
 
   private val networkSettings: NetworkSettings = settings.scorexSettings.network
 
@@ -318,16 +318,16 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
   /** Get V2 sync info from cache or load it from history and add to cache */
   private def getV2SyncInfo(history: ErgoHistory, full: Boolean): ErgoSyncInfoV2 = {
-    val headersHeight = history.headersHeight
-    val cache = if (full) fullSyncInfoV2CacheByHeadersHeight else reducedSyncInfoV2CacheByHeadersHeight
+    val key = (history.headersHeight, history.bestHeaderIdOpt)
+    val cache = if (full) fullSyncInfoV2Cache else reducedSyncInfoV2Cache
     cache
-      .collect { case (height, syncInfo) if height == headersHeight => syncInfo }
+      .collect { case (cachedKey, syncInfo) if cachedKey == key => syncInfo }
       .getOrElse {
         val v2SyncInfo = history.syncInfoV2(full)
         if (full) {
-          fullSyncInfoV2CacheByHeadersHeight = Some(headersHeight -> v2SyncInfo)
+          fullSyncInfoV2Cache = Some(key -> v2SyncInfo)
         } else {
-          reducedSyncInfoV2CacheByHeadersHeight = Some(headersHeight -> v2SyncInfo)
+          reducedSyncInfoV2Cache = Some(key -> v2SyncInfo)
         }
         v2SyncInfo
       }
