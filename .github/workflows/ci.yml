@@ -6,6 +6,7 @@ on:
       - master
       - develop
       - feat/v2-twohead-ci-20261012
+      - feat/v2-isolation-diagnostic-20261012
   pull_request:
     types:
       - opened
