@@ -184,7 +184,7 @@ jobs:
            cd it
            mkdir tmp
            if [ "$GITHUB_REF" = 'refs/heads/feat/v2-isolation-diagnostic-20261012' ]; then
-             TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++${{ matrix.scala }} 'it:testOnly org.ergoplatform.it.ForkResolutionSpec'
+             TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++${{ matrix.scala }} docker 'it:testOnly org.ergoplatform.it.ForkResolutionSpec'
            else
              TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++${{ matrix.scala }} it:test
            fi
