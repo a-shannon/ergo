@@ -33,11 +33,11 @@ jobs:
             ~/.cache/coursier/v1
           key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
 
-      - name: Run exact ForkResolutionSpec
+      - name: Build node image and run exact ForkResolutionSpec
         timeout-minutes: 35
         run: |
           mkdir -p tmp
-          TMPDIR="$PWD/tmp" sbt -Denv=test clean ++2.12.20 "it:testOnly org.ergoplatform.it.ForkResolutionSpec"
+          TMPDIR="$PWD/tmp" sbt -Denv=test clean ++2.12.20 docker "it:testOnly org.ergoplatform.it.ForkResolutionSpec"
 
       - name: Save leftover node container logs
         if: failure() || cancelled()
