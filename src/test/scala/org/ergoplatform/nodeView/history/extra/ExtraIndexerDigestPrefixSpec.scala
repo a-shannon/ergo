@@ -22,7 +22,11 @@ class ExtraIndexerDigestPrefixSpec extends ErgoCorePropertyTest with NodeViewTes
       verifyTransactions = true,
       popowBootstrap = false
     ).toSettings
-    val settings = defaults.copy(nodeSettings = defaults.nodeSettings.copy(extraIndex = true))
+    val votingLength = 10
+    val settings = defaults.copy(
+      chainSettings = defaults.chainSettings.copy(
+        voting = defaults.chainSettings.voting.copy(votingLength = votingLength)),
+      nodeSettings = defaults.nodeSettings.copy(extraIndex = true))
 
     new NodeViewFixture(settings, parameters).apply { fixture =>
       import fixture._
@@ -31,18 +35,22 @@ class ExtraIndexerDigestPrefixSpec extends ErgoCorePropertyTest with NodeViewTes
       try {
         var source = WrappedUtxoState(utxoState, boxes, fixture.settings)
         var parent: Option[ErgoFullBlock] = None
-        val blocks = (1 to 2).map { _ =>
+        // B10 is a voting-epoch checkpoint. Production can recover its context
+        // and then replay B11/B12 as headers without validating B12's body.
+        val blocks = (1 to votingLength + 2).map { _ =>
           val block = validFullBlock(parent, source)
           source = source.applyModifier(block)(_ => ()).get
           applyBlock(block).get
           parent = Some(block)
           block
         }
-        val first = blocks.head
+        val first = blocks(votingLength)
         val second = blocks.last
+        first.header.height shouldBe votingLength + 1
+        second.header.height shouldBe votingLength + 2
 
-        // Model a crash after history selected a complete second block but before its
-        // state application/validity batch. The second block's bytes stay in history.
+        // Model a crash after history selected complete B12 but before its
+        // state application/validity batch. B12's bytes stay in history.
         val history = getHistory
         val secondIds = second.header.id +: second.header.sectionIds.map(_._2)
         org.ergoplatform.utils.untilTimeout(10.seconds, 50.millis) {
