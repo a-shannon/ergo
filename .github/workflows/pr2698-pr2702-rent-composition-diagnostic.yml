@@ -1,0 +1,61 @@
+name: Rent candidate composition diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2698-pr2702-compose-20261012
+
+permissions:
+  contents: read
+
+jobs:
+  rent_candidate_join:
+    name: Rent cursor and selected-checkpoint join
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact scratch branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run focused composed candidate and indexer properties
+        timeout-minutes: 30
+        run: |
+          set -o pipefail
+          sbt -Denv=test clean ++2.12.20 \
+            "testOnly org.ergoplatform.mining.CandidateRentIndexContinuitySpec" \
+            "testOnly org.ergoplatform.mining.CandidateRentSkippedPageSpec" \
+            "testOnly org.ergoplatform.mining.CandidateRentMaxBoxIndexSpec" \
+            "testOnly org.ergoplatform.mining.CandidateRentRejectIndexSpec" \
+            "testOnly org.ergoplatform.nodeView.history.extra.ExtraIndexerSpecification -- -z revisits" \
+            "testOnly org.ergoplatform.nodeView.history.extra.ExtraIndexerSpecification -- -z retries" \
+            2>&1 | tee rent-composition-test.log
+
+      - name: Upload focused test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rent-composition-attempt-${{ github.run_attempt }}
+          path: |
+            rent-composition-test.log
+            target/test-reports/
+          if-no-files-found: ignore
+          retention-days: 14

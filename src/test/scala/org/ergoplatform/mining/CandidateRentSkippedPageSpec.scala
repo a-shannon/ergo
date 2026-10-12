@@ -4,17 +4,19 @@ import java.lang.reflect.{InvocationHandler, Method, Proxy}
 import java.nio.ByteBuffer
 
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
+import org.ergoplatform.modifiers.BlockSection
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.nodeView.history.ErgoHistoryReader
 import org.ergoplatform.nodeView.history.extra.{ExtraIndex, ExtraIndexer, IndexedErgoBox, NumericBoxIndex, StorageRentBox}
 import org.ergoplatform.nodeView.history.storage.HistoryStorage
+import org.ergoplatform.nodeView.history.storage.modifierprocessors.FullBlockProcessor
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.nodeView.state.{BoxHolder, ErgoStateContext, UtxoState, VotingData}
 import org.ergoplatform.settings.Constants
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.utils.generators.ErgoCoreTransactionGenerators._
 import org.ergoplatform.wallet.utils.TestFileUtils
-import scorex.util.{ModifierId, bytesToId}
+import scorex.util.{ModifierId, bytesToId, idToBytes}
 import sigma.Colls
 import sigma.ast.ByteArrayConstant
 import sigmastate.helpers.TestingHelpers._
@@ -67,14 +69,19 @@ class CandidateRentSkippedPageSpec extends ErgoCorePropertyTest with TestFileUti
       override def emissionBoxOpt: Option[ErgoBox] = None
     }
     val storage = HistoryStorage(fixtureSettings)
+    storage.insert(Array(FullBlockProcessor.chainStatusKey(parentHeader.id) ->
+      FullBlockProcessor.BestChainMarker), Array[BlockSection](parentHeader)).get
     val rows = rentBoxes.zipWithIndex.flatMap { case (box, index) =>
       val indexed = new IndexedErgoBox(box.creationHeight, None, None, None, box, index.toLong)
       Seq[ExtraIndex](indexed, NumericBoxIndex(index.toLong, indexed.id), StorageRentBox(indexed))
     }
-    storage.insertExtra(Array(ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4)
-      .putInt(height - 1).array), rows.toArray)
+    storage.insertExtra(Array(
+      ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4).putInt(height - 1).array,
+      ExtraIndexer.IndexedHeaderIdKey -> idToBytes(parentHeader.id)
+    ), rows.toArray)
     val scanRowCounts = scala.collection.mutable.ArrayBuffer.empty[Int]
     val removedRowCounts = scala.collection.mutable.ArrayBuffer.empty[Int]
+    var reportedFullHeight = parentHeader.height
     val history = Proxy.newProxyInstance(
       classOf[ErgoHistoryReader].getClassLoader,
       Array[Class[_]](classOf[ErgoHistoryReader]),
@@ -82,7 +89,7 @@ class CandidateRentSkippedPageSpec extends ErgoCorePropertyTest with TestFileUti
         override def invoke(proxy: Any, method: Method, args: Array[AnyRef]): AnyRef =
           method.getName match {
             case "bestFullBlockOpt" => Some(parentBlock)
-            case "fullBlockHeight" => Int.box(parentHeader.height)
+            case "fullBlockHeight" => Int.box(reportedFullHeight)
             case "historyStorage" => storage
             case "typedExtraIndexById" => storage.getExtraIndex(args(0).asInstanceOf[ModifierId])
             case "storageRentBoxesAtOrBefore" =>
@@ -95,7 +102,8 @@ class CandidateRentSkippedPageSpec extends ErgoCorePropertyTest with TestFileUti
               removedRowCounts += ids.size
               storage.removeStorageRentBoxes(ids)
               ().asInstanceOf[AnyRef]
-            case "typedModifierById" => None
+            case "typedModifierById" =>
+              if (args(0) == parentHeader.id) Some(parentHeader) else None
             case "requiredDifficultyAfter" => parentHeader.requiredDifficulty
             case other => throw new UnsupportedOperationException(s"unexpected history read: $other")
           }
@@ -128,6 +136,12 @@ class CandidateRentSkippedPageSpec extends ErgoCorePropertyTest with TestFileUti
 
       candidateInputs() shouldBe Set(bytesToId(freshBox.id))
       scan.after.map(_.globalIndex) shouldBe Some(scanLimit.toLong - 1)
+      val cursorAfterFirst = scan.after
+      reportedFullHeight += 3
+      candidateInputs() shouldBe Set(bytesToId(freshBox.id))
+      scan.after shouldBe cursorAfterFirst
+      scanRowCounts.toSeq shouldBe Seq(scanLimit)
+      reportedFullHeight = parentHeader.height
       // A successful ordinary candidate must preserve every unspent skipped row.
       assertUnspentRowsRetained()
       candidateInputs() shouldBe Set(bytesToId(freshBox.id), bytesToId(laterBox.id))
@@ -197,12 +211,16 @@ class CandidateRentSkippedPageSpec extends ErgoCorePropertyTest with TestFileUti
       override def emissionBoxOpt: Option[ErgoBox] = None
     }
     val storage = HistoryStorage(fixtureSettings)
+    storage.insert(Array(FullBlockProcessor.chainStatusKey(parentHeader.id) ->
+      FullBlockProcessor.BestChainMarker), Array[BlockSection](parentHeader)).get
     val rows = rentBoxes.zipWithIndex.flatMap { case (box, index) =>
       val indexed = new IndexedErgoBox(box.creationHeight, None, None, None, box, index.toLong)
       Seq[ExtraIndex](indexed, NumericBoxIndex(index.toLong, indexed.id), StorageRentBox(indexed))
     }
-    storage.insertExtra(Array(ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4)
-      .putInt(height - 1).array), rows.toArray)
+    storage.insertExtra(Array(
+      ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4).putInt(height - 1).array,
+      ExtraIndexer.IndexedHeaderIdKey -> idToBytes(parentHeader.id)
+    ), rows.toArray)
     val scanRowCounts = scala.collection.mutable.ArrayBuffer.empty[Int]
     val removedRowCounts = scala.collection.mutable.ArrayBuffer.empty[Int]
     val history = Proxy.newProxyInstance(
@@ -225,7 +243,8 @@ class CandidateRentSkippedPageSpec extends ErgoCorePropertyTest with TestFileUti
               removedRowCounts += ids.size
               storage.removeStorageRentBoxes(ids)
               ().asInstanceOf[AnyRef]
-            case "typedModifierById" => None
+            case "typedModifierById" =>
+              if (args(0) == parentHeader.id) Some(parentHeader) else None
             case "requiredDifficultyAfter" => parentHeader.requiredDifficulty
             case other => throw new UnsupportedOperationException(s"unexpected history read: $other")
           }

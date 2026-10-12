@@ -3,17 +3,18 @@ package org.ergoplatform.mining
 import java.lang.reflect.{InvocationHandler, Method, Proxy}
 
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
-import org.ergoplatform.modifiers.ErgoFullBlock
+import org.ergoplatform.modifiers.{BlockSection, ErgoFullBlock}
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.nodeView.history.ErgoHistoryReader
 import org.ergoplatform.nodeView.history.extra.{ExtraIndex, ExtraIndexer, IndexedErgoBox, NumericBoxIndex, StorageRentBox}
 import org.ergoplatform.nodeView.history.storage.HistoryStorage
+import org.ergoplatform.nodeView.history.storage.modifierprocessors.FullBlockProcessor
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.nodeView.state.{BoxHolder, ErgoStateContext, UtxoState, VotingData}
 import org.ergoplatform.settings.Constants
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.wallet.utils.TestFileUtils
-import scorex.util.{ModifierId, bytesToId}
+import scorex.util.{ModifierId, bytesToId, idToBytes}
 import sigma.Colls
 import sigma.data.Digest32Coll
 import sigmastate.helpers.TestingHelpers._
@@ -77,9 +78,13 @@ class CandidateRentMaxBoxIndexSpec extends ErgoCorePropertyTest with TestFileUti
       override def emissionBoxOpt: Option[ErgoBox] = None
     }
     val storage = HistoryStorage(fixtureSettings)
+    storage.insert(Array(FullBlockProcessor.chainStatusKey(parentHeader.id) ->
+      FullBlockProcessor.BestChainMarker), Array[BlockSection](parentHeader)).get
     val indexed = new IndexedErgoBox(box.creationHeight, None, None, None, box, 0L)
-    storage.insertExtra(Array(ExtraIndexer.IndexedHeightKey ->
-      java.nio.ByteBuffer.allocate(4).putInt(parentHeader.height).array),
+    storage.insertExtra(Array(
+      ExtraIndexer.IndexedHeightKey ->
+        java.nio.ByteBuffer.allocate(4).putInt(parentHeader.height).array,
+      ExtraIndexer.IndexedHeaderIdKey -> idToBytes(parentHeader.id)),
       Array[ExtraIndex](indexed, NumericBoxIndex(0L, indexed.id), StorageRentBox(indexed)))
     val history = historyProxy(storage, parentBlock)
 
@@ -147,7 +152,8 @@ class CandidateRentMaxBoxIndexSpec extends ErgoCorePropertyTest with TestFileUti
               ().asInstanceOf[AnyRef]
             case "typedExtraIndexById" =>
               storage.getExtraIndex(args(0).asInstanceOf[ModifierId])
-            case "typedModifierById" => None
+            case "typedModifierById" =>
+              if (args(0) == parentBlock.header.id) Some(parentBlock.header) else None
             case "requiredDifficultyAfter" => parentBlock.header.requiredDifficulty
             case other => throw new UnsupportedOperationException(s"unexpected history read: $other")
           }

@@ -830,33 +830,49 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
   }
 
   property("retries catch-up after a transient non-extending header") {
-    indexer ! CreateDB(HEIGHT)
-    awaitCondition(created)
-    indexer ! DeferNextHeaderOnce(2)
-    awaitCondition(created)
-    indexer ! Index()
-
-    org.ergoplatform.utils.untilTimeout(3.seconds, 50.millis) {
-      val state = IndexerState.fromHistory(_history)
-      state.indexedHeight shouldBe HEIGHT
-      state.indexedHeaderId shouldBe history.bestHeaderIdAtHeight(HEIGHT)
+    val commandProbe = TestProbe()(system)
+    def awaitProcessed(message: Any): IndexerState = {
+      commandProbe.send(indexer, message)
+      commandProbe.send(indexer, GetLoadedState())
+      commandProbe.expectMsgType[IndexerState](2.minutes)
     }
-    indexer ! Reset()
+
+    try {
+      awaitProcessed(CreateDB(HEIGHT)).indexedHeight shouldBe 0
+      awaitProcessed(DeferNextHeaderOnce(2))
+      awaitProcessed(Index())
+
+      org.ergoplatform.utils.untilTimeout(3.seconds, 50.millis) {
+        val state = IndexerState.fromHistory(_history)
+        state.indexedHeight shouldBe HEIGHT
+        state.indexedHeaderId shouldBe history.bestHeaderIdAtHeight(HEIGHT)
+      }
+    } finally {
+      awaitProcessed(Reset()).indexedHeight shouldBe 0
+    }
   }
 
   property("retries catch-up when the selected block transactions are temporarily unavailable") {
-    indexer ! CreateDB(HEIGHT)
-    awaitCondition(created)
-    indexer ! DeferBlockTransactionsOnce(2)
-    awaitCondition(created)
-    indexer ! Index()
-
-    org.ergoplatform.utils.untilTimeout(3.seconds, 50.millis) {
-      val state = IndexerState.fromHistory(_history)
-      state.indexedHeight shouldBe HEIGHT
-      state.indexedHeaderId shouldBe Some(fullChainHeaderAt(HEIGHT).id)
+    val commandProbe = TestProbe()(system)
+    def awaitProcessed(message: Any): IndexerState = {
+      commandProbe.send(indexer, message)
+      commandProbe.send(indexer, GetLoadedState())
+      commandProbe.expectMsgType[IndexerState](2.minutes)
     }
-    indexer ! Reset()
+
+    try {
+      awaitProcessed(CreateDB(HEIGHT)).indexedHeight shouldBe 0
+      awaitProcessed(DeferBlockTransactionsOnce(2))
+      awaitProcessed(Index())
+
+      org.ergoplatform.utils.untilTimeout(3.seconds, 50.millis) {
+        val state = IndexerState.fromHistory(_history)
+        state.indexedHeight shouldBe HEIGHT
+        state.indexedHeaderId shouldBe Some(fullChainHeaderAt(HEIGHT).id)
+      }
+    } finally {
+      awaitProcessed(Reset()).indexedHeight shouldBe 0
+    }
   }
 
   property("the production actor pulls an applied-state snapshot before catch-up") {
@@ -1106,7 +1122,8 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
             scanSizes += rows.length
             rows
           case "removeStorageRentBoxes" => fail("candidate must not delete this fixture's rent rows")
-          case "typedModifierById" => None
+          case "typedModifierById" =>
+            history.typedModifierById[Header](args(0).asInstanceOf[ModifierId])
           case "requiredDifficultyAfter" => agedParent.requiredDifficulty
           case other => throw new UnsupportedOperationException(s"unexpected mining history read: $other")
         }

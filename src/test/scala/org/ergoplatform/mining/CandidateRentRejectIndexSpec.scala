@@ -8,6 +8,7 @@ import akka.pattern.StatusReply
 import akka.testkit.{TestKit, TestProbe}
 import org.ergoplatform.mining.CandidateGenerator.{Candidate, GenerateCandidate}
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
+import org.ergoplatform.modifiers.BlockSection
 import org.ergoplatform.modifiers.history.HeaderChain
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.EliminateTransactions
@@ -15,6 +16,7 @@ import org.ergoplatform.nodeView.ErgoReadersHolder.{GetReaders, Readers}
 import org.ergoplatform.nodeView.history.ErgoHistoryReader
 import org.ergoplatform.nodeView.history.extra.{ExtraIndex, ExtraIndexer, IndexedErgoBox, NumericBoxIndex, StorageRentBox}
 import org.ergoplatform.nodeView.history.storage.HistoryStorage
+import org.ergoplatform.nodeView.history.storage.modifierprocessors.FullBlockProcessor
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.nodeView.state.{BoxHolder, ErgoStateContext, UtxoState, VotingData}
 import org.ergoplatform.nodeView.wallet.ErgoWalletReader
@@ -57,13 +59,17 @@ class CandidateRentRejectIndexSpec extends ErgoCorePropertyTest with TestFileUti
         override def emissionBoxOpt: Option[ErgoBox] = None
       }
       val storage = HistoryStorage(fixtureSettings)
+      storage.insert(Array(FullBlockProcessor.chainStatusKey(parentHeader.id) ->
+        FullBlockProcessor.BestChainMarker), Array[BlockSection](parentHeader)).get
       eligibleBoxes.zipWithIndex.foreach { case (box, index) =>
         val indexed = new IndexedErgoBox(box.creationHeight, None, None, None, box, index.toLong)
         storage.insertExtra(Array.empty[(Array[Byte], Array[Byte])],
           Array[ExtraIndex](indexed, NumericBoxIndex(index.toLong, indexed.id), StorageRentBox(indexed)))
       }
-      storage.insertExtra(Array(ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4)
-        .putInt(height - 1).array), Array.empty[ExtraIndex])
+      storage.insertExtra(Array(
+        ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4).putInt(height - 1).array,
+        ExtraIndexer.IndexedHeaderIdKey -> idToBytes(parentHeader.id)
+      ), Array.empty[ExtraIndex])
       val history = Proxy.newProxyInstance(
         classOf[ErgoHistoryReader].getClassLoader,
         Array[Class[_]](classOf[ErgoHistoryReader]),
@@ -80,7 +86,8 @@ class CandidateRentRejectIndexSpec extends ErgoCorePropertyTest with TestFileUti
                 storage.storageRentBoxesAtOrBefore(args(0).asInstanceOf[Int], args(1).asInstanceOf[Int],
                   args(2).asInstanceOf[Option[StorageRentBox]])
               case "removeStorageRentBoxes" => fail("candidate generation must retain unspent rent rows")
-              case "typedModifierById" => None
+              case "typedModifierById" =>
+                if (args(0) == parentHeader.id) Some(parentHeader) else None
               case "requiredDifficultyAfter" => parentHeader.requiredDifficulty
               case other => throw new UnsupportedOperationException(s"unexpected history read: $other")
             }
@@ -165,14 +172,18 @@ class CandidateRentRejectIndexSpec extends ErgoCorePropertyTest with TestFileUti
     }
 
     val storage = HistoryStorage(fixtureSettings)
+    storage.insert(Array(FullBlockProcessor.chainStatusKey(parentHeader.id) ->
+      FullBlockProcessor.BestChainMarker), Array[BlockSection](parentHeader)).get
     Seq(spentByOwner, stillUnspent).zipWithIndex.foreach { case (box, index) =>
       val indexed = new IndexedErgoBox(box.creationHeight, None, None, None, box, index.toLong)
       storage.insertExtra(Array.empty[(Array[Byte], Array[Byte])],
         Array[ExtraIndex](indexed, NumericBoxIndex(index.toLong, indexed.id), StorageRentBox(indexed)))
     }
 
-    storage.insertExtra(Array(ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4).putInt(height - 1).array),
-      Array.empty[ExtraIndex])
+    storage.insertExtra(Array(
+      ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4).putInt(height - 1).array,
+      ExtraIndexer.IndexedHeaderIdKey -> idToBytes(parentHeader.id)
+    ), Array.empty[ExtraIndex])
 
     val history = Proxy.newProxyInstance(
       classOf[ErgoHistoryReader].getClassLoader,
@@ -190,7 +201,8 @@ class CandidateRentRejectIndexSpec extends ErgoCorePropertyTest with TestFileUti
             case "removeStorageRentBoxes" =>
               storage.removeStorageRentBoxes(args(0).asInstanceOf[Seq[ModifierId]])
               ().asInstanceOf[AnyRef]
-            case "typedModifierById" => None
+            case "typedModifierById" =>
+              if (args(0) == parentHeader.id) Some(parentHeader) else None
             case "requiredDifficultyAfter" => parentHeader.requiredDifficulty
             case other => throw new UnsupportedOperationException(s"unexpected history read: $other")
           }
@@ -269,6 +281,8 @@ class CandidateRentRejectIndexSpec extends ErgoCorePropertyTest with TestFileUti
       override def emissionBoxOpt: Option[ErgoBox] = None
     }
     val storage = HistoryStorage(fixtureSettings)
+    storage.insert(Array(FullBlockProcessor.chainStatusKey(parentHeader.id) ->
+      FullBlockProcessor.BestChainMarker), Array[BlockSection](parentHeader)).get
     val unresolvedRows = (0 until unresolvedCount).flatMap { index =>
       // The index is structurally complete, but these boxes are absent from the UTXO.
       val box = testBox(10000000000L + index, Constants.TrueTree, threshold, Seq.empty, Map.empty)
@@ -276,8 +290,10 @@ class CandidateRentRejectIndexSpec extends ErgoCorePropertyTest with TestFileUti
       Seq[ExtraIndex](row, NumericBoxIndex(row.globalIndex, row.id), StorageRentBox(row))
     }
     val indexed = new IndexedErgoBox(threshold, None, None, None, laterBox, unresolvedCount.toLong)
-    storage.insertExtra(Array(ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4)
-      .putInt(height - 1).array), (unresolvedRows ++ Seq[ExtraIndex](indexed,
+    storage.insertExtra(Array(
+      ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4).putInt(height - 1).array,
+      ExtraIndexer.IndexedHeaderIdKey -> idToBytes(parentHeader.id)
+    ), (unresolvedRows ++ Seq[ExtraIndex](indexed,
       NumericBoxIndex(indexed.globalIndex, indexed.id), StorageRentBox(indexed))).toArray)
     val scanRowCounts = scala.collection.mutable.ArrayBuffer.empty[Int]
     val history = Proxy.newProxyInstance(
@@ -296,7 +312,8 @@ class CandidateRentRejectIndexSpec extends ErgoCorePropertyTest with TestFileUti
               scanRowCounts += rows.length
               rows
             case "removeStorageRentBoxes" => fail("unresolved rent rows must not be evicted")
-            case "typedModifierById" => None
+            case "typedModifierById" =>
+              if (args(0) == parentHeader.id) Some(parentHeader) else None
             case "requiredDifficultyAfter" => parentHeader.requiredDifficulty
             case other => throw new UnsupportedOperationException(s"unexpected history read: $other")
           }
@@ -370,13 +387,17 @@ class CandidateRentRejectIndexSpec extends ErgoCorePropertyTest with TestFileUti
     }
 
     val storage = HistoryStorage(fixtureSettings)
+    storage.insert(Array(FullBlockProcessor.chainStatusKey(parentHeader.id) ->
+      FullBlockProcessor.BestChainMarker), Array[BlockSection](parentHeader)).get
     eligibleBoxes.zipWithIndex.foreach { case (box, index) =>
       val indexed = new IndexedErgoBox(box.creationHeight, None, None, None, box, index.toLong)
       storage.insertExtra(Array.empty[(Array[Byte], Array[Byte])],
         Array[ExtraIndex](indexed, NumericBoxIndex(index.toLong, indexed.id), StorageRentBox(indexed)))
     }
-    storage.insertExtra(Array(ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4)
-      .putInt(height - 1).array), Array.empty[ExtraIndex])
+    storage.insertExtra(Array(
+      ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4).putInt(height - 1).array,
+      ExtraIndexer.IndexedHeaderIdKey -> idToBytes(parentHeader.id)
+    ), Array.empty[ExtraIndex])
 
     val history = Proxy.newProxyInstance(
       classOf[ErgoHistoryReader].getClassLoader,
@@ -394,7 +415,8 @@ class CandidateRentRejectIndexSpec extends ErgoCorePropertyTest with TestFileUti
             case "removeStorageRentBoxes" =>
               storage.removeStorageRentBoxes(args(0).asInstanceOf[Seq[ModifierId]])
               ().asInstanceOf[AnyRef]
-            case "typedModifierById" => None
+            case "typedModifierById" =>
+              if (args(0) == parentHeader.id) Some(parentHeader) else None
             case "requiredDifficultyAfter" => parentHeader.requiredDifficulty
             case other => throw new UnsupportedOperationException(s"unexpected history read: $other")
           }
