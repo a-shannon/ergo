@@ -3,6 +3,7 @@ package org.ergoplatform.it
 import java.io.File
 import cats.implicits._
 import com.typesafe.config.Config
+import org.ergoplatform.it.api.NodeApi.NodeInfo
 import org.ergoplatform.it.container.Docker.{ExtraConfig, noExtraConfig}
 import org.ergoplatform.it.container.{IntegrationSuite, Node}
 import org.scalatest.concurrent.Eventually
@@ -18,7 +19,8 @@ class ForkResolutionSpec extends AnyFlatSpec with Matchers with IntegrationSuite
 
   val nodesQty: Int = 4
 
-  val commonChainLength: Int = 5
+  // Sync V2 includes a header 16 below a forked tip; keep that anchor common.
+  val commonChainLength: Int = 16
   val forkLength: Int = 5
   val syncLength: Int = 15
 
@@ -64,11 +66,10 @@ class ForkResolutionSpec extends AnyFlatSpec with Matchers with IntegrationSuite
   }
 
   // Testing scenario:
-  // 1. Start up {nodesQty} nodes and let them mine common chain of length {initialCommonChainLength};
-  // 2. Kill all nodes when they are done, make them offline generating, clear known peers and restart them;
-  // 3. Let them mine another {forkLength} blocks offline in order to create {nodesQty} forks;
-  // 4. Kill all nodes again and restart with `knownPeers` filled, wait another {syncLength} blocks;
-  // 5. Check that nodes reached consensus on created forks;
+  // 1. Mine a common chain, then stop its miner and wait for all nodes to apply the same tip;
+  // 2. Stop all nodes, clear peers and restart with isolated mining;
+  // 3. Confirm each node mines a distinct fork without connections;
+  // 4. Restart with known peers, then check convergence on the selected fork;
   it should "Fork resolution after isolated mining" in {
 
     log.info(minerConfig.toString)
@@ -79,32 +80,65 @@ class ForkResolutionSpec extends AnyFlatSpec with Matchers with IntegrationSuite
     val result = Async.async {
       val initMaxHeight = Async.await(Future.traverse(nodes)(_.fullHeight).map(_.max))
       Async.await(Future.traverse(nodes)(_.waitForHeight(initMaxHeight + commonChainLength, 100.millis)))
+      val commonHeads = Async.await(Future.traverse(nodes)(_.headerIdsByHeight(initMaxHeight + commonChainLength)))
+        .map(_.headOption.value)
+      commonHeads.distinct.size shouldBe 1
+
+      // Stop producing the common chain before disconnecting its followers. A follower can
+      // have headers ahead of applied blocks; isolated mining cannot fill that gap without peers.
+      docker.stopNode(nodes.head.containerId)
+      val quiescedMiner = startNodesWithBinds(List(nonGeneratingPeerConfig.withFallback(minerConfig))).head
+      val quiescedNodes = quiescedMiner +: nodes.tail
+      val commonHeight = initMaxHeight + commonChainLength
+      val appliedCommonTip = Async.await(quiescedMiner.waitForProgress(
+        "all nodes to share a fully applied tip before isolation",
+        _ => Future.traverse(quiescedNodes)(_.info),
+        (infos: List[NodeInfo]) => infos.forall { info =>
+          info.isMining.contains(false) &&
+            info.bestBlockHeightOpt.exists(_ >= commonHeight) &&
+            info.bestHeaderHeightOpt == info.bestBlockHeightOpt &&
+            info.bestBlockIdOpt.nonEmpty &&
+            info.bestHeaderIdOpt == info.bestBlockIdOpt
+        } && infos.map(_.bestBlockIdOpt).distinct.size == 1,
+        100.millis
+      )(
+        infos => Some(infos.map(info =>
+          (info.bestBlockHeightOpt, info.bestHeaderHeightOpt, info.bestBlockIdOpt, info.bestHeaderIdOpt))),
+        infos => infos.map(info =>
+          s"full=${info.bestBlockHeightOpt} header=${info.bestHeaderHeightOpt} " +
+            s"fullId=${info.bestBlockIdOpt} headerId=${info.bestHeaderIdOpt} mining=${info.isMining}").mkString("; ")
+      ))
+      log.info(s"Fully applied common tip before isolation: ${appliedCommonTip.head.bestBlockIdOpt.value}")
       val isolatedNodes = Async.await {
-        nodes.foreach(node => docker.stopNode(node.containerId))
+        quiescedNodes.foreach(node => docker.stopNode(node.containerId))
         clearPeerDatabases()
         Future.successful(startNodesWithBinds(minerConfig +: offlineMiningNodesConfig, isolatedPeersConfig))
       }
-      val forkHeight = initMaxHeight + commonChainLength + forkLength
+      Async.await(Future.traverse(isolatedNodes)(_.connectedPeers)).foreach(_ shouldBe empty)
+      // Use the persisted heights after restart so the fork target is above every isolated tip.
+      val forkHeight = Async.await(Future.traverse(isolatedNodes)(_.fullHeight)).max + forkLength
       Async.await(Future.traverse(isolatedNodes)(_.waitForHeight(forkHeight, 100.millis)))
+      Async.await(Future.traverse(isolatedNodes)(_.connectedPeers)).foreach(_ shouldBe empty)
+      val isolatedHeads = Async.await(Future.traverse(isolatedNodes)(_.headerIdsByHeight(forkHeight)))
+        .map(_.headOption.value)
+      log.info(s"Isolated fork heads at height $forkHeight: ${isolatedHeads.mkString(",")}")
+      isolatedHeads.distinct.size shouldBe nodesQty
       val regularNodes = Async.await {
         isolatedNodes.foreach(node => docker.stopNode(node.containerId))
         clearPeerDatabases()
         Future.successful(startNodesWithBinds(minerConfig +: onlineSyncNodesConfig))
       }
       Async.await(Future.traverse(regularNodes)(_.waitForHeight(forkHeight + syncLength, 100.millis)))
-      val sample = Async.await(regularNodes.head.headerIdsByHeight(forkHeight)).headOption.value
-      val headers = Async.await(Future.traverse(regularNodes) { node =>
-        node.waitForProgress[Seq[String], String](
-          s"header $sample at height $forkHeight",
-          _.headerIdsByHeight(forkHeight),
-          _.headOption.contains(sample),
-          100.millis
-        )(_.headOption, ids => s"selected ${ids.headOption.getOrElse("none")}")
-      })
-
-      log.debug(s"Headers at height $forkHeight: ${headers.mkString(",")}")
-      val headerIdsAtSameHeight = headers.map(_.headOption.value)
-      headerIdsAtSameHeight should contain only sample
+      val headers = Async.await(regularNodes.head.waitForProgress[Seq[Seq[String]], Seq[Option[String]]](
+        s"all nodes to select the same header at height $forkHeight",
+        _ => Future.traverse(regularNodes)(_.headerIdsByHeight(forkHeight)),
+        ids => ids.head.headOption.nonEmpty && ids.map(_.headOption).distinct.size == 1,
+        100.millis
+      )(
+        ids => Some(ids.map(_.headOption)),
+        ids => s"selected ${ids.map(_.headOption.getOrElse("none")).mkString(",")}"
+      ))
+      log.info(s"Converged headers at height $forkHeight: ${headers.map(_.headOption.value).mkString(",")}")
     }
 
     Await.result(result, 15.minutes)
