@@ -1,0 +1,62 @@
+name: Fork resolution rent-index composition
+
+on:
+  push:
+    branches:
+      - feat/pr2698-pr2535-forkresolution-20261013
+
+jobs:
+  fork-resolution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout composition branch
+        uses: actions/checkout@v7
+        with:
+          path: it
+          fetch-depth: 0
+
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run ForkResolutionSpec
+        timeout-minutes: 20
+        run: |
+          cd it
+          mkdir tmp
+          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++2.12.20 docker "it:testOnly *ForkResolutionSpec"
+
+      - name: Save leftover node container logs
+        if: always()
+        timeout-minutes: 3
+        run: |
+          mkdir -p it/target/logs/containers
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              docker inspect --format '{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} finished={{.State.FinishedAt}}' "$id" || true
+              docker logs --timestamps "$id" > "it/target/logs/containers/$name.log" 2>&1 || true
+            done
+
+      - name: Upload fork resolution evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fork-resolution-rent-index-attempt-${{ github.run_attempt }}
+          path: |
+            it/target/logs/
+            it/target/it-reports/
+          if-no-files-found: warn
+          retention-days: 30
