@@ -864,8 +864,10 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
   property("retries catch-up after a transient non-extending header") {
     indexer ! CreateDB(HEIGHT)
     awaitCondition(created)
-    indexer ! DeferNextHeaderOnce(2)
-    awaitCondition(created)
+    val commandProbe = TestProbe()(system)
+    commandProbe.send(indexer, DeferNextHeaderOnce(2))
+    commandProbe.send(indexer, GetLoadedState())
+    commandProbe.expectMsgType[IndexerState]
     indexer ! Index()
 
     org.ergoplatform.utils.untilTimeout(3.seconds, 50.millis) {
@@ -879,8 +881,10 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
   property("retries catch-up when the selected block transactions are temporarily unavailable") {
     indexer ! CreateDB(HEIGHT)
     awaitCondition(created)
-    indexer ! DeferBlockTransactionsOnce(2)
-    awaitCondition(created)
+    val commandProbe = TestProbe()(system)
+    commandProbe.send(indexer, DeferBlockTransactionsOnce(2))
+    commandProbe.send(indexer, GetLoadedState())
+    commandProbe.expectMsgType[IndexerState]
     indexer ! Index()
 
     org.ergoplatform.utils.untilTimeout(3.seconds, 50.millis) {
