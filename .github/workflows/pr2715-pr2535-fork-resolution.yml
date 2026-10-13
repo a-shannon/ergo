@@ -1,0 +1,101 @@
+name: PR 2715 and 2535 fork resolution composition
+
+on:
+  push:
+    branches:
+      - feat/pr2715-pr2535-forkresolution-20261013
+
+jobs:
+  fork-resolution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact composition
+        uses: actions/checkout@v7
+        with:
+          path: it
+          fetch-depth: 0
+
+      - name: Verify source composition
+        run: |
+          cd it
+          test "$(git rev-parse HEAD~1^1)" = ac46880dfa6b57829a361b8b23133bedc64fe0c1
+          test "$(git rev-parse HEAD~1^2)" = d2f1cdab4ead9c614ab77f3ea39c66ae1894d3c8
+          test "$(git rev-parse HEAD~1^{tree})" = 3fcdec7489175ccfd8e624eadd5ba84b09bbe60b
+          test "$(git diff --name-only HEAD~1 HEAD)" = .github/workflows/pr2715-pr2535-fork-resolution.yml
+
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run ForkResolutionSpec
+        timeout-minutes: 20
+        run: |
+          cd it
+          mkdir tmp
+          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++2.12.20 docker "it:testOnly *ForkResolutionSpec"
+
+      - name: Verify isolation evidence before reconnect
+        if: success()
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          logs = Path('it/target/logs')
+          test_log = (logs / 'test.log').read_text(errors='replace').splitlines()
+          offline = []
+          for path in logs.glob('ForkResolutionSpec-*-node01-*.log'):
+              lines = path.read_text(errors='replace').splitlines()
+              if lines and '-Dscorex.network.maxConnections=0' in lines[0]:
+                  offline.append((path, lines))
+          assert len(offline) == 1, f'Expected one isolated node01 log, found {len(offline)}'
+          path, lines = offline[0]
+          assert any('No peers in database, seeding peers database with nodes from config' in line
+                     for line in lines), f'Persisted peer database was not confirmed empty in {path.name}'
+
+          isolated = [(n, re.search(r'Isolated fork heads at height \d+: (.*)$', line))
+                      for n, line in enumerate(test_log)]
+          isolated = [(n, match) for n, match in isolated if match]
+          reconnect = [n for n, line in enumerate(test_log) if 'Started node 10-node01:' in line]
+          assert len(isolated) == 1 and len(reconnect) == 1, 'Missing isolated-fork or reconnect marker'
+          assert isolated[0][0] < reconnect[0], 'Fork IDs were not observed before reconnect'
+          ids = isolated[0][1].group(1).split(',')
+          assert len(ids) == 4 and len(set(ids)) == 4, 'Expected four distinct isolated fork IDs'
+          assert all(re.fullmatch(r'[0-9a-f]{64}', block_id) for block_id in ids), 'Invalid fork ID'
+          print('Verified isolated node01 had no persisted peers; four distinct forks preceded reconnect')
+          PY
+
+      - name: Save leftover node container logs
+        if: always()
+        timeout-minutes: 3
+        run: |
+          mkdir -p it/target/logs/containers
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              docker inspect --format '{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} finished={{.State.FinishedAt}}' "$id" || true
+              docker logs --timestamps "$id" > "it/target/logs/containers/$name.log" 2>&1 || true
+            done
+
+      - name: Upload fork resolution evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr2715-pr2535-fork-resolution-attempt-${{ github.run_attempt }}
+          path: |
+            it/target/logs/
+            it/target/it-reports/
+          if-no-files-found: warn
+          retention-days: 30
