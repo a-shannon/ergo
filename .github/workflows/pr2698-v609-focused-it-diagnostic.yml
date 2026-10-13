@@ -1,0 +1,129 @@
+name: PR 2698 focused integration diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2698-v609-focused-it-20261013
+
+permissions:
+  contents: read
+
+jobs:
+  utxo-exact-head:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact PR 2698 head
+        uses: actions/checkout@v7
+        with:
+          ref: 25596311eb66e89523a8106a52ebe6c95507dcb2
+          path: it
+          fetch-depth: 0
+
+      - name: Verify exact checkout
+        run: test "$(git -C it rev-parse HEAD)" = 25596311eb66e89523a8106a52ebe6c95507dcb2
+
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run UtxoStateNodesSyncSpec on exact PR head
+        timeout-minutes: 20
+        run: |
+          cd it
+          mkdir tmp
+          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++2.12.20 docker "it:testOnly org.ergoplatform.it.UtxoStateNodesSyncSpec"
+
+      - name: Save leftover node container logs
+        if: always()
+        timeout-minutes: 3
+        run: |
+          mkdir -p it/target/logs/containers
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              docker inspect --format '{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} finished={{.State.FinishedAt}}' "$id" || true
+              docker logs --timestamps "$id" > "it/target/logs/containers/$name.log" 2>&1 || true
+            done
+
+      - name: Upload UTXO evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr2698-utxo-exact-attempt-${{ github.run_attempt }}
+          path: |
+            it/target/logs/
+            it/target/it-reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+  fork-with-isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout PR 2698 and PR 2535 composition
+        uses: actions/checkout@v7
+        with:
+          path: it
+          fetch-depth: 0
+
+      - name: Verify composition inputs
+        run: |
+          test "$(git -C it rev-parse HEAD^)" = c582ca6dc0aab28ea2347725a2f06fa1f77f8b29
+          test "$(git -C it rev-list --parents -n 1 HEAD^)" = "c582ca6dc0aab28ea2347725a2f06fa1f77f8b29 25596311eb66e89523a8106a52ebe6c95507dcb2 d2f1cdab4ead9c614ab77f3ea39c66ae1894d3c8"
+
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run ForkResolutionSpec with isolated peers
+        timeout-minutes: 20
+        run: |
+          cd it
+          mkdir tmp
+          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++2.12.20 docker "it:testOnly org.ergoplatform.it.ForkResolutionSpec"
+
+      - name: Save leftover node container logs
+        if: always()
+        timeout-minutes: 3
+        run: |
+          mkdir -p it/target/logs/containers
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              docker inspect --format '{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} finished={{.State.FinishedAt}}' "$id" || true
+              docker logs --timestamps "$id" > "it/target/logs/containers/$name.log" 2>&1 || true
+            done
+
+      - name: Upload fork-resolution evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr2698-fork-isolated-attempt-${{ github.run_attempt }}
+          path: |
+            it/target/logs/
+            it/target/it-reports/
+          if-no-files-found: warn
+          retention-days: 14
