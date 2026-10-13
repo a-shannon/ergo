@@ -20,7 +20,7 @@ import org.ergoplatform.nodeView.history.storage.modifierprocessors.FullBlockPro
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.CurrentView
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.GetDataFromCurrentView
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
-import org.ergoplatform.nodeView.state.{DigestState, ErgoStateContext, ErgoStateReader, StateType}
+import org.ergoplatform.nodeView.state.{DigestState, ErgoState, ErgoStateContext, ErgoStateReader, StateType}
 import org.ergoplatform.settings.{ErgoSettings, NetworkType}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import scorex.util.{ModifierId, bytesToId}
@@ -40,6 +40,8 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
 
   implicit val addressEncoder: ErgoAddressEncoder = settings.addressEncoder
   val initSettings: ErgoSettings = settings
+  private val genesisBoxes = ErgoState.genesisBoxes(initSettings.chainSettings)
+  private val firstOutputIndex = genesisBoxes.size + 1
   case class CreateDB(blockCount: Int)
   case class ExtendDB(blockCount: Int)
   case class Reset()
@@ -104,17 +106,24 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
                                 Int, // txs indexed
                                 Int) = { // boxes indexed
     var txsIndexed = 0
-    var boxesIndexed = 0
+    var boxesIndexed = firstOutputIndex
     val addresses: ID_LL = mutable.HashMap[ModifierId, (Long, Long)]()
     val templates: ID_LL = mutable.HashMap[ModifierId, (Long, Long)]()
     val indexedTokens: ID_LL = mutable.HashMap[ModifierId, (Long, Long)]()
+    genesisBoxes.foreach { box =>
+      val address = hashErgoTree(box.ergoTree)
+      val oldAddress = addresses.getOrElse(address, (0L, 0L))
+      addresses.put(address, (oldAddress._1 + box.value, oldAddress._2))
+      val template = hashTreeTemplate(box.ergoTree)
+      val oldTemplate = templates.getOrElse(template, (0L, 0L))
+      templates.put(template, (oldTemplate._1, oldTemplate._2 + 1L))
+    }
     cfor(1)(_ <= limit, _ + 1) { i =>
       val header = fullChainHeaderAt(i)
       val block = history.getFullBlock(header)
       block.get.transactions.foreach { tx =>
         txsIndexed += 1
-        if (i != 1) {
-          tx.inputs.foreach { input =>
+        tx.inputs.foreach { input =>
             val iEb: IndexedErgoBox = _history.getReader.typedExtraIndexById[IndexedErgoBox](bytesToId(input.boxId)).get
             val address = hashErgoTree(ExtraIndexer.getAddress(iEb.box.ergoTree)(addressEncoder).script)
             val prevAddress = addresses(address)
@@ -123,7 +132,6 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
             val prevTemplate = templates(template)
             templates.put(template, (prevTemplate._1 + 1, prevTemplate._2 - 1))
           }
-        }
         tx.outputs.foreach { output =>
           boxesIndexed += 1
           val address = hashErgoTree(ExtraIndexer.getAddress(output.ergoTree)(addressEncoder).script)
@@ -212,7 +220,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     */
   def checkRentIndex(): Unit = {
     val state = IndexerState.fromHistory(_history)
-    val expected = (0L until state.globalBoxIndex).flatMap { boxNum =>
+    val expected = (1L until state.globalBoxIndex).flatMap { boxNum =>
       NumericBoxIndex.getBoxByNumber(history, boxNum).filter(!_.isSpent)
     }
     val rentEntries = history.storageRentBoxesAtOrBefore(Int.MaxValue, math.max(expected.length * 2, 100))
@@ -238,9 +246,8 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
   /**
     * Ground truth for the rent index derived WITHOUT any indexer state: replay the best
     * chain's blocks and keep the boxes that were created and never spent, assigning the
-    * global box index in output order. The genesis box is not part of the chain's blocks,
-    * so the produced indices are offset relative to `NumericBoxIndex`, which counts from
-    * the genesis box.
+    * global box index in output order, after the configured genesis boxes at positive
+    * references. Inputs in every block remove their source boxes, including genesis.
     *
     * This is deliberately independent of `IndexerState` and `NumericBoxIndex`: those are
     * maintained by the indexer under test, so a systematic miscount of the rent rows
@@ -249,7 +256,10 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
   def unspentBoxesFromChain(height: Int): Map[ModifierId, (Int, Long)] = {
     val created = mutable.HashMap.empty[ModifierId, (Int, Long)]
     val spent = mutable.HashSet.empty[ModifierId]
-    var globalIndex = 0L
+    genesisBoxes.zipWithIndex.foreach { case (box, index) =>
+      created.put(bytesToId(box.id), (box.creationHeight, index.toLong + 1L))
+    }
+    var globalIndex = firstOutputIndex
     var h = 1
     while (h <= height) {
       history.bestHeaderIdAtHeight(h).foreach { headerId =>
@@ -302,14 +312,12 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     rentEntries.foreach { e =>
       NumericBoxIndex.getBoxByNumber(history, e.globalIndex).foreach { iEb =>
         e.creationHeight shouldBe iEb.box.creationHeight
+        (e.creationHeight, e.globalIndex) shouldBe expected(iEb.id)
         iEb.isSpent shouldBe false
       }
     }
 
-    // The global index cannot be compared against a chain replay: the indexer counts
-    // from the genesis box while a chain replay only sees block outputs. What matters
-    // for the range scan is that the numbering is strictly increasing in
-    // (creationHeight, globalIndex) order, so the rows form one ascending, unique run.
+    // The rows must form one ascending, unique run for the range scan.
     val keys = rentEntries.map(e => (e.creationHeight, e.globalIndex)).toSeq
     withClue("rent rows must be strictly ascending by (creationHeight, globalIndex): ") {
       keys shouldBe keys.sorted
@@ -371,7 +379,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
       }
 
       // check boxes
-      cfor(0)(_ < boxIndexBefore, _ + 1) { boxNum =>
+      cfor(1)(_ < boxIndexBefore, _ + 1) { boxNum =>
         val boxOpt = history.typedExtraIndexById[NumericBoxIndex](bytesToId(NumericBoxIndex.indexToBytes(boxNum)))
         if (boxNum < state.globalBoxIndex)
           boxOpt shouldNot be(empty)
@@ -428,7 +436,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     val secondHeader = history.typedModifierById[Header](history.bestHeaderIdAtHeight(HEIGHT + 2).get).get
     val blocks = (1 to HEIGHT + 2).map(height => history.bestBlockTransactionsAt(height).get)
     val expectedTxCount = blocks.map(_.txs.size.toLong).sum
-    val expectedBoxCount = blocks.flatMap(_.txs).map(_.outputs.size.toLong).sum
+    val expectedBoxCount = firstOutputIndex + blocks.flatMap(_.txs).map(_.outputs.size.toLong).sum
     indexer ! RemoteBlockApplied(firstHeader, history.getFullBlock(firstHeader).get.transactions.map(_.id))
     indexer ! RemoteBlockApplied(firstHeader, history.getFullBlock(firstHeader).get.transactions.map(_.id))
     indexer ! RemoteBlockApplied(secondHeader, history.getFullBlock(secondHeader).get.transactions.map(_.id))
@@ -548,7 +556,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
         override def receive: Receive = Actor.emptyBehavior
       }))
       withClue(name) {
-        probe.expectMsg((0, 0L, 0L, 0, None))
+        probe.expectMsg((0, 0L, firstOutputIndex.toLong, 0, None))
       }
     }
   }
@@ -574,32 +582,32 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
         val header = indexedHistory.bestFullBlockOpt.get.header
         val blockTransactions = indexedHistory.typedModifierById[BlockTransactions](header.transactionsId).get
         val txCount = blockTransactions.txs.size.toLong
-        val boxCount = blockTransactions.txs.map(_.outputs.size.toLong).sum
+        val boxCount = firstOutputIndex + blockTransactions.txs.map(_.outputs.size.toLong).sum
         val lastTx = blockTransactions.txs.last
         val lastTxIndex = txCount - 1
         val lastBoxIndex = boxCount - 1
         val outputIndexes = Array.tabulate(lastTx.outputs.size) { i =>
           boxCount - lastTx.outputs.size.toLong + i.toLong
         }
+        val allOutputs = blockTransactions.txs.flatMap(_.outputs).zipWithIndex.map { case (output, index) =>
+          new IndexedErgoBox(header.height, None, None, None, output, firstOutputIndex + index.toLong)
+        }
+        val allBoxes = (GenesisIndex.boxes(dbSettings.chainSettings) ++ allOutputs).map(box => box.id -> box).toMap
+        blockTransactions.txs.foreach { tx =>
+          tx.inputs.foreach { input =>
+            allBoxes(bytesToId(input.boxId)).asSpent(tx.id, header.height, input.spendingProof)
+          }
+        }
         val indexedTx = IndexedErgoTransaction.fromTx(
           lastTx,
           blockTransactions.txs.size - 1,
           header.height,
           lastTxIndex,
-          Array.fill(lastTx.inputs.size)(0L),
+          lastTx.inputs.map(input => allBoxes(bytesToId(input.boxId)).globalIndex).toArray,
           outputIndexes,
           header.id
         )
-        val indexedBoxes = lastTx.outputs.zip(outputIndexes).map { case (output, outputIndex) =>
-          new IndexedErgoBox(
-            header.height,
-            None,
-            None,
-            None,
-            output,
-            outputIndex
-          )
-        }.toArray
+        val indexedBoxes = (GenesisIndex.boxes(dbSettings.chainSettings).map(box => allBoxes(box.id)) ++ allOutputs).toArray
         val numericBoxes = indexedBoxes.map(box => NumericBoxIndex(box.globalIndex, box.id))
         val lastBox = indexedBoxes.last
         val numericTx = NumericTxIndex(lastTxIndex, lastTx.id)
@@ -803,14 +811,14 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     probe.expectMsg(true)
     probe.expectMsg(true)
     probe.expectMsg(true)
-    probe.expectMsg((0, 0L, 0L, None))
-    probe.expectMsg((0, 0L, 0L, None))
-    probe.expectMsg((0, 0L, 0L, None))
-    probe.expectMsg((0, 0L, 0L, None))
-    probe.expectMsg((0, 0L, 0L, None))
-    probe.expectMsg((0, 0L, 0L, None))
-    probe.expectMsg((0, 0L, 0L, None))
-    probe.expectMsg((0, 0L, 0L, None))
+    probe.expectMsg((0, 0L, firstOutputIndex.toLong, None))
+    probe.expectMsg((0, 0L, firstOutputIndex.toLong, None))
+    probe.expectMsg((0, 0L, firstOutputIndex.toLong, None))
+    probe.expectMsg((0, 0L, firstOutputIndex.toLong, None))
+    probe.expectMsg((0, 0L, firstOutputIndex.toLong, None))
+    probe.expectMsg((0, 0L, firstOutputIndex.toLong, None))
+    probe.expectMsg((0, 0L, firstOutputIndex.toLong, None))
+    probe.expectMsg((0, 0L, firstOutputIndex.toLong, None))
   }
 
   property("binds cached transactions to the selected header") {
@@ -996,7 +1004,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     indexer ! Index()
     awaitCondition(done)
     val state = IndexerState.fromHistory(_history)
-    cfor(0)(_ < state.globalBoxIndex, _ + 1) { n =>
+    cfor(1)(_ < state.globalBoxIndex, _ + 1) { n =>
       val id = history.typedExtraIndexById[NumericBoxIndex](bytesToId(NumericBoxIndex.indexToBytes(n)))
       id shouldNot be(empty)
       history.typedExtraIndexById[IndexedErgoBox](id.get.m) shouldNot be(empty)
@@ -1226,13 +1234,13 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
           state.indexedHeight shouldBe HEIGHT + 1
           state.indexedHeaderId shouldBe Some(selectedTip.id)
           state.globalTxIndex shouldBe expectedTransactions.size
-          state.globalBoxIndex shouldBe expectedBoxes.size
+          state.globalBoxIndex shouldBe expectedBoxes.size + firstOutputIndex
         }
         expectedTransactions.zipWithIndex.foreach { case (tx, index) =>
           NumericTxIndex.getTxByNumber(history, index).map(_.id) shouldBe Some(tx.id)
         }
         expectedBoxes.zipWithIndex.foreach { case (box, index) =>
-          NumericBoxIndex.getBoxByNumber(history, index).map(_.id) shouldBe Some(bytesToId(box.id))
+          NumericBoxIndex.getBoxByNumber(history, index + firstOutputIndex).map(_.id) shouldBe Some(bytesToId(box.id))
         }
       } finally {
         system.stop(restartedIndexer)
@@ -1292,20 +1300,20 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
       state.indexedHeight shouldBe HEIGHT - 1
       state.indexedHeaderId shouldBe Some(selectedTip.id)
       state.globalTxIndex shouldBe expectedTransactions.size
-      state.globalBoxIndex shouldBe expectedBoxes.size
+      state.globalBoxIndex shouldBe expectedBoxes.size + firstOutputIndex
       probe.send(indexer, GetLoadedState())
       probe.expectMsgType[IndexerState].indexedHeaderId shouldBe Some(selectedTip.id)
       expectedTransactions.zipWithIndex.foreach { case (tx, index) =>
         NumericTxIndex.getTxByNumber(history, index).map(_.id) shouldBe Some(tx.id)
       }
       expectedBoxes.zipWithIndex.foreach { case (box, index) =>
-        NumericBoxIndex.getBoxByNumber(history, index).map(_.id) shouldBe Some(bytesToId(box.id))
+        NumericBoxIndex.getBoxByNumber(history, index + firstOutputIndex).map(_.id) shouldBe Some(bytesToId(box.id))
       }
       history.typedExtraIndexById[NumericTxIndex](
         bytesToId(NumericTxIndex.indexToBytes(expectedTransactions.size))
       ) shouldBe None
       history.typedExtraIndexById[NumericBoxIndex](
-        bytesToId(NumericBoxIndex.indexToBytes(expectedBoxes.size))
+        bytesToId(NumericBoxIndex.indexToBytes(expectedBoxes.size + firstOutputIndex))
       ) shouldBe None
     } finally {
       indexer ! Reset()
@@ -1446,14 +1454,14 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
       state.indexedHeaderId shouldBe Some(selectedTip.id)
     }
     state.globalTxIndex shouldBe expectedTransactions.size
-    state.globalBoxIndex shouldBe expectedBoxes.size
+    state.globalBoxIndex shouldBe expectedBoxes.size + firstOutputIndex
     eventProbe.send(indexer, GetLoadedState())
     eventProbe.expectMsgType[IndexerState].indexedHeaderId shouldBe Some(selectedTip.id)
     expectedTransactions.zipWithIndex.foreach { case (tx, index) =>
       NumericTxIndex.getTxByNumber(history, index).map(_.id) shouldBe Some(tx.id)
     }
     expectedBoxes.zipWithIndex.foreach { case (box, index) =>
-      NumericBoxIndex.getBoxByNumber(history, index).map(_.id) shouldBe Some(bytesToId(box.id))
+      NumericBoxIndex.getBoxByNumber(history, index + firstOutputIndex).map(_.id) shouldBe Some(bytesToId(box.id))
     }
     indexer ! Reset()
   }
@@ -1501,12 +1509,12 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     val expectedBoxes = expectedTransactions.flatMap(_.outputs)
     val state = IndexerState.fromHistory(_history)
     state.globalTxIndex shouldBe expectedTransactions.size
-    state.globalBoxIndex shouldBe expectedBoxes.size
+    state.globalBoxIndex shouldBe expectedBoxes.size + firstOutputIndex
     expectedTransactions.zipWithIndex.foreach { case (tx, index) =>
       NumericTxIndex.getTxByNumber(history, index).map(_.id) shouldBe Some(tx.id)
     }
     expectedBoxes.zipWithIndex.foreach { case (box, index) =>
-      NumericBoxIndex.getBoxByNumber(history, index).map(_.id) shouldBe Some(bytesToId(box.id))
+      NumericBoxIndex.getBoxByNumber(history, index + firstOutputIndex).map(_.id) shouldBe Some(bytesToId(box.id))
     }
     val (addresses, templates, indexedTokens, _, _) = manualIndex(HEIGHT + 1)
     checkAddresses(addresses) shouldBe 0
@@ -1600,7 +1608,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     val rebuilt = probe.expectMsgType[IndexerState]
     rebuilt.indexedHeight shouldBe 0
     rebuilt.globalTxIndex shouldBe 0
-    rebuilt.globalBoxIndex shouldBe 0
+    rebuilt.globalBoxIndex shouldBe firstOutputIndex
     rebuilt.indexedHeaderId shouldBe None
     history.typedExtraIndexById[IndexedErgoTransaction](lastTx.id) shouldBe None
     indexer ! Reset()
@@ -1914,7 +1922,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
       } else {
         reopened.indexedHeight shouldBe 0
         reopened.globalTxIndex shouldBe 0
-        reopened.globalBoxIndex shouldBe 0
+        reopened.globalBoxIndex shouldBe firstOutputIndex
         reopened.rollbackTo shouldBe 0
         reopened.indexedHeaderId shouldBe None
         retained shouldBe false
@@ -1970,12 +1978,12 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     val expectedBoxes = expectedTransactions.flatMap(_.outputs)
     val state = IndexerState.fromHistory(_history)
     state.globalTxIndex shouldBe expectedTransactions.size
-    state.globalBoxIndex shouldBe expectedBoxes.size
+    state.globalBoxIndex shouldBe expectedBoxes.size + firstOutputIndex
     expectedTransactions.zipWithIndex.foreach { case (tx, index) =>
       NumericTxIndex.getTxByNumber(history, index).map(_.id) shouldBe Some(tx.id)
     }
     expectedBoxes.zipWithIndex.foreach { case (box, index) =>
-      NumericBoxIndex.getBoxByNumber(history, index).map(_.id) shouldBe Some(bytesToId(box.id))
+      NumericBoxIndex.getBoxByNumber(history, index + firstOutputIndex).map(_.id) shouldBe Some(bytesToId(box.id))
     }
 
     val (addresses, templates, indexedTokens, _, _) = manualIndex(HEIGHT + 1)
