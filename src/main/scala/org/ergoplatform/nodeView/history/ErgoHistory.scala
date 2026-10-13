@@ -12,9 +12,9 @@ import org.ergoplatform.modifiers.history.header.{Header, PreGenesisHeader}
 import org.ergoplatform.modifiers.{BlockSection, ErgoFullBlock, ErgoNodeViewModifier, NonHeaderBlockSection}
 import org.ergoplatform.nodeView.history.extra.ExtraIndexer.{DigestFrontierQuarantineKey, DigestIndexProvenanceBytes,
   GlobalBoxIndexKey, GlobalTxIndexKey, IndexedHeaderIdKey, IndexedHeightKey, IndexModeProvenanceKey,
-  NewestVersion, NewestVersionBytes, RentIndexEnabledBytes, RentIndexEnabledKey, RollbackToKey, SchemaVersionKey,
+  NewestVersion, RentIndexEnabledBytes, RentIndexEnabledKey, RollbackToKey, SchemaVersionKey,
   UtxoIndexProvenanceBytes}
-import org.ergoplatform.nodeView.history.extra.{IndexedErgoBox, IndexedErgoTransaction, NumericBoxIndex, NumericTxIndex}
+import org.ergoplatform.nodeView.history.extra.{GenesisIndex, IndexedErgoBox, IndexedErgoTransaction, NumericBoxIndex, NumericTxIndex}
 import org.ergoplatform.nodeView.history.storage.HistoryStorage
 import org.ergoplatform.nodeView.history.storage.modifierprocessors._
 import org.ergoplatform.nodeView.state.StateType
@@ -281,7 +281,6 @@ object ErgoHistory extends ScorexLogging {
       val modeProvenanceValid = storedBytes(IndexModeProvenanceKey)
         .exists(_.sameElements(modeProvenanceBytes))
       val quarantined = storedBytes(DigestFrontierQuarantineKey).isDefined
-      val modeProvenanceEntry = Array(IndexModeProvenanceKey -> modeProvenanceBytes)
       def intValue(bytesOpt: Option[Array[Byte]]): Option[Int] = bytesOpt
         .filter(_.length == Integer.BYTES)
         .map(bytes => ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).getInt)
@@ -327,15 +326,13 @@ object ErgoHistory extends ScorexLogging {
               val lastTxIndex = globalTxIndex - 1
               val firstTxBoxIndex = globalBoxIndex - lastTx.outputs.size
               val expectedOutputNums = Array.tabulate(lastTx.outputs.size)(i => firstTxBoxIndex + i)
-              val expectedInputNumsOpt = if (header.height <= 1) {
-                Some(Array.fill[Long](lastTx.inputs.size)(0L))
-              } else {
+              val expectedInputNumsOpt = {
                 val inputNums = lastTx.inputs.map { input =>
                   val inputId = bytesToId(input.boxId)
                   db.getExtraIndex(inputId).collect {
                     case box: IndexedErgoBox
                       if box.id == inputId && box.spendingTxIdOpt.contains(lastTx.id) &&
-                        box.spendingHeightOpt.contains(header.height) => box.globalIndex
+                        box.spendingHeightOpt.contains(header.height) && box.globalIndex > 0 => box.globalIndex
                   }
                 }
                 if (inputNums.forall(_.isDefined)) Some(inputNums.flatten.toArray) else None
@@ -378,12 +375,18 @@ object ErgoHistory extends ScorexLogging {
         rollbackToBytesOpt.forall(_.length == Integer.BYTES)
       ).forall(identity)
       val valuesAreNonNegative = indexedHeight >= 0 && globalTxIndex >= 0 && globalBoxIndex >= 0 && rollbackTo >= 0
-      val emptyCheckpoint = indexedHeight == 0 && globalTxIndex == 0 && globalBoxIndex == 0 &&
-        rollbackTo == 0 && indexedHeaderIdBytesOpt.isEmpty
+      val genesisMatches = schemaVersionOpt.contains(NewestVersion) &&
+        GenesisIndex.identitiesMatch(db, ergoSettings.chainSettings)
+      val emptyCheckpoint = indexedHeight == 0 && globalTxIndex == 0 &&
+        Seq(indexedHeightOpt, globalTxIndexOpt, globalBoxIndexOpt, rollbackToOpt).forall(_.isDefined) &&
+        globalBoxIndex == GenesisIndex.nextBoxIndex(ergoSettings.chainSettings) &&
+        rollbackTo == 0 && indexedHeaderIdBytesOpt.isEmpty &&
+        GenesisIndex.initialRowsMatch(db, ergoSettings.chainSettings, ergoSettings.nodeSettings.storageRentCollection)
       val nonEmptyCheckpoint = indexedHeight > 0 && Seq(indexedHeightOpt, globalTxIndexOpt, globalBoxIndexOpt, rollbackToOpt)
         .forall(_.isDefined) && rollbackTo == 0 && terminalRowsMatchCheckpoint
       val checkpointIsValid = schemaVersionOpt.contains(NewestVersion) && numericValuesAreWellFormed &&
-        valuesAreNonNegative && (emptyCheckpoint || nonEmptyCheckpoint) && modeProvenanceValid && !quarantined
+        valuesAreNonNegative && genesisMatches && (emptyCheckpoint || nonEmptyCheckpoint) &&
+        modeProvenanceValid && !quarantined
       if (!checkpointIsValid) {
         val failedChecks = Seq(
           !schemaVersionOpt.contains(NewestVersion) -> "schema version",
@@ -391,6 +394,7 @@ object ErgoHistory extends ScorexLogging {
           quarantined -> "Digest frontier quarantine",
           !numericValuesAreWellFormed -> "counter encoding",
           !valuesAreNonNegative -> "negative counters",
+          !genesisMatches -> "configured genesis identities",
           (rollbackTo != 0) -> "rollback marker",
           (indexedHeight == 0 && !emptyCheckpoint) -> "empty checkpoint shape",
           (indexedHeight > 0 && Seq(indexedHeightOpt, globalTxIndexOpt, globalBoxIndexOpt, rollbackToOpt)
@@ -415,14 +419,9 @@ object ErgoHistory extends ScorexLogging {
             error)
           Failure(error)
         }.get
-        val rentMarkerEntry: Array[(Array[Byte], Array[Byte])] =
-          if (ergoSettings.nodeSettings.storageRentCollection) {
-            Array(RentIndexEnabledKey -> RentIndexEnabledBytes)
-          } else {
-            Array.empty
-          }
-        freshDb.insertExtraTry(Array((SchemaVersionKey, NewestVersionBytes)) ++ rentMarkerEntry ++ modeProvenanceEntry,
-          Array.empty).recoverWith { case error =>
+        GenesisIndex.initialize(freshDb, ergoSettings.chainSettings,
+          ergoSettings.nodeSettings.storageRentCollection, ergoSettings.nodeSettings.stateType)
+          .recoverWith { case error =>
           Try(freshDb.close()).failed.foreach(error.addSuppressed)
           Failure(error)
         }.get
@@ -449,10 +448,8 @@ object ErgoHistory extends ScorexLogging {
             error)
           Failure(error)
         }.get
-        freshDb.insertExtraTry(Array(
-          (SchemaVersionKey, NewestVersionBytes),
-          (RentIndexEnabledKey, RentIndexEnabledBytes)) ++ modeProvenanceEntry,
-          Array.empty).recoverWith { case error =>
+        GenesisIndex.initialize(freshDb, ergoSettings.chainSettings, rentEnabled = true,
+          stateType = ergoSettings.nodeSettings.stateType).recoverWith { case error =>
           Try(freshDb.close()).failed.foreach(error.addSuppressed)
           Failure(error)
         }.get

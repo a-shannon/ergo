@@ -10,7 +10,7 @@ import org.ergoplatform.nodeView.history.ErgoHistory
 import org.ergoplatform.nodeView.history.extra.ExtraIndexer.ReceivableMessages.GetSegmentThreshold
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.CurrentView
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.GetDataFromCurrentView
-import org.ergoplatform.nodeView.state.{DigestState, ErgoStateContext, ErgoStateReader, StateType}
+import org.ergoplatform.nodeView.state.{DigestState, ErgoState, ErgoStateContext, ErgoStateReader, StateType}
 import org.ergoplatform.settings.{Algos, CacheSettings, ErgoSettings, NetworkType}
 import org.ergoplatform.utils.{ErgoCorePropertyTest, NodeViewTestConfig, NodeViewTestOps}
 import org.ergoplatform.utils.fixtures.NodeViewFixture
@@ -523,6 +523,44 @@ class ExtraIndexerRestartSpec extends ErgoCorePropertyTest with NodeViewTestOps 
           getCurrentState.fullBlockBodyFrontier shouldBe Some(block.id)
           IndexerState.fromHistory(getHistory).indexedHeaderId shouldBe Some(block.id)
         }, 10.seconds, 50.millis)
+
+        val genesisIds = ErgoState.genesisBoxes(settings.chainSettings).map(box => bytesToId(box.id)).toSet
+        def checkGenesisInputs(): Unit = {
+          val inputIds = block.transactions.flatMap(_.inputs.map(input => bytesToId(input.boxId)))
+          inputIds should not be empty
+          inputIds.forall(genesisIds.contains) shouldBe true
+          block.transactions.foreach { tx =>
+            val indexed = getHistory.typedExtraIndexById[IndexedErgoTransaction](tx.id).get
+            val expectedIds = tx.inputs.map(input => bytesToId(input.boxId))
+            indexed.inputNums.length shouldBe expectedIds.length
+            indexed.inputNums.zip(expectedIds).foreach { case (number, expectedId) =>
+              number should be > 0L
+              NumericBoxIndex.getBoxByNumber(getHistory, number).map(_.id) shouldBe Some(expectedId)
+            }
+            indexed.retrieveBody(getHistory.getReader).inputs.map(_.id) shouldBe expectedIds
+          }
+        }
+        checkGenesisInputs()
+
+        val checkpointBeforeReopen = IndexerState.fromHistory(getHistory)
+        val schemaBeforeReopen = ExtraIndexer.getIndex(ExtraIndexer.SchemaVersionKey, getHistory).getInt
+        val provenanceBeforeReopen = getHistory.historyStorage
+          .modifierBytesById(bytesToId(ExtraIndexer.IndexModeProvenanceKey)).get
+        schemaBeforeReopen shouldBe ExtraIndexer.NewestVersion
+        provenanceBeforeReopen.sameElements(ExtraIndexer.DigestIndexProvenanceBytes) shouldBe true
+
+        val lifecycle = TestProbe()(actorSystem)
+        lifecycle.watch(indexer)
+        actorSystem.stop(indexer)
+        lifecycle.expectTerminated(indexer, 10.seconds)
+        stopNodeViewHolder()
+        startNodeViewHolder()
+
+        IndexerState.fromHistory(getHistory) shouldBe checkpointBeforeReopen
+        ExtraIndexer.getIndex(ExtraIndexer.SchemaVersionKey, getHistory).getInt shouldBe schemaBeforeReopen
+        getHistory.historyStorage.modifierBytesById(bytesToId(ExtraIndexer.IndexModeProvenanceKey))
+          .exists(_.sameElements(provenanceBeforeReopen)) shouldBe true
+        checkGenesisInputs()
       } finally {
         actorSystem.stop(indexer)
         sourceState.closeStorage()
