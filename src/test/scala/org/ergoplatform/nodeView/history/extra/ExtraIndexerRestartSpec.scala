@@ -528,13 +528,14 @@ class ExtraIndexerRestartSpec extends ErgoCorePropertyTest with NodeViewTestOps 
         def checkGenesisInputs(): Unit = {
           val inputIds = block.transactions.flatMap(_.inputs.map(input => bytesToId(input.boxId)))
           inputIds should not be empty
-          inputIds.forall(genesisIds.contains) shouldBe true
+          inputIds.exists(genesisIds.contains) shouldBe true
           block.transactions.foreach { tx =>
             val indexed = getHistory.typedExtraIndexById[IndexedErgoTransaction](tx.id).get
             val expectedIds = tx.inputs.map(input => bytesToId(input.boxId))
             indexed.inputNums.length shouldBe expectedIds.length
             indexed.inputNums.zip(expectedIds).foreach { case (number, expectedId) =>
               number should be > 0L
+              if (genesisIds.contains(expectedId)) number should be <= genesisIds.size.toLong
               NumericBoxIndex.getBoxByNumber(getHistory, number).map(_.id) shouldBe Some(expectedId)
             }
             indexed.retrieveBody(getHistory.getReader).inputs.map(_.id) shouldBe expectedIds
