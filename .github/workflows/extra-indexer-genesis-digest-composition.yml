@@ -40,4 +40,5 @@ jobs:
           org.ergoplatform.nodeView.history.extra.GenesisIndexSpec
           org.ergoplatform.nodeView.history.extra.GenesisIndexApiSpec
           org.ergoplatform.nodeView.history.extra.ExtraIndexerRestoreJoinSpec
-          org.ergoplatform.nodeView.history.extra.ExtraIndexerSpecification'
+          org.ergoplatform.nodeView.history.extra.ExtraIndexerSpecification
+          org.ergoplatform.nodeView.history.extra.ExtraIndexerAppliedBlocksSpec'
