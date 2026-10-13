@@ -6,7 +6,7 @@ import java.nio.ByteBuffer
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.nodeView.history.ErgoHistoryReader
-import org.ergoplatform.nodeView.history.extra.{ExtraIndex, ExtraIndexer, IndexedErgoBox, NumericBoxIndex, StorageRentBox}
+import org.ergoplatform.nodeView.history.extra.{ExtraIndex, ExtraIndexer, GenesisIndex, IndexedErgoBox, NumericBoxIndex, StorageRentBox}
 import org.ergoplatform.nodeView.history.storage.HistoryStorage
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.nodeView.state.{BoxHolder, ErgoStateContext, UtxoState, VotingData}
@@ -54,6 +54,7 @@ class CandidateRentSkippedPageSpec extends ErgoCorePropertyTest with TestFileUti
     val fixtureSettings = baseSettings.copy(
       directory = createTempDir.getAbsolutePath,
       nodeSettings = baseSettings.nodeSettings.copy(extraIndex = true, storageRentCollection = true))
+    val firstGlobalIndex = GenesisIndex.nextBoxIndex(fixtureSettings.chainSettings)
     val baseState = UtxoState.fromBoxHolder(BoxHolder(rentBoxes :+ freshBox), None,
       createTempDir, fixtureSettings, parameters)
     val block = invalidErgoFullBlockGen.sample.get
@@ -68,8 +69,9 @@ class CandidateRentSkippedPageSpec extends ErgoCorePropertyTest with TestFileUti
     }
     val storage = HistoryStorage(fixtureSettings)
     val rows = rentBoxes.zipWithIndex.flatMap { case (box, index) =>
-      val indexed = new IndexedErgoBox(box.creationHeight, None, None, None, box, index.toLong)
-      Seq[ExtraIndex](indexed, NumericBoxIndex(index.toLong, indexed.id), StorageRentBox(indexed))
+      val globalIndex = firstGlobalIndex + index
+      val indexed = new IndexedErgoBox(box.creationHeight, None, None, None, box, globalIndex)
+      Seq[ExtraIndex](indexed, NumericBoxIndex(globalIndex, indexed.id), StorageRentBox(indexed))
     }
     storage.insertExtra(Array(ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4)
       .putInt(height - 1).array), rows.toArray)
@@ -103,7 +105,7 @@ class CandidateRentSkippedPageSpec extends ErgoCorePropertyTest with TestFileUti
     ).asInstanceOf[ErgoHistoryReader]
 
     try {
-      val expectedIndices = 0L to scanLimit.toLong
+      val expectedIndices = firstGlobalIndex to firstGlobalIndex + scanLimit
       def assertUnspentRowsRetained(): Unit = {
         withClue(s"scan pages=$scanRowCounts; removed rows=$removedRowCounts: ") {
           storage.storageRentBoxesAtOrBefore(threshold, scanLimit + 1)
@@ -127,7 +129,7 @@ class CandidateRentSkippedPageSpec extends ErgoCorePropertyTest with TestFileUti
       }
 
       candidateInputs() shouldBe Set(bytesToId(freshBox.id))
-      scan.after.map(_.globalIndex) shouldBe Some(scanLimit.toLong - 1)
+      scan.after.map(_.globalIndex) shouldBe Some(firstGlobalIndex + scanLimit - 1)
       // A successful ordinary candidate must preserve every unspent skipped row.
       assertUnspentRowsRetained()
       candidateInputs() shouldBe Set(bytesToId(freshBox.id), bytesToId(laterBox.id))
@@ -184,6 +186,7 @@ class CandidateRentSkippedPageSpec extends ErgoCorePropertyTest with TestFileUti
     val fixtureSettings = baseSettings.copy(
       directory = dir.getAbsolutePath,
       nodeSettings = baseSettings.nodeSettings.copy(extraIndex = true, storageRentCollection = true))
+    val firstGlobalIndex = GenesisIndex.nextBoxIndex(fixtureSettings.chainSettings)
     val baseState = UtxoState.fromBoxHolder(BoxHolder(rentBoxes :+ freshBox), None,
       dir, fixtureSettings, parameters)
     val block = invalidErgoFullBlockGen.sample.get
@@ -198,8 +201,9 @@ class CandidateRentSkippedPageSpec extends ErgoCorePropertyTest with TestFileUti
     }
     val storage = HistoryStorage(fixtureSettings)
     val rows = rentBoxes.zipWithIndex.flatMap { case (box, index) =>
-      val indexed = new IndexedErgoBox(box.creationHeight, None, None, None, box, index.toLong)
-      Seq[ExtraIndex](indexed, NumericBoxIndex(index.toLong, indexed.id), StorageRentBox(indexed))
+      val globalIndex = firstGlobalIndex + index
+      val indexed = new IndexedErgoBox(box.creationHeight, None, None, None, box, globalIndex)
+      Seq[ExtraIndex](indexed, NumericBoxIndex(globalIndex, indexed.id), StorageRentBox(indexed))
     }
     storage.insertExtra(Array(ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4)
       .putInt(height - 1).array), rows.toArray)
@@ -235,7 +239,8 @@ class CandidateRentSkippedPageSpec extends ErgoCorePropertyTest with TestFileUti
     try {
       def assertUnspentRowsRetained(): Unit = {
         storage.storageRentBoxesAtOrBefore(threshold, rentBoxes.size)
-          .map(_.globalIndex).toSeq shouldBe (0L until rentBoxes.size.toLong)
+          .map(_.globalIndex).toSeq shouldBe
+          (firstGlobalIndex until firstGlobalIndex + rentBoxes.size)
         rentBoxes.foreach(box => state.boxById(box.id) shouldBe Some(box))
       }
       assertUnspentRowsRetained()
@@ -254,7 +259,8 @@ class CandidateRentSkippedPageSpec extends ErgoCorePropertyTest with TestFileUti
       }
 
       candidateInputs() shouldBe Set(bytesToId(freshBox.id))
-      scan.after.map(_.globalIndex) shouldBe Some(StorageRentClaimBuilder.MaxClaims.toLong - 1)
+      scan.after.map(_.globalIndex) shouldBe
+        Some(firstGlobalIndex + StorageRentClaimBuilder.MaxClaims - 1)
       assertUnspentRowsRetained()
       candidateInputs() shouldBe Set(bytesToId(freshBox.id), bytesToId(laterBox.id))
       scanRowCounts.toSeq shouldBe Seq(rentBoxes.size, 1)
