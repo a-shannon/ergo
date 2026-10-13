@@ -1,0 +1,75 @@
+name: PR 2720 fork isolation diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2720-fork-isolation-diagnostic-20261013
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fork-resolution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact diagnostic
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Verify PR parent and diagnostic scope
+        run: |
+          test "$(git rev-parse HEAD^)" = 3874932250158ac9e097ab696d217ae8c7e291d9
+          git diff --name-only HEAD^ HEAD | sort > /tmp/changed-paths
+          printf '%s\n' \
+            .github/workflows/pr2720-fork-isolation-diagnostic.yml \
+            src/it/scala/org/ergoplatform/it/ForkResolutionSpec.scala \
+            src/it/scala/org/ergoplatform/it/container/IntegrationTestConstants.scala \
+            | sort > /tmp/expected-paths
+          diff -u /tmp/expected-paths /tmp/changed-paths
+
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run ForkResolutionSpec
+        timeout-minutes: 20
+        run: |
+          mkdir -p tmp
+          TMPDIR=$(pwd)/tmp sbt -Denv=test ++2.12.20 docker "it:testOnly *ForkResolutionSpec"
+
+      - name: Save remaining node container logs
+        if: always()
+        timeout-minutes: 3
+        run: |
+          mkdir -p target/logs/containers
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              docker inspect --format '{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} finished={{.State.FinishedAt}}' "$id" || true
+              docker logs --timestamps "$id" > "target/logs/containers/$name.log" 2>&1 || true
+            done
+
+      - name: Upload focused integration evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr2720-fork-isolation-attempt-${{ github.run_attempt }}
+          path: |
+            target/logs/
+            target/it-reports/
+          if-no-files-found: warn
+          retention-days: 14
