@@ -1,9 +1,9 @@
-name: V2 fork convergence composition diagnostic
+name: V2 and section scheduling composition diagnostic
 
 on:
   push:
     branches:
-      - feat/pr2535-pr2691-v2-deep-20261013
+      - feat/pr2535-2691-2673-deep-20261013
 
 permissions:
   contents: read
@@ -57,7 +57,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: v2-deep-rollback-composition-attempt-${{ github.run_attempt }}
+          name: v2-section-deep-rollback-composition-attempt-${{ github.run_attempt }}
           path: |
             target/logs/
             target/it-reports/
