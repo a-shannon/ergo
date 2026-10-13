@@ -1,13 +1,13 @@
-name: ExtraIndexer genesis Digest composition diagnostic
+name: ExtraIndexer genesis Digest fail-stop composition diagnostic
 
 on:
   push:
     branches:
-      - feat/genesis-digest-compose-20261013
+      - feat/digest-failstop-compose-20261013
 
 jobs:
   composed_index:
-    name: Verify composed genesis and Digest indexer
+    name: Verify composed genesis, Digest indexer and startup fail-stop
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -40,4 +40,7 @@ jobs:
           org.ergoplatform.nodeView.history.extra.GenesisIndexSpec
           org.ergoplatform.nodeView.history.extra.GenesisIndexApiSpec
           org.ergoplatform.nodeView.history.extra.ExtraIndexerRestoreJoinSpec
-          org.ergoplatform.nodeView.history.extra.ExtraIndexerSpecification'
+          org.ergoplatform.nodeView.history.extra.ExtraIndexerSpecification
+          org.ergoplatform.nodeView.history.extra.HistoryOpenFailureShutdownSpec
+          org.ergoplatform.nodeView.history.extra.RestoreStateFailureWitnessSpec
+          org.ergoplatform.nodeView.viewholder.DigestStateRecoverySpec'

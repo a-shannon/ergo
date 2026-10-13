@@ -68,7 +68,13 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
     * state (result of log's modifiers application to pre-historical(genesis) state,
     * user-specific information stored in vault (it could be e.g. a wallet), and a memory pool.
     */
-  private var nodeView: NodeView = restoreState().getOrElse(genesisState)
+  private var nodeView: NodeView = Try(restoreState().getOrElse(genesisState)).recover { case ex =>
+    log.error("Failed to initialize node view, shutting down the node", ex)
+    Try(ErgoApp.shutdownSystem()(context.system)).failed.foreach { shutdownError =>
+      if (shutdownError ne ex) ex.addSuppressed(shutdownError)
+    }
+    throw ex
+  }.get
 
   /** Tracking last modifier and header & block heights in time, being periodically checked for possible stuck */
   private var chainProgress: Option[ChainProgress] = None
@@ -475,8 +481,9 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
     val history = ErgoHistory.readOrGenerate(settings)
     log.info("History database read")
     val memPool = ErgoMemPool.empty(settings)
-    val stateIn = ErgoState.readOrGenerate(settings).asInstanceOf[State]
-    restoreConsistentState(stateIn, history) match {
+    val storedState = Try(ErgoState.readOrGenerate(settings).asInstanceOf[State])
+    val consistentState = storedState.flatMap(state => Try(restoreConsistentState(state, history)).flatten)
+    consistentState match {
       case Success(state) =>
         log.info(s"State database read, state synchronized")
         val wallet = ErgoWallet.readOrGenerate(
@@ -487,15 +494,15 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
         Some((history, state, wallet, memPool))
       case Failure(ex) =>
         log.error("Failed to recover state, try to resync from genesis manually", ex)
-        if (hasCertifiedDigestState(stateIn)) {
-          // Returning None here would enter genesisState and delete the certified state directory.
-          Try(stateIn.closeStorage()).failed.foreach(ex.addSuppressed)
-          Try(history.closeStorage()).failed.foreach(ex.addSuppressed)
-          ErgoApp.shutdownSystem()(context.system)
-          throw CriticalSystemException("Failed to recover certified Digest state").initCause(ex)
+        Try(history.closeStorage()).failed.foreach { closeError =>
+          if (closeError ne ex) ex.addSuppressed(closeError)
         }
-        ErgoApp.shutdownSystem()(context.system)
-        None
+        storedState.toOption.foreach { state =>
+          Try(state.closeStorage()).failed.foreach { closeError =>
+            if (closeError ne ex) ex.addSuppressed(closeError)
+          }
+        }
+        throw ex
     }
   }
 
