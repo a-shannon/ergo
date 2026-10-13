@@ -1,0 +1,65 @@
+name: V2 fork convergence composition diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2535-pr2691-v2-deep-20261013
+
+permissions:
+  contents: read
+
+jobs:
+  deep_rollback:
+    name: DeepRollBackSpec on composed PR heads
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout exact scratch branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Build node image and run exact DeepRollBackSpec
+        timeout-minutes: 35
+        run: |
+          mkdir -p tmp
+          TMPDIR="$PWD/tmp" sbt -Denv=test clean ++2.12.20 docker "it:testOnly org.ergoplatform.it.DeepRollBackSpec"
+
+      - name: Save remaining node container logs
+        if: always()
+        timeout-minutes: 3
+        run: |
+          mkdir -p target/logs/containers
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              docker inspect --format '{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} finished={{.State.FinishedAt}}' "$id" || true
+              docker logs --timestamps "$id" > "target/logs/containers/$name.log" 2>&1 || true
+            done
+
+      - name: Upload integration logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: v2-deep-rollback-composition-attempt-${{ github.run_attempt }}
+          path: |
+            target/logs/
+            target/it-reports/
+          if-no-files-found: ignore
+          retention-days: 14
