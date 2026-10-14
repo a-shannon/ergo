@@ -194,4 +194,32 @@ class MatrixInputIdAdmissionSpec extends AnyPropSpec with Matchers with FileUtil
       f.tracker.getRequestedInfo(InputBlockTransactionIdsTypeId.value, f.announcement.id).map(_.checks) shouldBe Some(2)
     }
   }
+
+  property("ID timeout retries while the announcement is still awaiting persistence") {
+    withFixture { f =>
+      import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{ChangedHistory, ChangedMempool, CheckDelivery}
+      import org.ergoplatform.network.message.{InvData, RequestModifierSpec}
+
+      f.ref ! ChangedHistory(f.history)
+      f.ref ! ChangedMempool(f.pool)
+      f.sync.requestInputBlockTransactionIds(f.announcement, f.peer, checksDone = 1)
+      f.nc.fishForMessage(1.second) {
+        case stn: SendToNetwork if stn.message.spec.messageCode == RequestModifierSpec.messageCode =>
+          stn.message.data.get.asInstanceOf[InvData].ids == Seq(f.announcement.id)
+        case _ => false
+      }
+      f.history.getInputBlock(f.announcement.id) shouldBe None
+
+      f.ref ! CheckDelivery(f.peer, InputBlockTransactionIdsTypeId.value, f.announcement.id)
+      val retry = f.nc.fishForMessage(1.second) {
+        case stn: SendToNetwork if stn.message.spec.messageCode == RequestModifierSpec.messageCode =>
+          val inv = stn.message.data.get.asInstanceOf[InvData]
+          inv.typeId == InputBlockTransactionIdsTypeId.value && inv.ids == Seq(f.announcement.id)
+        case _ => false
+      }.asInstanceOf[SendToNetwork]
+      retry.sendingStrategy shouldBe SendToPeer(f.peer)
+      f.tracker.getRequestedInfo(InputBlockTransactionIdsTypeId.value, f.announcement.id)
+        .map(_.peer.handlerRef) shouldBe Some(f.peer.handlerRef)
+    }
+  }
 }

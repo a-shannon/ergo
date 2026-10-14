@@ -3479,7 +3479,7 @@ class ErgoNodeViewSynchronizerSpecification
     }
   }
 
-  property("NodeViewSynchronizer: disconnected ID owner retries through a live Matrix peer") {
+  property("NodeViewSynchronizer: disconnected ID owner retries before announcement persistence") {
     withFixture2 { ctx =>
       import ctx._
       import org.ergoplatform.modifiers.InputBlockTransactionIdsTypeId
@@ -3494,7 +3494,7 @@ class ErgoNodeViewSynchronizerSpecification
       synchronizerMockRef ! ChangedMempool(ErgoMemPool.empty(settings))
 
       val inputBlockInfo = buildValidInputBlockAnnouncement(hist.bestFullBlockOpt)
-      hist.applyInputBlock(inputBlockInfo)
+      hist.getInputBlock(inputBlockInfo.id) shouldBe None
       val matrixSpec = defaultPeerSpec.copy(features = Seq(
         ModePeerFeature(StateType.Utxo, verifyingTransactions = true, None, -1)))
       val replacement = peer.copy(handlerRef = TestProbe()(system).ref,
@@ -3523,6 +3523,7 @@ class ErgoNodeViewSynchronizerSpecification
       synchronizerMockRef ! Message(InputBlockMessageSpec,
         Left(InputBlockMessageSpec.toBytes(inputBlockInfo)), Some(replacement))
       deliveryTracker.getRequestedInfo(idType, inputBlockInfo.id).get shouldBe firstRequest
+      hist.getInputBlock(inputBlockInfo.id) shouldBe None
       ncProbe.receiveWhile(300.millis, 50.millis) { case m => m }.collect {
         case stn: SendToNetwork if stn.message.spec.messageCode == RequestModifierSpec.messageCode => stn
       } shouldBe empty

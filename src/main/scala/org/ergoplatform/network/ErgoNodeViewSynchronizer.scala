@@ -1587,17 +1587,23 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
   /** Request transaction IDs for an input block from a live peer. */
   def requestInputBlockTransactionIds(inputBlockInfo: InputBlockAnnouncement,
                                        remote: ConnectedPeer,
-                                       checksDone: Int = 0): Unit = {
+                                       checksDone: Int = 0): Unit =
+    requestInputBlockTransactionIdsById(inputBlockInfo.id, remote, checksDone)
+
+  // A retry may fire before the view holder has persisted the announcement.
+  private def requestInputBlockTransactionIdsById(subBlockId: ModifierId,
+                                                  remote: ConnectedPeer,
+                                                  checksDone: Int): Unit = {
     if (disconnectedHandlers.contains(remote.handlerRef)) return
     val typeId = InputBlockTransactionIdsTypeId.value
-    val retryChecks = deliveryTracker.getRequestedInfo(typeId, inputBlockInfo.id) match {
+    val retryChecks = deliveryTracker.getRequestedInfo(typeId, subBlockId) match {
       case Some(info) if disconnectedHandlers.contains(info.peer.handlerRef) =>
-        deliveryTracker.setUnknown(inputBlockInfo.id, typeId)
+        deliveryTracker.setUnknown(subBlockId, typeId)
         info.checks
       case Some(_) => return
       case None => checksDone
     }
-    requestBlockSection(typeId, Seq(inputBlockInfo.id), remote, retryChecks)
+    requestBlockSection(typeId, Seq(subBlockId), remote, retryChecks)
   }
 
 
@@ -2214,10 +2220,8 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
               deliveryTracker.setUnknown(modifierId, modifierTypeId)
               if (!inputBlockTransactionsAreComplete(hr, modifierId) &&
                   !localInputBlockChunks.contains(modifierId)) {
-                hr.getInputBlock(modifierId).foreach { ibi =>
-                  liveInputBlockIdsPeer(modifierId).foreach { nextPeer =>
-                    requestInputBlockTransactionIds(ibi, nextPeer, checksDone)
-                  }
+                liveInputBlockIdsPeer(modifierId).foreach { nextPeer =>
+                  requestInputBlockTransactionIdsById(modifierId, nextPeer, checksDone)
                 }
               }
             } else if (modifierTypeId == InputBlockTypeId.value ||
@@ -2227,6 +2231,12 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
               if (modifierTypeId == InputBlockTypeId.value && checksDone < 2) {
                 log.info(s"re-requesting input block $modifierId")
                 requestInputBlock(modifierId, peer)
+              } else if (modifierTypeId == InputBlockTransactionIdsTypeId.value) {
+                if (!inputBlockTransactionsAreComplete(hr, modifierId) &&
+                    !localInputBlockChunks.contains(modifierId)) {
+                  log.info(s"re-requesting input tx ids $modifierId")
+                  requestInputBlockTransactionIdsById(modifierId, peer, checksDone)
+                }
               } else {
                 log.info(s"re-requesting input txs $modifierId")
                 hr.getInputBlock(modifierId).foreach { ibi =>
