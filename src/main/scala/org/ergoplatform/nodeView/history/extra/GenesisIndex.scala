@@ -37,14 +37,16 @@ object GenesisIndex {
   }
 
   /** Install schema, genesis rows and their checkpoint in the same database batch. */
-  def initialize(storage: HistoryStorage, settings: ChainSettings, rentEnabled: Boolean): Try[Unit] = {
+  def initialize(storage: HistoryStorage, settings: ChainSettings, rentEnabled: Boolean,
+                 modeProvenanceBytes: Array[Byte]): Try[Unit] = {
     val zero = ByteBuffer.allocate(4).putInt(0).array
     val entries = Array(
       SchemaVersionKey -> NewestVersionBytes,
       IndexedHeightKey -> zero,
       GlobalTxIndexKey -> ByteBuffer.allocate(8).putLong(0L).array,
       GlobalBoxIndexKey -> ByteBuffer.allocate(8).putLong(nextBoxIndex(settings)).array,
-      RollbackToKey -> zero
+      RollbackToKey -> zero,
+      IndexModeProvenanceKey -> modeProvenanceBytes
     ) ++ (if (rentEnabled) Array(RentIndexEnabledKey -> RentIndexEnabledBytes) else Array.empty[(Array[Byte], Array[Byte])])
     storage.insertExtraTry(entries, rows(settings, rentEnabled))
   }

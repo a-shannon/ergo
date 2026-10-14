@@ -218,7 +218,8 @@ class ExtraIndexerTestActor(test: ExtraIndexerSpecification,
           if (writeFailurePhase.nonEmpty) completedWriteKinds += "remove"
         }
       }
-      GenesisIndex.initialize(store, dbSettings.chainSettings, rentIndexEnabled).get
+      GenesisIndex.initialize(store, dbSettings.chainSettings, rentIndexEnabled,
+        ExtraIndexer.UtxoIndexProvenanceBytes).get
       _history = new ErgoHistory with FullBlockSectionProcessor {
         override protected val settings: ErgoSettings = dbSettings
         override protected[history] val historyStorage: HistoryStorage = store

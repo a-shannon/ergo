@@ -10,11 +10,14 @@ import org.ergoplatform.mining.AutolykosPowScheme
 import org.ergoplatform.modifiers.history._
 import org.ergoplatform.modifiers.history.header.{Header, PreGenesisHeader}
 import org.ergoplatform.modifiers.{BlockSection, ErgoFullBlock, ErgoNodeViewModifier, NonHeaderBlockSection}
-import org.ergoplatform.nodeView.history.extra.ExtraIndexer.{GlobalBoxIndexKey, GlobalTxIndexKey, IndexedHeaderIdKey,
-  IndexedHeightKey, NewestVersion, RentIndexEnabledBytes, RentIndexEnabledKey, RollbackToKey, SchemaVersionKey}
+import org.ergoplatform.nodeView.history.extra.ExtraIndexer.{DigestFrontierQuarantineKey, DigestIndexProvenanceBytes,
+  GlobalBoxIndexKey, GlobalTxIndexKey, IndexedHeaderIdKey, IndexedHeightKey, IndexModeProvenanceKey,
+  NewestVersion, RentIndexEnabledBytes, RentIndexEnabledKey, RollbackToKey, SchemaVersionKey,
+  UtxoIndexProvenanceBytes}
 import org.ergoplatform.nodeView.history.extra.{GenesisIndex, IndexedErgoBox, IndexedErgoTransaction, NumericBoxIndex, NumericTxIndex}
 import org.ergoplatform.nodeView.history.storage.HistoryStorage
 import org.ergoplatform.nodeView.history.storage.modifierprocessors._
+import org.ergoplatform.nodeView.state.StateType
 import org.ergoplatform.settings.{Algos, ErgoSettings}
 import org.ergoplatform.utils.LoggingUtil
 import org.ergoplatform.validation.RecoverableModifierError
@@ -273,6 +276,11 @@ object ErgoHistory extends ScorexLogging {
     // ExtraIndexer db check
     if(ergoSettings.nodeSettings.extraIndex) { // check db schema and checkpoint provenance
       def storedBytes(key: Array[Byte]): Option[Array[Byte]] = db.modifierBytesById(bytesToId(key))
+      val digestMode = ergoSettings.nodeSettings.stateType == StateType.Digest
+      val modeProvenanceBytes = if (digestMode) DigestIndexProvenanceBytes else UtxoIndexProvenanceBytes
+      val modeProvenanceValid = storedBytes(IndexModeProvenanceKey)
+        .exists(_.sameElements(modeProvenanceBytes))
+      val quarantined = storedBytes(DigestFrontierQuarantineKey).isDefined
       def intValue(bytesOpt: Option[Array[Byte]]): Option[Int] = bytesOpt
         .filter(_.length == Integer.BYTES)
         .map(bytes => ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).getInt)
@@ -377,10 +385,13 @@ object ErgoHistory extends ScorexLogging {
       val nonEmptyCheckpoint = indexedHeight > 0 && Seq(indexedHeightOpt, globalTxIndexOpt, globalBoxIndexOpt, rollbackToOpt)
         .forall(_.isDefined) && rollbackTo == 0 && terminalRowsMatchCheckpoint
       val checkpointIsValid = schemaVersionOpt.contains(NewestVersion) && numericValuesAreWellFormed &&
-        valuesAreNonNegative && genesisMatches && (emptyCheckpoint || nonEmptyCheckpoint)
+        valuesAreNonNegative && genesisMatches && (emptyCheckpoint || nonEmptyCheckpoint) &&
+          modeProvenanceValid && !quarantined
       if (!checkpointIsValid) {
         val failedChecks = Seq(
           !schemaVersionOpt.contains(NewestVersion) -> "schema version",
+          !modeProvenanceValid -> "state-mode index provenance",
+          quarantined -> "Digest frontier quarantine",
           !numericValuesAreWellFormed -> "counter encoding",
           !valuesAreNonNegative -> "negative counters",
           !genesisMatches -> "configured genesis identities",
@@ -408,7 +419,8 @@ object ErgoHistory extends ScorexLogging {
             error)
           Failure(error)
         }.get
-        GenesisIndex.initialize(freshDb, ergoSettings.chainSettings, ergoSettings.nodeSettings.storageRentCollection)
+        GenesisIndex.initialize(freshDb, ergoSettings.chainSettings,
+          ergoSettings.nodeSettings.storageRentCollection, modeProvenanceBytes)
           .recoverWith { case error =>
           Try(freshDb.close()).failed.foreach(error.addSuppressed)
           Failure(error)
@@ -436,7 +448,9 @@ object ErgoHistory extends ScorexLogging {
             error)
           Failure(error)
         }.get
-        GenesisIndex.initialize(freshDb, ergoSettings.chainSettings, rentEnabled = true).recoverWith { case error =>
+        GenesisIndex.initialize(freshDb, ergoSettings.chainSettings, rentEnabled = true,
+          modeProvenanceBytes = modeProvenanceBytes)
+          .recoverWith { case error =>
           Try(freshDb.close()).failed.foreach(error.addSuppressed)
           Failure(error)
         }.get

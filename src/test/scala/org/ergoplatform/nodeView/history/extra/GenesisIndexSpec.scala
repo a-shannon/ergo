@@ -39,17 +39,23 @@ class GenesisIndexSpec extends ErgoCorePropertyTest with TestFileUtils {
         else super.insertExtraTry(entries, objects, removals)
     }
     try {
-      GenesisIndex.initialize(storage, settings.chainSettings, rentEnabled = true).isFailure shouldBe true
-      Seq(SchemaVersionKey, IndexedHeightKey, GlobalBoxIndexKey, GlobalTxIndexKey).foreach { key =>
+      GenesisIndex.initialize(storage, settings.chainSettings, rentEnabled = true,
+        modeProvenanceBytes = UtxoIndexProvenanceBytes).isFailure shouldBe true
+      Seq(SchemaVersionKey, IndexedHeightKey, GlobalBoxIndexKey, GlobalTxIndexKey,
+        IndexModeProvenanceKey).foreach { key =>
         storage.modifierBytesById(bytesToId(key)) shouldBe None
       }
       GenesisIndex.boxes(settings.chainSettings).foreach(box => storage.getExtraIndex(box.id) shouldBe None)
       failWrite = false
-      GenesisIndex.initialize(storage, settings.chainSettings, rentEnabled = true).get
+      GenesisIndex.initialize(storage, settings.chainSettings, rentEnabled = true,
+        modeProvenanceBytes = UtxoIndexProvenanceBytes).get
+      storage.modifierBytesById(bytesToId(IndexModeProvenanceKey))
+        .exists(_.sameElements(UtxoIndexProvenanceBytes)) shouldBe true
       GenesisIndex.identitiesMatch(storage, settings.chainSettings) shouldBe true
       GenesisIndex.initialRowsMatch(storage, settings.chainSettings, rentEnabled = true) shouldBe true
       // A retry constructs the same seed instead of adding to balances in the previous batch.
-      GenesisIndex.initialize(storage, settings.chainSettings, rentEnabled = true).get
+      GenesisIndex.initialize(storage, settings.chainSettings, rentEnabled = true,
+        modeProvenanceBytes = UtxoIndexProvenanceBytes).get
       GenesisIndex.initialRowsMatch(storage, settings.chainSettings, rentEnabled = true) shouldBe true
     } finally storage.close()
     val reopened = ErgoHistory.readOrGenerate(settings)(null)

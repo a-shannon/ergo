@@ -1,6 +1,7 @@
 package org.ergoplatform.nodeView.history.extra
 
 import akka.actor.{ActorRef, Props}
+import akka.testkit.TestProbe
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
 import org.ergoplatform.core.idToVersion
 import org.ergoplatform.modifiers.ErgoFullBlock
@@ -20,6 +21,7 @@ import sigma.ast.ErgoTree
 import sigma.interpreter.ProverResult
 import sigma.serialization.ErgoTreeSerializer
 
+import java.nio.ByteBuffer
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.duration._
 
@@ -108,15 +110,33 @@ class ExtraIndexerTemplateKeySpec extends ErgoCorePropertyTest with NodeViewTest
     }
     (1 to 3).foreach(_ => extendWith(validTransactionsFromBoxHolder(tipState.versionedBoxHolder, new RandomWrapper)._1))
 
-    private val indexer: ActorRef = actorSystem.actorOf(Props(
+    private def newIndexer(): ActorRef = actorSystem.actorOf(Props(
       new ExtraIndexer(settings.cacheSettings, settings.chainSettings.addressEncoder, Some(nodeViewHolderRef), true)))
+
+    private var indexer: Option[ActorRef] = Some(newIndexer())
     awaitIndexed(chain.last)
 
     def history: ErgoHistory = getHistory
 
     def state: UtxoStateReader = getCurrentState.asInstanceOf[UtxoStateReader]
 
-    def stopIndexer(): Unit = actorSystem.stop(indexer)
+    def stopIndexer(): Unit = indexer.foreach { ref =>
+      val watcher = TestProbe()
+      watcher.watch(ref)
+      actorSystem.stop(ref)
+      watcher.expectTerminated(ref)
+      indexer = None
+    }
+
+    def reopenNodeHolder(): Unit = {
+      stopNodeViewHolder()
+      startNodeViewHolder()
+    }
+
+    def restartIndexer(): Unit = {
+      indexer shouldBe None
+      indexer = Some(newIndexer())
+    }
 
     def deliver(block: ErgoFullBlock): Unit = applyBlock(block) shouldBe 'success
 
@@ -335,6 +355,47 @@ class ExtraIndexerTemplateKeySpec extends ErgoCorePropertyTest with NodeViewTest
       node.templateRecord.map(_.boxes.toList) shouldBe Some(List(secondNumber))
       node.history.typedExtraIndexById[IndexedContractTemplate](addressKey) shouldBe None
       node.boxRecord(first).map(_.globalIndex) shouldBe Some(firstNumber)
+    }
+  }
+
+  property("schema 8 rebuilds a schema 7 collision into separate address and template records") {
+    withNode() { node =>
+      val (first, _) = node.firstPayment()
+      val firstNumber = node.boxRecord(first).get.globalIndex
+      node.addressRecord.map(_.boxes.toList) shouldBe Some(List(firstNumber))
+      node.templateRecord.map(_.boxes.toList) shouldBe Some(List(firstNumber))
+      node.stopIndexer()
+
+      // This is a handwritten schema-7 row with the exact legacy collision shape, not an
+      // execution of the 6.0.8 producer. Reopening the real store exercises the upgrade itself.
+      node.history.historyStorage.insertExtraTry(
+        Array(ExtraIndexer.SchemaVersionKey -> ByteBuffer.allocate(4).putInt(7).array),
+        Array[ExtraIndex](IndexedContractTemplate(addressKey, ArrayBuffer(firstNumber))),
+        Array(templateKey)).get
+      node.addressRecord shouldBe None
+      node.templateRecord shouldBe None
+      node.history.typedExtraIndexById[IndexedContractTemplate](addressKey).map(_.boxes.toList) shouldBe
+        Some(List(firstNumber))
+
+      node.reopenNodeHolder()
+      ExtraIndexer.getIndex(ExtraIndexer.SchemaVersionKey, node.history).getInt shouldBe ExtraIndexer.NewestVersion
+      IndexerState.fromHistory(node.history).indexedHeight shouldBe 0
+      node.addressRecord shouldBe None
+      node.templateRecord shouldBe None
+      node.history.typedExtraIndexById[IndexedContractTemplate](addressKey) shouldBe None
+
+      node.restartIndexer()
+      node.awaitIndexed(node.chain.last)
+      val rebuiltNumber = node.boxRecord(first).get.globalIndex
+
+      node.state.boxById(first.id).isDefined shouldBe true
+      node.addressRecord.map(_.boxes.toList) shouldBe Some(List(rebuiltNumber))
+      node.addressRecord.flatMap(_.balanceInfo).map(_.nanoErgs) shouldBe Some(first.value)
+      node.addressTxs shouldBe Seq(first.transactionId)
+      node.templateRecord.map(_.boxes.toList) shouldBe Some(List(rebuiltNumber))
+      node.addressRecord.get.retrieveBoxes(node.history, 0, 10).map(_.id).toList shouldBe List(bytesToId(first.id))
+      node.templateRecord.get.retrieveBoxes(node.history, 0, 10).map(_.id).toList shouldBe List(bytesToId(first.id))
+      node.history.typedExtraIndexById[IndexedContractTemplate](addressKey) shouldBe None
     }
   }
 

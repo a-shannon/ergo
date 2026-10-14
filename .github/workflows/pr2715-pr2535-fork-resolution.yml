@@ -1,0 +1,73 @@
+name: Digest genesis composition diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  digest-genesis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact composition
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify source parents and atomic junction
+        run: |
+          test "$(git rev-parse HEAD)" = '${{ github.sha }}'
+          git merge-base --is-ancestor 51e2b455bf0628310bedc7f213d90ce09a8378fe HEAD
+          git merge-base --is-ancestor 0fdc6e7d91cc37fb5d07e2044b8f4f90247744fa HEAD
+          git merge-base --is-ancestor 0e8f0c2793521891d119889c82fabfa661091a4f HEAD
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/history/ErgoHistory.scala)" = 474b852c429867be33f4b7e1afe3c10181d2c275
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/history/extra/GenesisIndex.scala)" = a447a83548011ea731f5f8c3e87d84e2ee6476a9
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/history/extra/ExtraIndexer.scala)" = b6d41e51f0b8db7d55fd779db8b28028e00ca94c
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/http/api/BlockchainApiRoute.scala)" = 6f0e90c82611f599cec0f6efd5ad4aab67346567
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/extra/GenesisIndexApiSpec.scala)" = 05b095b5cc09640d22b80209624165ff119ef266
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/extra/GenesisIndexSpec.scala)" = 2946af82743fc932b715ed9cdb78921496e94021
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/extra/BlockchainExtraIndexGateSpec.scala)" = b7739a385e9a600b46662bc75adc7b921fcb9e07
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/extra/ExtraIndexerRestartSpec.scala)" = 032ad93291c5ff563ec48de90a1a65c63a047d96
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/extra/ExtraIndexerAppliedBlocksSpec.scala)" = 04f9e12da25a5dc0d6d95d92d795fdddcf624162
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/extra/ExtraIndexerTemplateKeySpec.scala)" = 62c019147821e18e3b8a9a4a3e3ecc566561f221
+
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run isolated bound HTTP and affected index checks
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          mkdir -p target/diagnostic
+          sbt -J-Xmx3g -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            'set Test / parallelExecution := false' \
+            'testOnly org.ergoplatform.nodeView.history.extra.GenesisIndexApiSpec' \
+            'testOnly org.ergoplatform.nodeView.history.extra.GenesisIndexSpec org.ergoplatform.nodeView.history.extra.BlockchainExtraIndexGateSpec org.ergoplatform.nodeView.history.extra.ExtraIndexerRestartSpec org.ergoplatform.nodeView.history.extra.ExtraIndexerAppliedBlocksSpec org.ergoplatform.nodeView.history.extra.ExtraIndexerTemplateKeySpec' \
+            2>&1 | tee target/diagnostic/affected-tests.log
+
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-genesis-composition-attempt-${{ github.run_attempt }}
+          path: |
+            target/diagnostic/
+            target/test-reports/
+          if-no-files-found: error
+          retention-days: 30
