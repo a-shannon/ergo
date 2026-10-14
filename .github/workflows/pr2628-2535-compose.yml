@@ -44,7 +44,7 @@ jobs:
         run: |
           cd it
           mkdir tmp
-          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++2.12.20 'it:testOnly org.ergoplatform.it.ForkResolutionSpec org.ergoplatform.it.container.DockerMountedCommandSpec'
+          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++2.12.20 docker 'it:testOnly org.ergoplatform.it.ForkResolutionSpec org.ergoplatform.it.container.DockerMountedCommandSpec'
 
       - name: Retain node logs and test reports
         if: always()
