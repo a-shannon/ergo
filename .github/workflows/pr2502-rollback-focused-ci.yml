@@ -1,0 +1,52 @@
+name: PR 2502 fork rollback focused diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2502-weak-restack-20261014
+
+permissions:
+  contents: read
+
+jobs:
+  focused-node:
+    name: Exercise disjoint input-fork rollback
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Build pinned SigmaState dependency
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
+
+      - name: Setup Java and Scala
+        uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+
+      - name: Run focused rollback regression
+        run: sbt -batch -Denv=test ++2.12.20 "testOnly org.ergoplatform.nodeView.history.llm_generated.MatrixDisjointForkRollbackSpec"
+
+      - name: Retain test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr2502-rollback-reports
+          path: target/test-reports/
+          if-no-files-found: warn
+          retention-days: 7
