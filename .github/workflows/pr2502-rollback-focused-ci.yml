@@ -40,7 +40,7 @@ jobs:
           java-version: adopt@1.8
 
       - name: Run focused rollback regression
-        run: sbt -batch -Denv=test ++2.12.20 "testOnly org.ergoplatform.nodeView.history.llm_generated.MatrixDisjointForkRollbackSpec"
+        run: sbt -batch -Denv=test ++2.12.20 "testOnly org.ergoplatform.nodeView.history.llm_generated.MatrixDisjointForkRollbackSpec org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification"
 
       - name: Retain test reports
         if: always()
