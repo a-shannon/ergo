@@ -2343,7 +2343,8 @@ class ErgoNodeViewSynchronizerSpecification
 
       // Verify that localInputBlockChunks was populated
       val localInputBlockChunksField =
-        classOf[ErgoNodeViewSynchronizer].getDeclaredField("localInputBlockChunks")
+        classOf[ErgoNodeViewSynchronizer].getDeclaredFields
+          .find(_.getName.endsWith("localInputBlockChunks")).get
       localInputBlockChunksField.setAccessible(true)
       val localInputBlockChunks = localInputBlockChunksField
         .get(synchronizer)
@@ -2414,7 +2415,8 @@ class ErgoNodeViewSynchronizerSpecification
       // Pre-populate localInputBlockChunks with tx1 (local tx from mempool) but not tx2
       val testSynchronizer = testSynchronizerRef.underlyingActor
       val localInputBlockChunksField =
-        classOf[ErgoNodeViewSynchronizer].getDeclaredField("localInputBlockChunks")
+        classOf[ErgoNodeViewSynchronizer].getDeclaredFields
+          .find(_.getName.endsWith("localInputBlockChunks")).get
       localInputBlockChunksField.setAccessible(true)
       val localInputBlockChunks = localInputBlockChunksField
         .get(testSynchronizer)
@@ -2562,7 +2564,8 @@ class ErgoNodeViewSynchronizerSpecification
 
       // Use reflection to access private field
       val localInputBlockChunksField =
-        classOf[ErgoNodeViewSynchronizer].getDeclaredField("localInputBlockChunks")
+        classOf[ErgoNodeViewSynchronizer].getDeclaredFields
+          .find(_.getName.endsWith("localInputBlockChunks")).get
       localInputBlockChunksField.setAccessible(true)
       val localInputBlockChunks = localInputBlockChunksField
         .get(synchronizerMock)
@@ -2610,7 +2613,8 @@ class ErgoNodeViewSynchronizerSpecification
 
       // Access the localInputBlockChunks map via reflection
       val localInputBlockChunksField =
-        classOf[ErgoNodeViewSynchronizer].getDeclaredField("localInputBlockChunks")
+        classOf[ErgoNodeViewSynchronizer].getDeclaredFields
+          .find(_.getName.endsWith("localInputBlockChunks")).get
       localInputBlockChunksField.setAccessible(true)
       val localInputBlockChunks = localInputBlockChunksField
         .get(synchronizerMock)
@@ -4187,7 +4191,8 @@ class ErgoNodeViewSynchronizerSpecification
       // Pre-populate with tx1 weakId but a fake weakId that won't be found
       val fakeWeakId: Array[Byte] = Array.fill(32)(0xFF.toByte)
       val localInputBlockChunksField =
-        classOf[ErgoNodeViewSynchronizer].getDeclaredField("localInputBlockChunks")
+        classOf[ErgoNodeViewSynchronizer].getDeclaredFields
+          .find(_.getName.endsWith("localInputBlockChunks")).get
       localInputBlockChunksField.setAccessible(true)
       val localInputBlockChunks = localInputBlockChunksField
         .get(testSynchronizerRef.underlyingActor)
