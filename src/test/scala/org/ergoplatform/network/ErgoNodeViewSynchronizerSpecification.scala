@@ -416,7 +416,9 @@ class ErgoNodeViewSynchronizerSpecification
     )
 
     deleteRecursive(ErgoHistory.historyDir(synchronizerSettings))
-    val nodeViewHolderMockRef = system.actorOf(Props(new NodeViewHolderMock(synchronizerSettings)))
+    // This fixture supplies ChangedHistory explicitly below. A real view-holder mock would
+    // also reply to GetNodeViewChanges with its own history and race that explicit update.
+    val nodeViewHolderMockRef = TestProbe("SnapshotViewHolderProbe").ref
 
     val synchronizerMockRef = system.actorOf(Props(
       new SynchronizerMock(
