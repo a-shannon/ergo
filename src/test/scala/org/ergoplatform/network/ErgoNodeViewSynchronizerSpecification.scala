@@ -3391,7 +3391,8 @@ class ErgoNodeViewSynchronizerSpecification
         case _ => false
       }.asInstanceOf[SendToNetwork]
       bodyRequest.sendingStrategy shouldBe SendToPeer(peer)
-      bodyRequest.message.data.get.asInstanceOf[InputBlockTransactionsRequest].txIds shouldBe Seq(tx.weakId)
+      bodyRequest.message.data.get.asInstanceOf[InputBlockTransactionsRequest].txIds.map(_.toSeq) shouldBe
+        Seq(tx.weakId.toSeq)
     }
   }
 
@@ -3442,7 +3443,8 @@ class ErgoNodeViewSynchronizerSpecification
         case _ => false
       }.asInstanceOf[SendToNetwork]
       bodyRequest.sendingStrategy shouldBe SendToPeer(peerB)
-      bodyRequest.message.data.get.asInstanceOf[InputBlockTransactionsRequest].txIds shouldBe Seq(tx.weakId)
+      bodyRequest.message.data.get.asInstanceOf[InputBlockTransactionsRequest].txIds.map(_.toSeq) shouldBe
+        Seq(tx.weakId.toSeq)
 
       val conflictingId = tx.weakId.clone()
       conflictingId(0) = (conflictingId(0) ^ 1).toByte
@@ -4399,7 +4401,7 @@ class ErgoNodeViewSynchronizerSpecification
     }
   }
 
-  property("NodeViewSynchronizer: processInputBlock ignores already known input block") {
+  property("NodeViewSynchronizer: processInputBlock ignores an already completed input block") {
     withFixture2 { ctx =>
       import ctx._
 
@@ -4426,8 +4428,10 @@ class ErgoNodeViewSynchronizerSpecification
         None
       )
 
-      // Pre-apply the input block to history so it is already known
+      // Persist both the announcement and its empty transaction body. A stored
+      // announcement alone remains incomplete and should request its IDs.
       hist.applyInputBlock(inputBlockInfo) shouldBe None
+      hist.applyInputBlockTransactions(inputBlockInfo.id, Seq.empty, wrappedState)
       hist.getInputBlock(header.id) shouldBe Some(inputBlockInfo)
 
       val synchronizer = synchronizerMockRef.underlyingActor
@@ -4441,7 +4445,6 @@ class ErgoNodeViewSynchronizerSpecification
         Some(wrappedState)
       )
 
-      // No network activity should occur for a known block
       ncProbe.expectNoMessage(500.millis)
     }
   }
