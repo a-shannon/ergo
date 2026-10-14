@@ -1,0 +1,79 @@
+name: PR 2725 and 2535 isolation diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2725-pr2535-isolation-20261015
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolation:
+    if: github.repository == 'a-shannon/ergo'
+    name: Mounted command and fork isolation on composed heads
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout exact scratch composition
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact source parents and source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^1)" = "262d3cafa895a35fe78f520e861c87cdfef046b7"
+          test "$(git rev-parse HEAD^2)" = "d2f1cdab4ead9c614ab77f3ea39c66ae1894d3c8"
+          test "$(git rev-parse HEAD:src)" = "9864c33db2fce81c3874b0f503fea2ed181fcb7a"
+          git diff --exit-code HEAD^1 HEAD -- src/main/scala/org/ergoplatform/nodeView/mempool/ErgoMemPool.scala
+          git show --no-patch --format=fuller HEAD
+
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Build node image and run focused integration suites
+        timeout-minutes: 35
+        run: |
+          mkdir -p tmp
+          TMPDIR="$PWD/tmp" sbt -Denv=test clean ++2.12.20 docker "it:testOnly org.ergoplatform.it.container.DockerMountedCommandSpec org.ergoplatform.it.ForkResolutionSpec"
+
+      - name: Save leftover node container logs
+        if: always()
+        timeout-minutes: 3
+        run: |
+          mkdir -p target/logs/containers
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              docker inspect --format '{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} finished={{.State.FinishedAt}}' "$id" > "target/logs/containers/$name.state.log" 2>&1 || true
+              docker logs --timestamps "$id" > "target/logs/containers/$name.log" 2>&1 || true
+            done
+
+      - name: Upload integration reports and node logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr2725-pr2535-isolation-attempt-${{ github.run_attempt }}
+          path: |
+            target/logs/
+            target/it-reports/
+          if-no-files-found: warn
+          retention-days: 14
