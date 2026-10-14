@@ -1,0 +1,58 @@
+name: PR 2628 and 2535 fixture composition
+
+on:
+  push:
+    branches:
+      - feat/pr2628-2535-compose-20261014
+
+permissions:
+  contents: read
+
+jobs:
+  focused-integration:
+    name: Run fork isolation and mounted cleanup tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout current branch
+        uses: actions/checkout@v4
+        with:
+          path: it
+          fetch-depth: 0
+
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Build pinned SigmaState dependency
+        uses: ./it/.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
+          ergo-build-file: it/build.sbt
+
+      - name: Setup Java and Scala
+        uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+
+      - name: Run focused integration tests
+        run: |
+          cd it
+          mkdir tmp
+          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++2.12.20 'it/testOnly org.ergoplatform.it.ForkResolutionSpec org.ergoplatform.it.container.DockerMountedCommandSpec'
+
+      - name: Retain node logs and test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr2628-2535-composition-logs
+          path: |
+            it/target/logs/
+            it/target/test-reports/
+          if-no-files-found: warn
+          retention-days: 7
