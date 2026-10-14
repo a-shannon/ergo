@@ -5,6 +5,7 @@ import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
 import org.ergoplatform.mining.InputBlockFields
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
 import org.ergoplatform.nodeView.history.ErgoHistory
+import org.ergoplatform.nodeView.history.modifierprocessors.InputBlocksProcessor
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.nodeView.state.{BoxHolder, StateType, UtxoState}
 import org.ergoplatform.nodeView.wallet.IdUtils.EncodedBoxId
@@ -297,5 +298,19 @@ class MatrixDisjointForkRollbackSpec extends ErgoCorePropertyTest {
     history.applyInputBlockTransactions(winningRoot.id, Seq.empty, us) shouldBe
       (Seq.empty -> Seq.empty)
     history.bestInputBlocksChain() shouldBe Seq(abandonedTip.id, abandonedRoot.id)
+  }
+
+  property("a cached input body is complete only when every recorded transaction is present") {
+    val first = spend(genesisBoxes.head, 0)
+    val second = spend(genesisBoxes(1), 0)
+    val ids = Seq(first.id, second.id)
+    val bodies = Map(first.id -> first, second.id -> second)
+
+    InputBlocksProcessor.completeTransactions(ids, bodies.get) shouldBe
+      Some(Seq(first, second))
+    InputBlocksProcessor.completeTransactions(ids, id => bodies.get(id).filterNot(_ == second)) shouldBe
+      None
+    InputBlocksProcessor.completeTransactions(Seq.empty, bodies.get) shouldBe
+      Some(Seq.empty)
   }
 }
