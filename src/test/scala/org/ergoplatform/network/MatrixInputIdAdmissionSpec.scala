@@ -26,6 +26,7 @@ import scala.concurrent.{Await, ExecutionContext}
 import scala.concurrent.duration._
 
 class MatrixInputIdAdmissionSpec extends AnyPropSpec with Matchers with FileUtils {
+  import org.ergoplatform.utils.ErgoCoreTestConstants.parameters
   import org.ergoplatform.utils.ErgoNodeTestConstants._
   import org.ergoplatform.utils.generators.ConnectedPeerGenerators._
   import org.ergoplatform.utils.generators.ChainGenerator._
