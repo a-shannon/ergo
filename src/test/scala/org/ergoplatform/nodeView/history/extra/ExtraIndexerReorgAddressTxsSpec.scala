@@ -558,4 +558,86 @@ class ExtraIndexerReorgAddressTxsSpec extends ErgoCorePropertyTest with NodeView
     rollbackOnRowOutOfOrder(alsoPaysAddress = true)
   }
 
+  property("a later rollback removes a stale number from an earlier transaction segment") {
+    withNode(segmentThreshold = Some(2)) { node =>
+      import node.segmentThreshold
+
+      val Seq(box) = node.fund(1)
+      val fork = node.chain.last
+      val fundingNumber = node.expectedWatchedTxs.head
+
+      // This abandoned spend is the old-code source of the stale number. Its transaction is
+      // deliberately late in a full block, while the replacement branch below has fewer
+      // transactions. The old rollback omitted the input-only address, so it retained this
+      // number and then appended the lower number of `carry` from the replacement branch.
+      val abandoned = node.branch(fork) { state =>
+        node.ordinaryTxs(state, atLeast = 12) :+ spend(box)
+      }
+      val staleNumber = node.txCount + abandoned.head.blockTransactions.txs.size - 1
+      node.deliver(abandoned)
+      node.awaitIndexed()
+
+      val carry = move(box, watchedTree)
+      val replacement = node.branch(fork)(
+        state => carry +: node.ordinaryTxs(state).take(1),
+        node.ordinaryTxs(_).take(1))
+      node.deliver(replacement)
+      node.awaitIndexed()
+      val validNumbers = node.expectedWatchedTxs
+      validNumbers.size shouldBe 2
+      validNumbers.head shouldBe fundingNumber
+      validNumbers.last should be < staleNumber
+
+      // Persist exactly the layout which the old code's addTx/splitToSegments path could write:
+      // [funding, stale, lower-valid] splits at two entries, leaving the valid tail current.
+      val legacy = node.watchedRow
+      legacy.txSegmentCount shouldBe 0
+      legacy.txs.toSeq shouldBe validNumbers
+      legacy.txs.clear()
+      legacy.txs ++= Seq(fundingNumber, staleNumber, validNumbers.last)
+      val legacySegments = legacy.splitToSegments.map(segment => segment: ExtraIndex)
+      node.history.historyStorage
+        .insertExtraTry(Array.empty, Array[ExtraIndex](legacy) ++ legacySegments)
+        .get
+
+      node.restart()
+      node.awaitIndexed()
+      val reopened = node.watchedRow
+      reopened.txSegmentCount shouldBe 1
+      node.history.typedExtraIndexById[IndexedErgoAddress](txSegmentId(watched, 0))
+        .map(_.txs.toSeq) shouldBe Some(Seq(fundingNumber, staleNumber))
+      reopened.txs.toSeq shouldBe Seq(validNumbers.last)
+
+      // A second real chain switch touches the address, then rolls it back below staleNumber.
+      // The current valid tail remains below the target, challenging rollbackState's segment walk.
+      val secondFork = node.chain.last
+      val spendCarry = spend(carry.outputs.head)
+      val rollbackTarget = node.txCount - 1
+      rollbackTarget should be < staleNumber
+      validNumbers.last should be <= rollbackTarget
+      val secondAbandoned = node.branch(secondFork) { state =>
+        node.ordinaryTxs(state).take(1) :+ spendCarry
+      }
+      node.deliver(secondAbandoned)
+      node.awaitIndexed()
+      node.deliver(node.branch(secondFork)(
+        node.ordinaryTxs(_).take(1),
+        node.ordinaryTxs(_).take(1)))
+      node.awaitIndexed()
+
+      val expected = node.expectedWatchedTxs
+      val row = node.watchedRow
+      val stored = listedTxs(node.history, row)
+      val chainTxIds = numbered(node.chain).map(_._1.id).toIndexedSeq
+      val expectedRead = expected.reverse.map(n => chainTxIds(n.toInt))
+      val read = Try(row.retrieveTxs(node.history, 0, Int.MaxValue).map(_.id).toSeq)
+      val differences = node.indexDifferences()
+
+      withClue(s"stored=$stored expected=$expected read=$read expectedRead=$expectedRead differences=$differences: ") {
+        stored shouldBe expected
+        read shouldBe Success(expectedRead)
+      }
+    }
+  }
+
 }
