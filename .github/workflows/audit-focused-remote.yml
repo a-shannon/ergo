@@ -1,0 +1,77 @@
+name: Focused audit validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact full source commit on this fork
+        required: true
+        type: string
+      suite:
+        description: Affected source closure
+        required: true
+        type: choice
+        options:
+          - matrix-pending
+          - mempool-providers
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate source identity
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: '[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+      - name: Confirm tested commit
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: 'test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"'
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Build pinned Matrix SigmaState dependency
+        if: inputs.suite == 'matrix-pending'
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
+      - name: Setup Scala and Java
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Run Matrix pending synchronization closure
+        if: inputs.suite == 'matrix-pending'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.network.MatrixInputIdAdmissionSpec" \
+            "testOnly org.ergoplatform.network.llm_generated.InputBlockPendingCacheSpec" \
+            "testOnly org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification"
+      - name: Run mempool provider regressions
+        if: inputs.suite == 'mempool-providers'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.mempool.ErgoMemPoolInputProvidersSpec"
+      - name: Retain test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: focused-${{ inputs.suite }}-${{ inputs.source_commit }}
+          path: target/test-reports/
+          if-no-files-found: warn
+          retention-days: 7
