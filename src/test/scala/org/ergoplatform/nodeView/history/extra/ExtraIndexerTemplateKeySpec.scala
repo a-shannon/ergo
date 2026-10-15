@@ -446,7 +446,7 @@ class ExtraIndexerTemplateKeySpec extends ErgoCorePropertyTest with NodeViewTest
       // Only the legacy extra-index marker and collision row are synthetic. The short chain,
       // serialized proofs and certified Digest frontier above were produced by the real holder.
       node.history.historyStorage.insertExtraTry(
-        Array(ExtraIndexer.SchemaVersionKey -> ByteBuffer.allocate(4).putInt(7).array),
+        Array(ExtraIndexer.SchemaVersionKey -> ByteBuffer.allocate(4).putInt(ExtraIndexer.NewestVersion).array),
         Array[ExtraIndex](IndexedContractTemplate(addressKey, ArrayBuffer(firstNumber))),
         Array(templateKey)).get
       node.addressRecord shouldBe None
