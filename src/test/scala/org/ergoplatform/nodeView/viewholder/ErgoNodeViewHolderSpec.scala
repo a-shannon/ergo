@@ -1326,69 +1326,105 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
     }
   }
 
-  private val t42 = TestCase("input block rollback restores transactions to mempool and rolls back wallet") { fixture =>
+  private val t42 = TestCase("longer input block fork removes a restored conflict when winner was never pooled") { fixture =>
     import fixture._
     if (stateType == Utxo && verifyTransactions) {
       val (us, bh) = createUtxoState(fixture.settings)
-      val genesis = validFullBlock(parentOpt = None, us, bh)
-      applyBlock(genesis) shouldBe 'success
+      try {
+        val genesis = validFullBlock(parentOpt = None, us, bh)
+        applyBlock(genesis) shouldBe 'success
 
-      // Create first input block (ib1) with a real transaction
-      val boxes = ErgoState.newBoxes(genesis.transactions).find(_.ergoTree == TrueTree).toIndexedSeq
-      boxes.nonEmpty shouldBe true
-      val tx1 = UnconfirmedTransaction(validTransactionFromBoxes(boxes), None)
-      nodeViewHolderRef ! LocallyGeneratedTransaction(tx1)
-      expectMsgType[Accepted]
-      getPoolSize shouldBe 1
+        val spendable = ErgoState.newBoxes(genesis.transactions)
+          .filter(_.ergoTree == TrueTree)
+          .sortBy(box => Algos.encode(box.id))
+          .toIndexedSeq
+        spendable.size should be >= 2
 
-      val (_, bh2) = createUtxoState(fixture.settings)
-      val block1 = validFullBlock(Some(genesis), WrappedUtxoState(us, bh2, fixture.settings))
-      val ib1 = InputBlockAnnouncement(1, block1.header, emptyInputBlockFields, None)
+        def spend(boxIndex: Int, outputTree: sigma.ast.ErgoTree): ErgoTransaction = {
+          val box = spendable(boxIndex)
+          val tx = ErgoTransaction(
+            IndexedSeq(org.ergoplatform.Input(box.id, emptyProverResult)),
+            IndexedSeq.empty,
+            IndexedSeq(new ErgoBoxCandidate(
+              box.value,
+              outputTree,
+              box.creationHeight,
+              box.additionalTokens,
+              box.additionalRegisters)))
+          tx.statelessValidity().get
+          tx
+        }
 
-      val dummyPeer = ConnectedPeer(
-        scorex.core.network.ConnectionId(
-          new java.net.InetSocketAddress("127.0.0.1", 1234),
-          new java.net.InetSocketAddress("127.0.0.1", 5678),
-          scorex.core.network.Outgoing
-        ),
-        testProbe.ref,
-        None
-      )
+        val abandoned = spend(0, TrueTree)
+        val winner = spend(0, FalseTree)
+        val unrelated = spend(1, TrueTree)
+        winner.id should not be abandoned.id
 
-      // Helper to wait for input block processing to complete
-      def waitForProcessing(): Unit = Thread.sleep(500)
+        send(LocallyGeneratedTransaction(UnconfirmedTransaction(abandoned, None)))
+        expectMsgType[Accepted]
+        send(LocallyGeneratedTransaction(UnconfirmedTransaction(unrelated, None)))
+        expectMsgType[Accepted]
 
-      // Apply ib1 to establish first chain and consume tx1 from mempool
-      nodeViewHolderRef ! ProcessInputBlock(ib1, dummyPeer)
-      waitForProcessing()
-      val txData1 = InputBlockTransactionsData(ib1.id, Seq(tx1.transaction))
-      nodeViewHolderRef ! ProcessInputBlockTransactions(txData1)
-      waitForProcessing()
+        val forkABlock = validFullBlock(Some(genesis), us, bh, new RandomWrapper(Some(101)))
+        val forkBRootBlock = validFullBlock(Some(genesis), us, bh, new RandomWrapper(Some(202)))
+        val forkBChildBlock = validFullBlock(Some(genesis), us, bh, new RandomWrapper(Some(303)))
+        val forkA = InputBlockAnnouncement(1, forkABlock.header, emptyInputBlockFields, None)
+        val forkBRoot = InputBlockAnnouncement(1, forkBRootBlock.header, emptyInputBlockFields, None)
+        val forkBChild = InputBlockAnnouncement(
+          1,
+          forkBChildBlock.header,
+          parentOnlyFields(idToBytes(forkBRoot.id)),
+          None)
 
-      // Verify tx1 was consumed from mempool
-      getHistory.getInputBlock(ib1.id) should not be None
-      getPoolSize shouldBe 0
+        val dummyPeer = ConnectedPeer(
+          scorex.core.network.ConnectionId(
+            new java.net.InetSocketAddress("127.0.0.1", 1234),
+            new java.net.InetSocketAddress("127.0.0.1", 5678),
+            scorex.core.network.Outgoing
+          ),
+          testProbe.ref,
+          None
+        )
 
-      // Create competing input block (ib1b) that starts a different fork (same parent as ib1)
-      val block1b = validFullBlock(Some(genesis), WrappedUtxoState(us, bh2, fixture.settings))
-      val ib1b = InputBlockAnnouncement(1, block1b.header, emptyInputBlockFields, None)
+        def currentViewAfterMailbox(): CurView = {
+          send(GetDataFromCurrentView[ErgoState[_], CurView](view => view))
+          expectMsgType[CurView]
+        }
 
-      // Apply competing chain ib1b (single block, same length as original chain; fork switch by depth not needed)
-      nodeViewHolderRef ! ProcessInputBlock(ib1b, dummyPeer)
-      waitForProcessing()
-      val txData1b = InputBlockTransactionsData(ib1b.id, Seq.empty)
-      nodeViewHolderRef ! ProcessInputBlockTransactions(txData1b)
-      waitForProcessing()
+        def poolIds(view: CurView): Set[ModifierId] =
+          view.pool.getAll.map(_.transaction.id).toSet
 
-      // Verify that a fork now exists and the original chain ib1 is still known
-      getHistory.getInputBlock(ib1.id) should not be None
-      getHistory.getInputBlock(ib1b.id) should not be None
+        send(ProcessInputBlock(forkA, dummyPeer))
+        send(ProcessInputBlockTransactions(InputBlockTransactionsData(forkA.id, Seq(abandoned))))
+        val afterForkA = currentViewAfterMailbox()
+        afterForkA.history.bestInputBlocksChain() shouldBe Seq(forkA.id)
+        poolIds(afterForkA) shouldBe Set(unrelated.id)
 
-      // Check mempool state: tx1 was consumed by ib1. If the node switched to ib1b,
-      // it should have rolled back ib1 and restored tx1. We just assert the behavior
-      // is consistent (tx1 is either still consumed or restored), without requiring a switch.
-      val poolSizeAfter = getPoolSize
-      poolSizeAfter should (be (0) or be (1))
+        // The competing root is only tied with fork A, so its transaction is recorded
+        // without becoming best or entering the mempool.
+        send(ProcessInputBlock(forkBRoot, dummyPeer))
+        send(ProcessInputBlockTransactions(InputBlockTransactionsData(forkBRoot.id, Seq(winner))))
+        val afterForkBRoot = currentViewAfterMailbox()
+        afterForkBRoot.history.bestInputBlocksChain() shouldBe Seq(forkA.id)
+        poolIds(afterForkBRoot) shouldBe Set(unrelated.id)
+        afterForkBRoot.pool.contains(winner.id) shouldBe false
+
+        // Completing the child makes fork B strictly longer. The holder must restore
+        // fork A, then remove the restored conflict even though winner was never pooled.
+        send(ProcessInputBlock(forkBChild, dummyPeer))
+        send(ProcessInputBlockTransactions(InputBlockTransactionsData(forkBChild.id, Seq.empty)))
+        val afterSwitch = currentViewAfterMailbox()
+        afterSwitch.history.bestInputBlocksChain() shouldBe Seq(forkBChild.id, forkBRoot.id)
+        afterSwitch.history.getInputBlockTransactions(forkA.id).map(_.map(_.id)) shouldBe
+          Some(Seq(abandoned.id))
+        afterSwitch.history.getInputBlockTransactions(forkBRoot.id).map(_.map(_.id)) shouldBe
+          Some(Seq(winner.id))
+        poolIds(afterSwitch) shouldBe Set(unrelated.id)
+        afterSwitch.pool.contains(abandoned.id) shouldBe false
+        afterSwitch.pool.contains(winner.id) shouldBe false
+      } finally {
+        us.closeStorage()
+      }
     }
   }
 
