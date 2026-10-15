@@ -22,6 +22,7 @@ on:
           - mempool-conflicts
           - nipopow-producer
           - nipopow-validation
+          - nipopow-validation-remainder
 
 permissions:
   contents: read
@@ -38,7 +39,7 @@ jobs:
         run: |
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
-            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation) ;;
+            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -133,6 +134,15 @@ jobs:
           sbt -batch -Denv=test ++2.12.20 \
             'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
             "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec" \
+            "testOnly *PoPowAlgosSpec *NipopowVerifierSpec *SerializationTests *PopowProcessorSpecification *NipopowApiRoutesSpec" \
+            "testOnly *ErgoSanityUTXO *ErgoSanityDigest -- -z GetNipopowProof" \
+            ++2.13.18 \
+            "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec"
+      - name: Run remaining NiPoPoW consumer and cross-version checks
+        if: inputs.suite == 'nipopow-validation-remainder'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
             "testOnly *PoPowAlgosSpec *NipopowVerifierSpec *SerializationTests *PopowProcessorSpecification *NipopowApiRoutesSpec" \
             "testOnly *ErgoSanityUTXO *ErgoSanityDigest -- -z GetNipopowProof" \
             ++2.13.18 \
