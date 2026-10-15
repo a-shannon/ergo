@@ -16,6 +16,7 @@ on:
           - matrix-forks
           - matrix-mempool
           - matrix-wallet-join
+          - digest-proof-rebuild
           - mempool-providers
           - mempool-conflicts
 
@@ -34,7 +35,7 @@ jobs:
         run: |
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
-            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|mempool-providers|mempool-conflicts) ;;
+            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|digest-proof-rebuild|mempool-providers|mempool-conflicts) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -93,6 +94,11 @@ jobs:
         run: |
           sbt -batch -Denv=test ++2.12.20 \
             "testOnly org.ergoplatform.nodeView.mempool.ErgoMemPoolInputProvidersSpec"
+      - name: Run Digest proof retention through extra-index rebuild
+        if: inputs.suite == 'digest-proof-rebuild'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.history.extra.ExtraIndexerTemplateKeySpec"
       - name: Run applied transaction conflict closure
         if: inputs.suite == 'mempool-conflicts'
         run: |
