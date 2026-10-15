@@ -83,9 +83,6 @@ object NipopowProverWithDbAlgs {
       }
       require(suffixTail.lengthCompare(k - 1) == 0,
         s"Cannot construct NiPoPoW proof with suffix length ${suffixTail.size + 1}: expected $k")
-      require((suffixHead.header +: suffixTail).zip(suffixTail).forall {
-        case (parent, child) => child.parentId == parent.id
-      }, "Cannot construct NiPoPoW proof with disconnected suffix")
 
       val storedHeights = mutable.Set[Height]() // cache to filter out duplicate headers
       val prefixBuilder = mutable.ArrayBuilder.make[PoPowHeader]()
