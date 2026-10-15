@@ -16,6 +16,7 @@ on:
           - matrix-forks
           - matrix-mempool
           - matrix-wallet-join
+          - matrix-wallet-closeout
           - digest-proof-rebuild
           - mempool-providers
           - mempool-conflicts
@@ -35,7 +36,7 @@ jobs:
         run: |
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
-            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|digest-proof-rebuild|mempool-providers|mempool-conflicts) ;;
+            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -57,7 +58,7 @@ jobs:
             ~/.cache/coursier/v1
           key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
       - name: Build pinned Matrix SigmaState dependency
-        if: inputs.suite == 'matrix-pending' || inputs.suite == 'matrix-forks' || inputs.suite == 'matrix-mempool' || inputs.suite == 'matrix-wallet-join'
+        if: inputs.suite == 'matrix-pending' || inputs.suite == 'matrix-forks' || inputs.suite == 'matrix-mempool' || inputs.suite == 'matrix-wallet-join' || inputs.suite == 'matrix-wallet-closeout'
         uses: ./.github/actions/bootstrap-sigmastate
         with:
           scala-version: 2.12.20
@@ -94,6 +95,16 @@ jobs:
         run: |
           sbt -batch -Denv=test ++2.12.20 \
             "testOnly org.ergoplatform.nodeView.mempool.ErgoMemPoolInputProvidersSpec"
+      - name: Run affected Matrix wallet closure
+        if: inputs.suite == 'matrix-wallet-closeout'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.wallet.InputBlockWalletSpec" \
+            'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "longer input block fork removes a restored conflict when winner was never pooled"' \
+            "testOnly org.ergoplatform.nodeView.wallet.ErgoWalletSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.ErgoWalletServiceSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.WalletScanLogicSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.persistence.OffChainRegistrySpec"
       - name: Run Digest proof retention through extra-index rebuild
         if: inputs.suite == 'digest-proof-rebuild'
         run: |
