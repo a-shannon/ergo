@@ -1,0 +1,112 @@
+name: Matrix sibling completion batch diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2369-completion-batches-20261015
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  focused-node:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify candidate source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^1)" = "4d90ba606e88e9f2f6be09f232997a5a6b005713"
+          test "$(git rev-parse HEAD:src)" = "56acabb0289334130685d57230cee5000216da42"
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/history/modifierprocessors/InputBlocksProcessor.scala)" = "b280422b6f0f6c99e02eacc5ca34785ea54a99b1"
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/modifierprocessors/InputBlockProcessorSpecification.scala)" = "33f5aa14533e4bea76af6a1f9a54201e49b36653"
+
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Build pinned SigmaState dependency
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
+
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Verify both regressions fail on previous production source
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          production=src/main/scala/org/ergoplatform/nodeView/history/modifierprocessors/InputBlocksProcessor.scala
+          git restore --source=a6aa06bfac90bc99dd4fde2ae714ed3e63e20a25 -- "$production"
+          set +e
+          sbt -batch -Denv=test ++2.12.20 'testOnly org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification -- -z "cached replay preserves"'
+          result=$?
+          set -e
+          test "$result" -ne 0
+          python3 - <<'PY'
+          import re
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          report = Path('target/test-reports/TEST-org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification.xml')
+          suite = ET.parse(report).getroot()
+          assert suite.attrib['tests'] == '2', suite.attrib
+          assert suite.attrib['failures'] == '2', suite.attrib
+          assert suite.attrib['errors'] == '0', suite.attrib
+          assert suite.attrib.get('skipped', '0') == '0', suite.attrib
+          expected = {
+              'linear cached replay preserves a multi-block shared prefix for a later fork switch',
+              'fork-switch cached replay preserves every shared completion for a third fork',
+          }
+          assert {case.attrib['name'] for case in suite.findall('testcase')} == expected
+          for case in suite.findall('testcase'):
+              failure = case.find('failure')
+              assert failure is not None, case.attrib
+              lists = re.findall(r'List\((.*?)\)', failure.attrib['message'], re.S)
+              assert len(lists) == 2, failure.attrib
+              actual, wanted = [re.findall(r'"([0-9a-f]{64})"', value) for value in lists]
+              assert len(actual) == 3 and len(wanted) == 2, failure.attrib
+              assert actual[1:] == wanted and actual[0] not in wanted, failure.attrib
+          destination = Path('target/matrix-batch-red')
+          destination.mkdir(parents=True, exist_ok=True)
+          (destination / report.name).write_bytes(report.read_bytes())
+          print('Both regressions expose exactly one replayed shared-prefix block.')
+          PY
+          git restore --source="$GITHUB_SHA" -- "$production"
+          git diff --exit-code -- src
+
+      - name: Run full processor specification on candidate source
+        timeout-minutes: 20
+        run: sbt -batch -Denv=test ++2.12.20 'testOnly org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification'
+
+      - name: Retain RED and GREEN reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: matrix-sibling-batch-attempt-${{ github.run_attempt }}
+          path: |
+            target/matrix-batch-red/
+            target/test-reports/
+          if-no-files-found: warn
+          retention-days: 14
