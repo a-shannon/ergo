@@ -1,26 +1,41 @@
-name: PR 2502 fork rollback focused diagnostic
+name: Matrix fork PR composition diagnostic
 
 on:
   push:
     branches:
-      - feat/pr2502-weak-restack-20261014
+      - feat/pr2502-fork-composition-20261015
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   focused-node:
-    name: Exercise disjoint input-fork rollback
+    if: github.repository == 'a-shannon/ergo'
+    name: Exercise processed depth, completion and sibling recovery
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: Checkout exact branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify frozen composition
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor f05ed1a95833d66f46a582aff8000234c831a240 HEAD
+          test "$(git rev-parse HEAD:src)" = "080e9eea9358d8a70d0fc9d3ed0f79f5a41c686c"
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/history/modifierprocessors/InputBlocksProcessor.scala)" = "97cbe4e009e982ccaad0c7ddd60916be6e7755a4"
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/modifierprocessors/InputBlockProcessorSpecification.scala)" = "fdbde6c82628d4b688403b01e25bc5b986ce9829"
+          git show --no-patch --format=fuller HEAD
 
       - name: Cache sbt
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.sbt
@@ -35,18 +50,20 @@ jobs:
           scala-version: 2.12.20
 
       - name: Setup Java and Scala
-        uses: olafurpg/setup-scala@v10
+        uses: coursier/setup-action@v3
         with:
-          java-version: adopt@1.8
+          jvm: temurin:8
+          apps: sbt
 
-      - name: Run focused rollback regression
-        run: sbt -batch -Denv=test ++2.12.20 "testOnly org.ergoplatform.nodeView.history.llm_generated.MatrixDisjointForkRollbackSpec"
+      - name: Run focused combined fork regressions
+        timeout-minutes: 35
+        run: sbt -batch -Denv=test ++2.12.20 "testOnly org.ergoplatform.nodeView.history.llm_generated.MatrixDisjointForkRollbackSpec org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification"
 
       - name: Retain test reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: pr2502-rollback-reports
+          name: matrix-fork-composition-attempt-${{ github.run_attempt }}
           path: target/test-reports/
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 14
