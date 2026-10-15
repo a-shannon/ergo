@@ -192,7 +192,7 @@ class InputBlockWalletSpec extends ErgoCorePropertyTest with WalletTestOps with 
     }
   }
 
-  property("holder fork switch restores exact wallet state after chained input blocks") {
+  property("holder fork switch rolls back chained input-block wallet registry while restoring transactions to mempool") {
     withFixture { implicit w =>
       implicit val patienceConfig: PatienceConfig = PatienceConfig(5.second, 100.millis)
 
@@ -202,7 +202,7 @@ class InputBlockWalletSpec extends ErgoCorePropertyTest with WalletTestOps with 
 
       val (balanceBefore, boxIdsBefore) = eventually {
         val balance = await(wallet.balancesWithUnconfirmed)
-        val boxes = await(wallet.walletBoxes(unspentOnly = true, considerUnconfirmed = true))
+        val boxes = await(wallet.walletBoxes(unspentOnly = false, considerUnconfirmed = true))
         balance.walletBalance should be > 0L
         balance.walletAssetBalances should not be empty
         balance.walletAssetBalances.map(_._2).sum shouldBe 10L
@@ -281,8 +281,8 @@ class InputBlockWalletSpec extends ErgoCorePropertyTest with WalletTestOps with 
         currentViewAfterMailbox()
       }
 
-      // This holder-level diagnostic begins after peer validation; synthetic announcements
-      // do not exercise network transport or Merkle-proof binding.
+      // Direct holder injection uses synthetic headers/fields and bypasses synchronizer
+      // PoW, network transport and Merkle-proof validation.
       val afterForkA = processInputBlock(forkA, Seq(tx1, tx2))
       afterForkA.history.bestInputBlocksChain() shouldBe Seq(forkA.id)
       afterForkA.history.getInputBlockTransactions(forkA.id).map(_.map(_.id)) shouldBe
@@ -302,11 +302,14 @@ class InputBlockWalletSpec extends ErgoCorePropertyTest with WalletTestOps with 
       afterSwitch.history.bestInputBlocksChain() shouldBe Seq(forkBChild.id, forkBRoot.id)
       afterSwitch.history.getInputBlockTransactions(forkA.id).map(_.map(_.id)) shouldBe
         Some(Seq(tx1.id, tx2.id))
+      afterSwitch.pool.getAll.map(_.id).toSet shouldBe Set(tx1.id, tx2.id)
 
       val transientBoxIds = (tx1.outputs ++ tx2.outputs).map(box => Algos.encode(box.id)).toSet
       eventually {
         val balanceAfter = await(wallet.balancesWithUnconfirmed)
-        val boxIdsAfter = await(wallet.walletBoxes(unspentOnly = true, considerUnconfirmed = true))
+        // Compare registry endpoints independently of mempool input filtering:
+        // restored transactions make the spendable-box view exclude the confirmed input.
+        val boxIdsAfter = await(wallet.walletBoxes(unspentOnly = false, considerUnconfirmed = true))
           .map(box => Algos.encode(box.trackedBox.box.id))
           .toSet
         boxIdsAfter shouldBe boxIdsBefore
