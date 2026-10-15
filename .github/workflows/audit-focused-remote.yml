@@ -14,6 +14,7 @@ on:
         options:
           - matrix-pending
           - matrix-forks
+          - matrix-mempool
           - mempool-providers
           - mempool-conflicts
 
@@ -32,7 +33,7 @@ jobs:
         run: |
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
-            matrix-pending|matrix-forks|mempool-providers|mempool-conflicts) ;;
+            matrix-pending|matrix-forks|matrix-mempool|mempool-providers|mempool-conflicts) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -54,7 +55,7 @@ jobs:
             ~/.cache/coursier/v1
           key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
       - name: Build pinned Matrix SigmaState dependency
-        if: inputs.suite == 'matrix-pending' || inputs.suite == 'matrix-forks'
+        if: inputs.suite == 'matrix-pending' || inputs.suite == 'matrix-forks' || inputs.suite == 'matrix-mempool'
         uses: ./.github/actions/bootstrap-sigmastate
         with:
           scala-version: 2.12.20
@@ -75,6 +76,11 @@ jobs:
         run: |
           sbt -batch -Denv=test ++2.12.20 \
             "testOnly org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification"
+      - name: Run real holder fork-to-mempool regression
+        if: inputs.suite == 'matrix-mempool'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "longer input block fork removes a restored conflict when winner was never pooled"'
       - name: Run mempool provider regressions
         if: inputs.suite == 'mempool-providers'
         run: |
