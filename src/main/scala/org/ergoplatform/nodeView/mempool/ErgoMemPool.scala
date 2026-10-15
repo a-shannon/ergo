@@ -127,27 +127,116 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
   private def updateStatsOnRemoval(tx: ErgoTransaction): MemPoolStatistics = {
     val wtx = pool.transactionsRegistry.get(tx.id)
     wtx.map(wgtx => stats.add(System.currentTimeMillis(), wgtx))
-       .getOrElse(MemPoolStatistics(System.currentTimeMillis(), 0, System.currentTimeMillis()))
+       .getOrElse(stats)
   }
 
   /**
     * Remove transaction from the pool along with its double-spends
     */
   def removeTxAndDoubleSpends(tx: ErgoTransaction): ErgoMemPool = {
-    def removeTx(mp: ErgoMemPool, tx: ErgoTransaction): ErgoMemPool = {
-      log.debug(s"Removing transaction ${tx.id} from the mempool")
-      new ErgoMemPool(mp.pool.remove(tx), mp.updateStatsOnRemoval(tx), sortingOption)
+    def removeTx(mp: ErgoMemPool,
+                 tx: ErgoTransaction,
+                 updateStats: Boolean = true): ErgoMemPool = {
+      val updatedPool = mp.pool.remove(tx)
+      if (updatedPool eq mp.pool) {
+        mp
+      } else {
+        log.debug(s"Removing transaction ${tx.id} from the mempool")
+        val updatedStats = if (updateStats) mp.updateStatsOnRemoval(tx) else mp.stats
+        new ErgoMemPool(updatedPool, updatedStats, sortingOption)
+      }
     }
 
+    // An applied transaction may arrive through a block without ever entering the pool.
     val poolWithoutTx = removeTx(this, tx)
-    val doubleSpentTransactionIds = tx.inputs.flatMap(i =>
-      poolWithoutTx.pool.inputs.get(i.boxId)
-    ).toSet
-    val doubleSpentTransactions = doubleSpentTransactionIds.flatMap { txId =>
-      poolWithoutTx.pool.orderedTransactions.get(txId)
+    val directConflictIds = mutable.LinkedHashSet.empty[ModifierId]
+    tx.inputs.foreach { input =>
+      poolWithoutTx.pool.inputs.get(input.boxId)
+        .flatMap(poolWithoutTx.pool.orderedTransactions.get)
+        .foreach(conflict => directConflictIds += conflict.id)
     }
-    doubleSpentTransactions.foldLeft(poolWithoutTx) { case (pool, tx) =>
-      removeTx(pool, tx.transaction)
+
+    if (directConflictIds.isEmpty) {
+      poolWithoutTx
+    } else {
+      val liveTransactions = poolWithoutTx.pool.orderedTransactions.valuesIterator.toVector
+      val liveById = liveTransactions.iterator.map(tx => tx.id -> tx).toMap
+      val consumersByProvider = mutable.LinkedHashMap.empty[ModifierId, mutable.LinkedHashSet[ModifierId]]
+
+      // A conflicting loser invalidates consumers of its outputs, including data-input consumers.
+      // Snapshot the live graph before removing leaves first, so ancestor weights remain consistent.
+      liveTransactions.foreach { consumer =>
+        val referencedBoxIds = consumer.transaction.inputs.iterator.map(_.boxId) ++
+          consumer.transaction.dataInputs.iterator.map(_.boxId)
+        referencedBoxIds.foreach { boxId =>
+          poolWithoutTx.pool.outputs.get(boxId).foreach { provider =>
+            if (provider.id != consumer.id && liveById.contains(provider.id)) {
+              consumersByProvider
+                .getOrElseUpdate(provider.id, mutable.LinkedHashSet.empty)
+                .add(consumer.id)
+            }
+          }
+        }
+      }
+
+      val reachable = mutable.LinkedHashSet.empty[ModifierId]
+      val frontier = mutable.Queue.empty[ModifierId]
+      directConflictIds.foreach { id =>
+        if (liveById.contains(id) && reachable.add(id)) frontier.enqueue(id)
+      }
+      while (frontier.nonEmpty && reachable.size <= liveTransactions.size) {
+        val providerId = frontier.dequeue()
+        consumersByProvider.get(providerId).foreach { consumers =>
+          consumers.foreach { consumerId =>
+            if (reachable.add(consumerId)) frontier.enqueue(consumerId)
+          }
+        }
+      }
+
+      val parentsByChild = mutable.LinkedHashMap.empty[ModifierId, mutable.LinkedHashSet[ModifierId]]
+      val remainingChildren = mutable.LinkedHashMap.empty[ModifierId, Int]
+      reachable.foreach { providerId =>
+        val children = consumersByProvider.get(providerId)
+          .map(_.iterator.filter(reachable.contains).toVector)
+          .getOrElse(Vector.empty)
+        remainingChildren.update(providerId, children.size)
+        children.foreach { childId =>
+          parentsByChild
+            .getOrElseUpdate(childId, mutable.LinkedHashSet.empty)
+            .add(providerId)
+        }
+      }
+
+      val ready = mutable.Queue.empty[ModifierId]
+      reachable.foreach { id =>
+        if (remainingChildren(id) == 0) ready.enqueue(id)
+      }
+      val removalOrder = mutable.ArrayBuffer.empty[ModifierId]
+      val ordered = mutable.HashSet.empty[ModifierId]
+      while (ready.nonEmpty) {
+        val removedId = ready.dequeue()
+        removalOrder += removedId
+        ordered += removedId
+        parentsByChild.get(removedId).foreach { parents =>
+          parents.foreach { parentId =>
+            val count = remainingChildren(parentId) - 1
+            remainingChildren.update(parentId, count)
+            if (count == 0) ready.enqueue(parentId)
+          }
+        }
+      }
+
+      // Cycles are not valid transaction dependencies, but keep traversal bounded if indexes diverge.
+      if (removalOrder.size < reachable.size) {
+        reachable.iterator.filterNot(ordered.contains).foreach(removalOrder += _)
+      }
+
+      // Descendant cleanup is not a confirmation; direct conflicts retain existing statistics behavior.
+      removalOrder.foldLeft(poolWithoutTx) { (mp, id) =>
+        liveById.get(id).map { victim =>
+          removeTx(mp, victim.transaction, updateStats = directConflictIds.contains(id))
+        }.getOrElse(mp)
+      }
     }
   }
 
@@ -156,11 +245,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
     */
   def removeWithDoubleSpends(txs: TraversableOnce[ErgoTransaction]): ErgoMemPool = {
     txs.foldLeft(this) { case (memPool, tx) =>
-      if (memPool.contains(tx.id)) { // tx could be removed earlier in this loop as double-spend of another tx
-        memPool.removeTxAndDoubleSpends(tx)
-      } else {
-        memPool
-      }
+      memPool.removeTxAndDoubleSpends(tx)
     }
   }
 
@@ -315,9 +400,8 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
                   log.info(s"Mempool rejecting transaction with reemission token: ${tx.id}")
                   val exc = new Exception(
                     "Mempool policy declines a transaction carrying the re-emission token in outputs")
-                  // The pool is rebuilt directly, rather than via `this.invalidate`, because that
-                  // helper runs `updateStatsOnRemoval`, which resets statistics for a transaction
-                  // that was never in the pool - which is exactly the case here.
+                  // The pool is rebuilt directly to preserve existing statistics and avoid
+                  // unrelated removal bookkeeping for a transaction that was never in the pool.
                   return (new ErgoMemPool(pool.invalidate(unconfirmedTx), stats, sortingOption),
                     new ProcessingOutcome.Declined(exc, validationStartTime))
                 }
