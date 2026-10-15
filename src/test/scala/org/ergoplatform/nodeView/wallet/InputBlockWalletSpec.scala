@@ -521,6 +521,128 @@ class InputBlockWalletSpec extends ErgoCorePropertyTest with WalletTestOps with 
     }
   }
 
+  property("holder fork switch removes an orphaned chained transaction after a selected conflict") {
+    withFixture { implicit w =>
+      implicit val patienceConfig: PatienceConfig = PatienceConfig(5.second, 100.millis)
+
+      val addresses = getPublicKeys
+      addresses.length should be >= 2
+      val address = addresses.head
+      val genesis = makeGenesisBlock(address.pubkey, Seq(newAssetIdStub -> 10L))
+      applyBlock(genesis) shouldBe 'success
+
+      val (initialBoxes, initialDigest) = eventually {
+        val boxes = await(wallet.walletBoxes(unspentOnly = true, considerUnconfirmed = true))
+        val digest = await(wallet.balancesWithUnconfirmed)
+        boxes should not be empty
+        digest.walletAssetBalances.map(_._2).sum shouldBe 10L
+        boxes -> digest
+      }
+      val initialBoxIds = initialBoxes.map(box => Algos.encode(box.trackedBox.box.id)).toSet
+      val genesisAsset = ErgoState.newBoxes(genesis.transactions)
+        .flatMap(_.additionalTokens.toArray)
+        .find(_._2 == 10L)
+        .get
+
+      val tx1 = eventually {
+        await(wallet.generateTransaction(Seq(PaymentRequest(
+          address,
+          MinBoxValue * 10,
+          Array(genesisAsset._1 -> 1L),
+          Map.empty
+        )))).get
+      }
+      val intermediate = tx1.outputs.find(
+        _.additionalTokens.toArray.contains(genesisAsset._1 -> 1L)
+      ).get
+      val tx2 = await(wallet.signTransaction(
+        new UnsignedErgoTransaction(
+          IndexedSeq(new UnsignedInput(intermediate.id)),
+          IndexedSeq.empty,
+          IndexedSeq(intermediate.toCandidate)
+        ),
+        Seq.empty,
+        TransactionHintsBag.empty,
+        Some(Seq(intermediate)),
+        None
+      )).get
+
+      val txB = eventually {
+        await(wallet.generateTransaction(Seq(PaymentRequest(
+          addresses(1),
+          MinBoxValue * 10,
+          Array(genesisAsset._1 -> 1L),
+          Map.empty
+        )))).get
+      }
+      val tx1InputIds = tx1.inputs.map(input => Algos.encode(input.boxId)).toSet
+      val txBInputIds = txB.inputs.map(input => Algos.encode(input.boxId)).toSet
+      val conflictingInputIds = tx1InputIds intersect txBInputIds
+      tx1.id should not be txB.id
+      conflictingInputIds should not be empty
+      tx1InputIds.subsetOf(initialBoxIds) shouldBe true
+      txBInputIds.subsetOf(initialBoxIds) shouldBe true
+      tx2.inputs.map(input => Algos.encode(input.boxId)) shouldBe
+        IndexedSeq(Algos.encode(intermediate.id))
+
+      val spentBoxes = initialBoxes.filter(box => txBInputIds.contains(
+        Algos.encode(box.trackedBox.box.id)
+      ))
+      spentBoxes.map(box => Algos.encode(box.trackedBox.box.id)).toSet shouldBe txBInputIds
+      val winnerOutputIds = addresses.flatMap(address => boxesAvailable(txB, address.pubkey))
+        .map(box => Algos.encode(box.id))
+        .toSet
+      winnerOutputIds should not be empty
+      val winnerOutputBoxes = txB.outputs.filter(box => winnerOutputIds.contains(Algos.encode(box.id)))
+      val expectedBoxIds = (initialBoxIds -- txBInputIds) ++ winnerOutputIds
+      val expectedDigest = initialDigest.copy(
+        walletBalance = initialDigest.walletBalance - spentBoxes.map(_.trackedBox.box.value).sum +
+          winnerOutputBoxes.map(_.value).sum
+      )
+      val abandonedOutputIds = (tx1.outputs ++ tx2.outputs).map(box => Algos.encode(box.id)).toSet
+
+      val forkTime = genesis.header.timestamp + 1L
+      val forkABlock = validFullBlock(Some(genesis), getUtxoState, Seq(tx1, tx2), Some(forkTime))
+      val forks = competingForks(forkABlock, forkTime)
+
+      // Direct holder injection uses synthetic headers/fields and bypasses synchronizer
+      // PoW, network transport and Merkle-proof validation.
+      val afterForkA = processInputBlock(forks.a, Seq(tx1, tx2))
+      afterForkA.history.bestInputBlocksChain() shouldBe Seq(forks.a.id)
+      eventually {
+        val ids = await(wallet.walletBoxes(unspentOnly = true, considerUnconfirmed = true))
+          .map(box => Algos.encode(box.trackedBox.box.id))
+          .toSet
+        ids should contain(Algos.encode(tx2.outputs.head.id))
+        ids should not contain Algos.encode(intermediate.id)
+      }
+
+      val afterBRoot = processInputBlock(forks.bRoot, Seq(txB))
+      afterBRoot.history.bestInputBlocksChain() shouldBe Seq(forks.a.id)
+      afterBRoot.history.getInputBlockTransactions(forks.bRoot.id).map(_.map(_.id)) shouldBe
+        Some(Seq(txB.id))
+
+      val afterSwitch = processInputBlock(forks.bChild, Seq.empty)
+      afterSwitch.history.bestInputBlocksChain() shouldBe Seq(forks.bChild.id, forks.bRoot.id)
+      afterSwitch.history.getInputBlockTransactions(forks.a.id).map(_.map(_.id)) shouldBe
+        Some(Seq(tx1.id, tx2.id))
+      afterSwitch.history.getInputBlockTransactions(forks.bRoot.id).map(_.map(_.id)) shouldBe
+        Some(Seq(txB.id))
+      afterSwitch.pool.getAll.map(_.id).toSet shouldBe empty
+
+      eventually {
+        val finalBoxIds = await(wallet.walletBoxes(unspentOnly = true, considerUnconfirmed = true))
+          .map(box => Algos.encode(box.trackedBox.box.id))
+          .toSet
+        val finalDigest = await(wallet.balancesWithUnconfirmed)
+        finalBoxIds shouldBe expectedBoxIds
+        finalBoxIds.intersect(winnerOutputIds) shouldBe winnerOutputIds
+        finalBoxIds.intersect(abandonedOutputIds) shouldBe empty
+        finalDigest shouldBe expectedDigest
+      }
+    }
+  }
+
   property("scanInputBlock updates wallet balances") {
     withFixture { implicit w =>
       val _ = w
