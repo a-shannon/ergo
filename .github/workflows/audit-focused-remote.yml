@@ -13,6 +13,7 @@ on:
         type: choice
         options:
           - matrix-pending
+          - matrix-forks
           - mempool-providers
 
 permissions:
@@ -26,7 +27,13 @@ jobs:
       - name: Validate source identity
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
-        run: '[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]'
+          SUITE: ${{ inputs.suite }}
+        run: |
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          case "$SUITE" in
+            matrix-pending|matrix-forks|mempool-providers) ;;
+            *) exit 1 ;;
+          esac
       - name: Checkout exact source
         uses: actions/checkout@v4
         with:
@@ -46,7 +53,7 @@ jobs:
             ~/.cache/coursier/v1
           key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
       - name: Build pinned Matrix SigmaState dependency
-        if: inputs.suite == 'matrix-pending'
+        if: inputs.suite == 'matrix-pending' || inputs.suite == 'matrix-forks'
         uses: ./.github/actions/bootstrap-sigmastate
         with:
           scala-version: 2.12.20
@@ -62,6 +69,11 @@ jobs:
             "testOnly org.ergoplatform.network.MatrixInputIdAdmissionSpec" \
             "testOnly org.ergoplatform.network.llm_generated.InputBlockPendingCacheSpec" \
             "testOnly org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification"
+      - name: Run Matrix fork completion and sibling regressions
+        if: inputs.suite == 'matrix-forks'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification"
       - name: Run mempool provider regressions
         if: inputs.suite == 'mempool-providers'
         run: |
