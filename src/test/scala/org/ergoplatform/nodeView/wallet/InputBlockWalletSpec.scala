@@ -333,18 +333,25 @@ class InputBlockWalletSpec extends ErgoCorePropertyTest with WalletTestOps with 
     withFixture { implicit w =>
       implicit val patienceConfig: PatienceConfig = PatienceConfig(5.second, 100.millis)
 
-      val address = getPublicKeys.head
+      val addresses = getPublicKeys
+      val address = addresses.head
       val genesis = makeGenesisBlock(address.pubkey, Seq(newAssetIdStub -> 10L))
       applyBlock(genesis) shouldBe 'success
 
-      val (balanceBefore, boxIdsBefore) = eventually {
+      val (balanceBefore, initialBoxes, rawBoxIdsBefore, spendableBoxIdsBefore) = eventually {
         val balance = await(wallet.balancesWithUnconfirmed)
         val boxes = await(wallet.walletBoxes(unspentOnly = false, considerUnconfirmed = true))
+        val spendableBoxes = await(wallet.walletBoxes(unspentOnly = true, considerUnconfirmed = false))
         balance.walletBalance should be > 0L
         balance.walletAssetBalances should not be empty
         balance.walletAssetBalances.map(_._2).sum shouldBe 10L
         boxes should not be empty
-        balance -> boxes.map(box => Algos.encode(box.trackedBox.box.id)).toSet
+        (
+          balance,
+          boxes,
+          boxes.map(box => Algos.encode(box.trackedBox.box.id)).toSet,
+          spendableBoxes.map(box => Algos.encode(box.trackedBox.box.id)).toSet
+        )
       }
 
       val genesisAsset = ErgoState.newBoxes(genesis.transactions)
@@ -379,6 +386,37 @@ class InputBlockWalletSpec extends ErgoCorePropertyTest with WalletTestOps with 
       )).get
       tx2.inputs.map(input => Algos.encode(input.boxId)) shouldBe IndexedSeq(Algos.encode(intermediate.id))
       tx2.outputs.head.additionalTokens shouldBe intermediate.additionalTokens
+
+      val tx1InputIds = tx1.inputs.map(input => Algos.encode(input.boxId)).toSet
+      val tx1InputBoxes = initialBoxes.filter(box =>
+        tx1InputIds.contains(Algos.encode(box.trackedBox.box.id))
+      )
+      tx1InputBoxes.map(box => Algos.encode(box.trackedBox.box.id)).toSet shouldBe tx1InputIds
+      val walletOutputs = addresses.flatMap(address =>
+        boxesAvailable(tx1, address.pubkey) ++ boxesAvailable(tx2, address.pubkey)
+      )
+      val liveOutputIds = walletOutputs.map(box => Algos.encode(box.id)).toSet -- Set(Algos.encode(intermediate.id))
+      liveOutputIds should not be empty
+      liveOutputIds should not contain Algos.encode(intermediate.id)
+      val expectedRawBoxIds = rawBoxIdsBefore ++ liveOutputIds
+      val expectedSpendableBoxIds = (spendableBoxIdsBefore -- tx1InputIds) ++ liveOutputIds
+
+      def assetAmounts(boxes: Seq[ErgoBox]): Map[ModifierId, Long] =
+        boxes.flatMap(_.additionalTokens.toArray)
+          .groupBy { case (tokenId, _) => ModifierId @@ Algos.encode(tokenId) }
+          .map { case (tokenId, entries) => tokenId -> entries.map(_._2).sum }
+
+      val spentInputAssets = assetAmounts(tx1InputBoxes.map(_.trackedBox.box))
+      val liveOutputBoxes = walletOutputs.filter(box => liveOutputIds.contains(Algos.encode(box.id)))
+      val liveOutputAssets = assetAmounts(liveOutputBoxes)
+      val expectedAssetBalances = (balanceBefore.walletAssetBalances.toMap.keySet ++
+        spentInputAssets.keySet ++ liveOutputAssets.keySet).flatMap { tokenId =>
+        val amount = balanceBefore.walletAssetBalances.toMap.getOrElse(tokenId, 0L) -
+          spentInputAssets.getOrElse(tokenId, 0L) + liveOutputAssets.getOrElse(tokenId, 0L)
+        if (amount != 0L) Some(tokenId -> amount) else None
+      }.toMap
+      val expectedWalletBalance = balanceBefore.walletBalance -
+        tx1InputBoxes.map(_.trackedBox.box.value).sum + liveOutputBoxes.map(_.value).sum
 
       val forkTime = genesis.header.timestamp + 1L
       val forkABlock = validFullBlock(Some(genesis), getUtxoState, Seq(tx1, tx2), Some(forkTime))
@@ -441,18 +479,21 @@ class InputBlockWalletSpec extends ErgoCorePropertyTest with WalletTestOps with 
         Some(Seq(tx1.id, tx2.id))
       afterSwitch.pool.getAll.map(_.id).toSet shouldBe Set(tx1.id, tx2.id)
 
-      val transientBoxIds = (tx1.outputs ++ tx2.outputs).map(box => Algos.encode(box.id)).toSet
       eventually {
-        val balanceAfter = await(wallet.balancesWithUnconfirmed)
-        // Compare registry endpoints independently of mempool input filtering:
-        // restored transactions make the spendable-box view exclude the confirmed input.
-        val boxIdsAfter = await(wallet.walletBoxes(unspentOnly = false, considerUnconfirmed = true))
+        val rawBoxIdsAfter = await(wallet.walletBoxes(unspentOnly = false, considerUnconfirmed = true))
           .map(box => Algos.encode(box.trackedBox.box.id))
           .toSet
-        boxIdsAfter shouldBe boxIdsBefore
-        boxIdsAfter.intersect(transientBoxIds) shouldBe empty
-        balanceAfter.walletBalance shouldBe balanceBefore.walletBalance
-        balanceAfter.walletAssetBalances.toMap shouldBe balanceBefore.walletAssetBalances.toMap
+        val spendableBoxIdsAfter = await(wallet.walletBoxes(unspentOnly = true, considerUnconfirmed = true))
+          .map(box => Algos.encode(box.trackedBox.box.id))
+          .toSet
+        val balanceAfter = await(wallet.balancesWithUnconfirmed)
+        rawBoxIdsAfter shouldBe expectedRawBoxIds
+        spendableBoxIdsAfter shouldBe expectedSpendableBoxIds
+        rawBoxIdsAfter should not contain Algos.encode(intermediate.id)
+        spendableBoxIdsAfter should not contain Algos.encode(intermediate.id)
+        rawBoxIdsAfter.intersect(liveOutputIds) shouldBe liveOutputIds
+        balanceAfter.walletBalance shouldBe expectedWalletBalance
+        balanceAfter.walletAssetBalances.toMap shouldBe expectedAssetBalances
       }
     }
   }
