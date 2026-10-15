@@ -216,7 +216,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
       // Descendant cleanup is not a confirmation; direct conflicts retain existing statistics behavior.
       removalOrder.foldLeft(poolWithoutTx) { (mp, id) =>
         liveById.get(id).map { victim =>
-          removeTx(mp, victim.transaction, updateStats = directConflictIds.contains(id))
+          removeTx(mp, victim.transaction, updateStats = true)
         }.getOrElse(mp)
       }
     }
