@@ -1,6 +1,6 @@
 package org.ergoplatform.nodeView.mempool
 
-import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
+import org.ergoplatform.{DataInput, ErgoBox, ErgoBoxCandidate, Input}
 import org.ergoplatform.modifiers.ErgoFullBlock
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
 import org.ergoplatform.nodeView.mempool.ErgoMemPoolUtils.ProcessingOutcome
@@ -37,6 +37,8 @@ class AppliedTransactionConflictsSpec extends AnyFlatSpec with ErgoTestHelpers w
                                       genesis: ErgoFullBlock,
                                       parent: ErgoTransaction,
                                       child: ErgoTransaction,
+                                      dataChild: ErgoTransaction,
+                                      grandchild: ErgoTransaction,
                                       replacement: ErgoTransaction,
                                       unrelated: ErgoTransaction)
 
@@ -58,23 +60,33 @@ class AppliedTransactionConflictsSpec extends AnyFlatSpec with ErgoTestHelpers w
       val funding = ErgoTransaction(
         IndexedSeq(new Input(initial.id, emptyProverResult)),
         IndexedSeq(
-          new ErgoBoxCandidate(40000000L, TrueTree, 0),
-          new ErgoBoxCandidate(59000000L, TrueTree, 0),
+          new ErgoBoxCandidate(30000000L, TrueTree, 0),
+          new ErgoBoxCandidate(30000000L, TrueTree, 0),
+          new ErgoBoxCandidate(39000000L, TrueTree, 0),
           new ErgoBoxCandidate(1000000L, feeProp, 0)
         )
       )
       val genesis = validFullBlock(None, utxoState, Seq(funding))
       val state = WrappedUtxoState(utxoState, boxHolder, settings)
         .applyModifier(genesis)(_ => ()).get
-      // A real funding block provides deterministic roots for both independent branches.
-      val roots = funding.outputs.take(2)
-      roots.size shouldBe 2
+      // A real funding block provides deterministic roots for independent branches and a data provider.
+      val roots = funding.outputs.take(3)
+      roots.size shouldBe 3
       roots.foreach(box => state.boxById(box.id).isDefined shouldBe true)
       val parent = spend(roots.head, 1000000L)
       val child = spend(parent.outputs.head, 1000000L)
+      val dataChild = ErgoTransaction(
+        IndexedSeq(new Input(roots(1).id, emptyProverResult)),
+        IndexedSeq(DataInput(ADKey @@ parent.outputs.head.id.clone())),
+        IndexedSeq(
+          new ErgoBoxCandidate(roots(1).value - 1000000L, TrueTree, 0, roots(1).additionalTokens),
+          new ErgoBoxCandidate(1000000L, feeProp, 0)
+        )
+      )
+      val grandchild = spend(dataChild.outputs.head, 1000000L)
       val replacement = spend(roots.head, 2000000L)
-      val unrelated = spend(roots(1), 1000000L)
-      test(UtxoChainFixture(state, genesis, parent, child, replacement, unrelated))
+      val unrelated = spend(roots(2), 1000000L)
+      test(UtxoChainFixture(state, genesis, parent, child, dataChild, grandchild, replacement, unrelated))
     } finally utxoState.closeStorage()
   }
 
@@ -236,6 +248,37 @@ class AppliedTransactionConflictsSpec extends AnyFlatSpec with ErgoTestHelpers w
       val postParentState = f.state.applyModifier(parentBlock)(_ => ()).get
       putAccepted(ErgoMemPool.empty(settings), f.child, postParentState)
         .contains(f.child.id) shouldBe true
+    }
+  }
+
+  it should "remove data-input descendants of a conflicting producer but retain them when it is confirmed" in {
+    withUtxoChain { f =>
+      f.dataChild.inputs.head.boxId.sameElements(f.parent.inputs.head.boxId) shouldBe false
+      f.dataChild.dataInputs.map(input => Algos.encode(input.boxId)).toSeq shouldBe
+        Seq(Algos.encode(f.parent.outputs.head.id))
+      f.grandchild.inputs.head.boxId.sameElements(f.dataChild.outputs.head.id) shouldBe true
+
+      val transactions = Seq(f.parent, f.dataChild, f.grandchild, f.unrelated)
+      val before = transactions.foldLeft(ErgoMemPool.empty(settings)) { case (pool, tx) =>
+        putAccepted(pool, tx, f.state)
+      }
+      assertExactPool(before, transactions)
+      before.pool.inputs.contains(f.parent.outputs.head.id) shouldBe false
+
+      val afterConflict = before.removeWithDoubleSpends(Seq(f.replacement))
+      assertExactPool(afterConflict, Seq(f.unrelated))
+
+      val afterConfirmation = before.removeWithDoubleSpends(Seq(f.parent))
+      assertExactPool(afterConfirmation, Seq(f.dataChild, f.grandchild, f.unrelated))
+      val parentBlock = validFullBlock(
+        Some(f.genesis),
+        f.state,
+        Seq(f.parent),
+        Some(f.genesis.header.timestamp + 1L)
+      )
+      val postParentState = f.state.applyModifier(parentBlock)(_ => ()).get
+      val withDataChild = putAccepted(ErgoMemPool.empty(settings), f.dataChild, postParentState)
+      putAccepted(withDataChild, f.grandchild, postParentState).contains(f.grandchild.id) shouldBe true
     }
   }
 }
