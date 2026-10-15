@@ -20,6 +20,8 @@ on:
           - digest-proof-rebuild
           - mempool-providers
           - mempool-conflicts
+          - nipopow-producer
+          - nipopow-validation
 
 permissions:
   contents: read
@@ -36,7 +38,7 @@ jobs:
         run: |
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
-            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts) ;;
+            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -118,11 +120,30 @@ jobs:
             "testOnly org.ergoplatform.nodeView.mempool.AppliedTransactionConflictsSpec" \
             "testOnly org.ergoplatform.nodeView.mempool.ErgoMemPoolSpec" \
             "testOnly org.ergoplatform.nodeView.mempool.OrderedTxPoolSpec"
+      # NiPoPoW runs use the real history producer, HTTP route and P2P cache consumer.
+      - name: Run NiPoPoW producer and HTTP route regressions
+        if: inputs.suite == 'nipopow-producer'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            "testOnly org.ergoplatform.http.routes.NipopowApiRoutesSpec"
+      - name: Run NiPoPoW proof and consumer closure
+        if: inputs.suite == 'nipopow-validation'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec" \
+            "testOnly *PoPowAlgosSpec *NipopowVerifierSpec *SerializationTests *PopowProcessorSpecification *NipopowApiRoutesSpec" \
+            "testOnly *ErgoSanityUTXO *ErgoSanityDigest -- -z GetNipopowProof" \
+            ++2.13.18 \
+            "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec"
       - name: Retain test reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: focused-${{ inputs.suite }}-${{ inputs.source_commit }}
-          path: target/test-reports/
+          path: |
+            target/test-reports/
+            ergo-core/target/test-reports/
           if-no-files-found: warn
           retention-days: 7
