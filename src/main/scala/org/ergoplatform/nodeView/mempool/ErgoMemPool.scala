@@ -148,8 +148,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
       // A conflicting loser invalidates consumers of its outputs, including data-input consumers.
       // Snapshot the live graph before removing leaves first, so ancestor weights remain consistent.
       liveTransactions.foreach { consumer =>
-        val referencedBoxIds = consumer.transaction.inputs.iterator.map(_.boxId) ++
-          consumer.transaction.dataInputs.iterator.map(_.boxId)
+        val referencedBoxIds = consumer.transaction.inputs.iterator.map(_.boxId)
         referencedBoxIds.foreach { boxId =>
           poolWithoutTx.pool.outputs.get(boxId).foreach { provider =>
             if (provider.id != consumer.id && liveById.contains(provider.id)) {
