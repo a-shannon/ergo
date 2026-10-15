@@ -119,6 +119,99 @@ class InputBlockWalletSpec extends ErgoCorePropertyTest with WalletTestOps with 
     }
   }
 
+  property("first selected input block replaces an ordinary wallet spend of the same confirmed inputs") {
+    withFixture { implicit w =>
+      implicit val patienceConfig: PatienceConfig = PatienceConfig(5.second, 100.millis)
+
+      val addresses = getPublicKeys
+      addresses.length should be >= 2
+      val genesis = makeGenesisBlock(addresses.head.pubkey, Seq.empty)
+      applyBlock(genesis) shouldBe 'success
+
+      val (initialBoxes, initialDigest) = eventually {
+        val boxes = await(wallet.walletBoxes(unspentOnly = true, considerUnconfirmed = false))
+        boxes should not be empty
+        val digest = await(wallet.balancesWithUnconfirmed)
+        boxes -> digest
+      }
+      val initialBoxIds = initialBoxes.map(box => Algos.encode(box.trackedBox.box.id)).toSet
+      val txU = eventually {
+        await(wallet.generateTransaction(Seq(PaymentRequest(
+          addresses(1), MinBoxValue * 10, Array.empty, Map.empty
+        )))).get
+      }
+      val txT = eventually {
+        await(wallet.generateTransaction(Seq(PaymentRequest(
+          addresses.head, MinBoxValue * 11, Array.empty, Map.empty
+        )))).get
+      }
+      txU.id should not be txT.id
+      val txUInputIds = txU.inputs.map(input => Algos.encode(input.boxId)).toSet
+      val txTInputIds = txT.inputs.map(input => Algos.encode(input.boxId)).toSet
+      val sharedInputIds = txUInputIds intersect txTInputIds
+      sharedInputIds should not be empty
+      txUInputIds.subsetOf(initialBoxIds) shouldBe true
+      txTInputIds.subsetOf(initialBoxIds) shouldBe true
+
+      val spentUBoxes = initialBoxes.filter(box => txUInputIds.contains(
+        Algos.encode(box.trackedBox.box.id)
+      ))
+      val spentTBoxes = initialBoxes.filter(box => txTInputIds.contains(
+        Algos.encode(box.trackedBox.box.id)
+      ))
+      spentUBoxes.map(box => Algos.encode(box.trackedBox.box.id)).toSet shouldBe txUInputIds
+      spentTBoxes.map(box => Algos.encode(box.trackedBox.box.id)).toSet shouldBe txTInputIds
+      val txUWalletOutputs = addresses.flatMap(address => boxesAvailable(txU, address.pubkey))
+      val txTWalletOutputs = addresses.flatMap(address => boxesAvailable(txT, address.pubkey))
+      val txUWalletOutputIds = txUWalletOutputs.map(box => Algos.encode(box.id)).toSet
+      val txTWalletOutputIds = txTWalletOutputs.map(box => Algos.encode(box.id)).toSet
+      txUWalletOutputIds should not be empty
+      txTWalletOutputIds should not be empty
+      val expectedUBoxIds = (initialBoxIds -- txUInputIds) ++ txUWalletOutputIds
+      val expectedTDigest = initialDigest.copy(
+        walletBalance = initialDigest.walletBalance - spentTBoxes.map(_.trackedBox.box.value).sum +
+          txTWalletOutputs.map(_.value).sum
+      )
+      val expectedUDigest = initialDigest.copy(
+        walletBalance = initialDigest.walletBalance - spentUBoxes.map(_.trackedBox.box.value).sum +
+          txUWalletOutputs.map(_.value).sum
+      )
+
+      send(LocallyGeneratedTransaction(UnconfirmedTransaction(txU, None)))
+      expectMsgType[Accepted].tx.transaction.id shouldBe txU.id
+      send(GetDataFromCurrentView[ErgoState[_], CurView](view => view))
+      val afterU = expectMsgType[CurView]
+      afterU.pool.getAll.map(_.id).toSet shouldBe Set(txU.id)
+      eventually {
+        val pendingBoxIds = await(wallet.walletBoxes(unspentOnly = true, considerUnconfirmed = true))
+          .map(box => Algos.encode(box.trackedBox.box.id))
+          .toSet
+        pendingBoxIds shouldBe expectedUBoxIds
+        await(wallet.balancesWithUnconfirmed) shouldBe expectedUDigest
+      }
+
+      val selectedBlock = validFullBlock(
+        Some(genesis), getUtxoState, Seq(txT), Some(genesis.header.timestamp + 1L)
+      )
+      val selected = InputBlockAnnouncement(1, selectedBlock.header, InputBlockFields.empty, None)
+      val afterT = processInputBlock(selected, Seq(txT))
+      afterT.history.bestInputBlocksChain() shouldBe Seq(selected.id)
+      afterT.history.getInputBlockTransactions(selected.id).map(_.map(_.id)) shouldBe Some(Seq(txT.id))
+      afterT.pool.getAll.map(_.id).toSet shouldBe empty
+
+      eventually {
+        val finalBoxIds = await(wallet.walletBoxes(unspentOnly = true, considerUnconfirmed = true))
+          .map(box => Algos.encode(box.trackedBox.box.id))
+          .toSet
+        val finalDigest = await(wallet.balancesWithUnconfirmed)
+        finalBoxIds shouldBe ((initialBoxIds -- txTInputIds) ++ txTWalletOutputIds)
+        finalBoxIds.intersect(txUWalletOutputIds) shouldBe empty
+        finalBoxIds.intersect(txTWalletOutputIds) shouldBe txTWalletOutputIds
+        finalDigest shouldBe expectedTDigest
+      }
+    }
+  }
+
   property("boxes created in input blocks can be spent in subsequent blocks") {
     withFixture { implicit w =>
       val _ = w
