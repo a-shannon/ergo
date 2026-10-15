@@ -228,6 +228,8 @@ class AppliedTransactionConflictsSpec extends AnyFlatSpec with ErgoTestHelpers w
       val after = before.removeWithDoubleSpends(Seq(f.replacement))
 
       assertExactPool(after, Seq(f.unrelated))
+      // Existing direct-conflict statistics are separate; orphan eviction is not a confirmation.
+      after.stats.takenTxns shouldBe before.stats.takenTxns + 1L
     }
   }
 
@@ -267,6 +269,7 @@ class AppliedTransactionConflictsSpec extends AnyFlatSpec with ErgoTestHelpers w
 
       val afterConflict = before.removeWithDoubleSpends(Seq(f.replacement))
       assertExactPool(afterConflict, Seq(f.unrelated))
+      afterConflict.stats.takenTxns shouldBe before.stats.takenTxns + 1L
 
       val afterConfirmation = before.removeWithDoubleSpends(Seq(f.parent))
       assertExactPool(afterConfirmation, Seq(f.dataChild, f.grandchild, f.unrelated))
