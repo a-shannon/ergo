@@ -29,9 +29,9 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git merge-base --is-ancestor f05ed1a95833d66f46a582aff8000234c831a240 HEAD
-          test "$(git rev-parse HEAD:src)" = "080e9eea9358d8a70d0fc9d3ed0f79f5a41c686c"
-          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/history/modifierprocessors/InputBlocksProcessor.scala)" = "97cbe4e009e982ccaad0c7ddd60916be6e7755a4"
-          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/modifierprocessors/InputBlockProcessorSpecification.scala)" = "fdbde6c82628d4b688403b01e25bc5b986ce9829"
+          test "$(git rev-parse HEAD:src)" = "79f15c11570946b42fca8723dae7c00b08cb43bb"
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/history/modifierprocessors/InputBlocksProcessor.scala)" = "2c1fe84b6eba3fcf56740a025ace6cbe38976fe4"
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/modifierprocessors/InputBlockProcessorSpecification.scala)" = "958efc721c14235b64c363dc99377985dd591144"
           git show --no-patch --format=fuller HEAD
 
       - name: Cache sbt

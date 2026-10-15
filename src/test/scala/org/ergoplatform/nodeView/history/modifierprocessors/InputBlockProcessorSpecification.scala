@@ -624,13 +624,13 @@ class InputBlockProcessorSpecification extends ErgoCorePropertyTest with ErgoCom
       h.inputBlocksTree().get.forks(1).processedBlocks shouldBe rootProcessed
       h.inputBlocksTree().get.forks(1).processedIndex shouldBe 0
       h.bestInputBlocksChain() shouldBe Seq(oldTip.id, oldChild.id, root.id)
-      h.applyInputBlockTransactions(parent.id, Seq.empty, us) shouldBe
-        (Seq.empty -> Seq.empty)
-
-      val (forward, rollback) = h.applyInputBlockTransactions(tip.id, Seq.empty, us)
+      // With #2502 composed, the delayed parent closes the entire cached prefix.
+      val (forward, rollback) = h.applyInputBlockTransactions(parent.id, Seq.empty, us)
       forward shouldBe Seq(parent.id, child.id, tip.id)
       rollback shouldBe Seq(oldChild.id, oldTip.id)
       rollback should not contain root.id
+      h.applyInputBlockTransactions(tip.id, Seq.empty, us) shouldBe
+        (Seq.empty -> Seq.empty)
       h.bestInputBlocksChain() shouldBe recoveredChain.reverse
       val selected = h.inputBlocksTree().get.forks.find(_.chain == recoveredChain).get
       selected.chain.head shouldBe root.id
