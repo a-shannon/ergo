@@ -98,6 +98,7 @@ jobs:
         if: inputs.suite == 'digest-proof-rebuild'
         run: |
           sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
             "testOnly org.ergoplatform.nodeView.history.extra.ExtraIndexerTemplateKeySpec"
       - name: Run applied transaction conflict closure
         if: inputs.suite == 'mempool-conflicts'
