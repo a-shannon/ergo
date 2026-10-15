@@ -15,6 +15,7 @@ on:
           - matrix-pending
           - matrix-forks
           - mempool-providers
+          - mempool-conflicts
 
 permissions:
   contents: read
@@ -31,7 +32,7 @@ jobs:
         run: |
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
-            matrix-pending|matrix-forks|mempool-providers) ;;
+            matrix-pending|matrix-forks|mempool-providers|mempool-conflicts) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -79,6 +80,13 @@ jobs:
         run: |
           sbt -batch -Denv=test ++2.12.20 \
             "testOnly org.ergoplatform.nodeView.mempool.ErgoMemPoolInputProvidersSpec"
+      - name: Run applied transaction conflict closure
+        if: inputs.suite == 'mempool-conflicts'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.mempool.AppliedTransactionConflictsSpec" \
+            "testOnly org.ergoplatform.nodeView.mempool.ErgoMemPoolSpec" \
+            "testOnly org.ergoplatform.nodeView.mempool.OrderedTxPoolSpec"
       - name: Retain test reports
         if: always()
         uses: actions/upload-artifact@v4
