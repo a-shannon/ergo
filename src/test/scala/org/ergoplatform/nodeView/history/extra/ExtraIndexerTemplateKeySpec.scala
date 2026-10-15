@@ -1,15 +1,24 @@
 package org.ergoplatform.nodeView.history.extra
 
-import akka.actor.{ActorRef, Props}
+import akka.actor.{ActorRef, ActorSystem, Props}
+import akka.http.scaladsl.Http
+import akka.http.scaladsl.Http.ServerBinding
+import akka.http.scaladsl.model.{HttpRequest, StatusCodes}
+import akka.http.scaladsl.server.Route
+import akka.stream.SystemMaterializer
 import akka.testkit.TestProbe
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
 import org.ergoplatform.core.idToVersion
+import org.ergoplatform.http.api.BlockchainApiRoute
 import org.ergoplatform.modifiers.ErgoFullBlock
+import org.ergoplatform.modifiers.history.ADProofs
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
+import org.ergoplatform.nodeView.ErgoReadersHolder.{GetReaders, Readers}
+import org.ergoplatform.nodeView.ErgoReadersHolderRef
 import org.ergoplatform.nodeView.history.ErgoHistory
 import org.ergoplatform.nodeView.history.extra.IndexedContractTemplateSerializer.hashTreeTemplate
 import org.ergoplatform.nodeView.history.extra.IndexedErgoAddressSerializer.hashErgoTree
-import org.ergoplatform.nodeView.state.{StateType, UtxoStateReader}
+import org.ergoplatform.nodeView.state.{DigestState, ErgoState, StateType, UtxoStateReader}
 import org.ergoplatform.nodeView.state.wrapped.WrappedUtxoState
 import org.ergoplatform.settings.{Algos, CheckpointSettings, Constants, ErgoSettings}
 import org.ergoplatform.utils.fixtures.NodeViewFixture
@@ -46,6 +55,11 @@ class ExtraIndexerTemplateKeySpec extends ErgoCorePropertyTest with NodeViewTest
   private val indexedSettings: ErgoSettings = {
     val base = NodeViewTestConfig(StateType.Utxo, verifyTransactions = true, popowBootstrap = false).toSettings
     base.copy(nodeSettings = base.nodeSettings.copy(extraIndex = true))
+  }
+
+  private val digestIndexedSettings: ErgoSettings = {
+    val base = NodeViewTestConfig(StateType.Digest, verifyTransactions = true, popowBootstrap = false).toSettings
+    base.copy(nodeSettings = base.nodeSettings.copy(extraIndex = true, storageRentCollection = false))
   }
 
   /**
@@ -111,7 +125,8 @@ class ExtraIndexerTemplateKeySpec extends ErgoCorePropertyTest with NodeViewTest
     (1 to 3).foreach(_ => extendWith(validTransactionsFromBoxHolder(tipState.versionedBoxHolder, new RandomWrapper)._1))
 
     private def newIndexer(): ActorRef = actorSystem.actorOf(Props(
-      new ExtraIndexer(settings.cacheSettings, settings.chainSettings.addressEncoder, Some(nodeViewHolderRef), true)))
+      new ExtraIndexer(settings.cacheSettings, settings.chainSettings.addressEncoder, Some(nodeViewHolderRef),
+        settings.nodeSettings.storageRentCollection)))
 
     private var indexer: Option[ActorRef] = Some(newIndexer())
     awaitIndexed(chain.last)
@@ -119,6 +134,16 @@ class ExtraIndexerTemplateKeySpec extends ErgoCorePropertyTest with NodeViewTest
     def history: ErgoHistory = getHistory
 
     def state: UtxoStateReader = getCurrentState.asInstanceOf[UtxoStateReader]
+
+    def stateReader: ErgoState[_] = getCurrentState
+
+    def holderRef: ActorRef = nodeViewHolderRef
+
+    def indexerRef: ActorRef = indexer.get
+
+    def nodeSettings: ErgoSettings = settings
+
+    def system: ActorSystem = actorSystem
 
     def stopIndexer(): Unit = indexer.foreach { ref =>
       val watcher = TestProbe()
@@ -396,6 +421,125 @@ class ExtraIndexerTemplateKeySpec extends ErgoCorePropertyTest with NodeViewTest
       node.addressRecord.get.retrieveBoxes(node.history, 0, 10).map(_.id).toList shouldBe List(bytesToId(first.id))
       node.templateRecord.get.retrieveBoxes(node.history, 0, 10).map(_.id).toList shouldBe List(bytesToId(first.id))
       node.history.typedExtraIndexById[IndexedContractTemplate](addressKey) shouldBe None
+    }
+  }
+
+  property("Digest schema 7 collision rebuild retains generated proofs and serves rebuilt rows over loopback") {
+    withNode(digestIndexedSettings) { node =>
+      val (first, _) = node.firstPayment()
+      val tip = node.chain.last
+      val firstNumber = node.boxRecord(first).get.globalIndex
+      val retainedProofs = node.chain.map { block =>
+        val proofId = block.header.ADProofsId
+        val proofBytes = node.history.modifierBytesById(proofId).get
+        proofBytes should not be empty
+        node.history.typedModifierById[ADProofs](proofId).map(_.headerId) shouldBe Some(block.id)
+        proofId -> proofBytes.clone()
+      }.toMap
+
+      node.stateReader shouldBe a[DigestState]
+      node.stateReader.fullBlockBodyFrontier shouldBe Some(tip.id)
+      node.addressRecord.map(_.boxes.toList) shouldBe Some(List(firstNumber))
+      node.templateRecord.map(_.boxes.toList) shouldBe Some(List(firstNumber))
+      node.stopIndexer()
+
+      // Only the legacy extra-index marker and collision row are synthetic. The short chain,
+      // serialized proofs and certified Digest frontier above were produced by the real holder.
+      node.history.historyStorage.insertExtraTry(
+        Array(ExtraIndexer.SchemaVersionKey -> ByteBuffer.allocate(4).putInt(7).array),
+        Array[ExtraIndex](IndexedContractTemplate(addressKey, ArrayBuffer(firstNumber))),
+        Array(templateKey)).get
+      node.addressRecord shouldBe None
+      node.templateRecord shouldBe None
+      node.history.typedExtraIndexById[IndexedContractTemplate](addressKey).map(_.boxes.toList) shouldBe
+        Some(List(firstNumber))
+
+      node.reopenNodeHolder()
+      ExtraIndexer.getIndex(ExtraIndexer.SchemaVersionKey, node.history).getInt shouldBe
+        ExtraIndexer.NewestVersion
+      ExtraIndexer.digestIndexHasProvenance(node.history) shouldBe true
+      IndexerState.fromHistory(node.history).indexedHeight shouldBe 0
+      node.history.bestFullBlockIdOpt shouldBe Some(tip.id)
+      node.stateReader shouldBe a[DigestState]
+      node.stateReader.fullBlockBodyFrontier shouldBe Some(tip.id)
+      retainedProofs.foreach { case (proofId, proofBytes) =>
+        node.history.modifierBytesById(proofId).get.toSeq shouldBe proofBytes.toSeq
+      }
+      node.addressRecord shouldBe None
+      node.templateRecord shouldBe None
+      node.history.typedExtraIndexById[IndexedContractTemplate](addressKey) shouldBe None
+
+      node.restartIndexer()
+      node.awaitIndexed(tip)
+      val rebuiltNumber = node.boxRecord(first).get.globalIndex
+      node.addressRecord.map(_.boxes.toList) shouldBe Some(List(rebuiltNumber))
+      node.templateRecord.map(_.boxes.toList) shouldBe Some(List(rebuiltNumber))
+      node.addressRecord.get.retrieveBoxes(node.history, 0, 10).map(_.id).toList shouldBe
+        List(bytesToId(first.id))
+      node.templateRecord.get.retrieveBoxes(node.history, 0, 10).map(_.id).toList shouldBe
+        List(bytesToId(first.id))
+
+      node.stopIndexer()
+      node.reopenNodeHolder()
+      val reopenedCheckpoint = IndexerState.fromHistory(node.history)
+      reopenedCheckpoint.indexedHeaderId shouldBe Some(tip.id)
+      reopenedCheckpoint.indexedHeight shouldBe tip.header.height
+      reopenedCheckpoint.rollbackTo shouldBe 0
+      ExtraIndexer.digestIndexHasProvenance(node.history) shouldBe true
+      node.history.bestFullBlockIdOpt shouldBe Some(tip.id)
+      node.stateReader shouldBe a[DigestState]
+      node.stateReader.fullBlockBodyFrontier shouldBe Some(tip.id)
+      retainedProofs.foreach { case (proofId, proofBytes) =>
+        node.history.modifierBytesById(proofId).get.toSeq shouldBe proofBytes.toSeq
+      }
+      node.boxRecord(first).map(_.globalIndex) shouldBe Some(rebuiltNumber)
+      node.addressRecord.map(_.boxes.toList) shouldBe Some(List(rebuiltNumber))
+      node.templateRecord.map(_.boxes.toList) shouldBe Some(List(rebuiltNumber))
+      node.restartIndexer()
+      node.awaitIndexed(tip)
+
+      implicit val actorSystem: ActorSystem = node.system
+      implicit val materializer = SystemMaterializer(actorSystem).materializer
+      val probe = TestProbe()(actorSystem)
+      val readersHolder = ErgoReadersHolderRef(node.holderRef)(actorSystem)
+      probe.watch(readersHolder)
+      var bindingOpt = Option.empty[ServerBinding]
+      try {
+        probe.send(readersHolder, GetReaders)
+        val readers = probe.expectMsgType[Readers](settleTimeout)
+        readers.h shouldBe node.history.getReader
+        readers.s shouldBe a[DigestState]
+
+        val route = Route.seal(
+          BlockchainApiRoute(readersHolder, node.nodeSettings, Some(node.indexerRef))(actorSystem).route)
+        val binding = await(Http().newServerAt("127.0.0.1", 0).bind(route))
+        bindingOpt = Some(binding)
+        binding.localAddress.getAddress.isLoopbackAddress shouldBe true
+
+        val byIndex = await(Http().singleRequest(HttpRequest(
+          uri = s"http://127.0.0.1:${binding.localAddress.getPort}/blockchain/box/byIndex/$rebuiltNumber")))
+        byIndex.status shouldBe StatusCodes.OK
+        val byIndexBody = await(byIndex.entity.toStrict(5.seconds)).data.utf8String
+        io.circe.parser.parse(byIndexBody).flatMap(_.hcursor.get[String]("boxId")) shouldBe
+          Right(bytesToId(first.id))
+
+        val byTemplate = await(Http().singleRequest(HttpRequest(
+          uri = s"http://127.0.0.1:${binding.localAddress.getPort}/blockchain/box/byTemplateHash/$templateKey" +
+            "?offset=0&limit=10")))
+        byTemplate.status shouldBe StatusCodes.OK
+        val byTemplateBody = await(byTemplate.entity.toStrict(5.seconds)).data.utf8String
+        val byTemplateJson = io.circe.parser.parse(byTemplateBody).toOption.get
+        val returnedIds = byTemplateJson.hcursor.downField("items").values.get
+          .map(_.hcursor.get[String]("boxId").toOption.get).toSeq
+        returnedIds shouldBe Seq(bytesToId(first.id))
+        byTemplateJson.hcursor.get[Long]("total") shouldBe Right(1L)
+      } finally {
+        try bindingOpt.foreach(binding => await(binding.unbind()))
+        finally {
+          actorSystem.stop(readersHolder)
+          probe.expectTerminated(readersHolder, settleTimeout)
+        }
+      }
     }
   }
 
