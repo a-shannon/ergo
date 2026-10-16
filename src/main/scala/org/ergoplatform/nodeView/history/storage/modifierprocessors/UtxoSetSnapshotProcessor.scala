@@ -68,7 +68,7 @@ trait UtxoSetSnapshotProcessor extends MinimalFullBlockHeightFunctions with Scor
       _cachedDownloadPlan.map(_.latestUpdateTime).getOrElse(0L) - _cachedDownloadPlan.map(_.createdTime).getOrElse(0L)
     }
     log.info(s"UTXO set downloading and application time: ${utxoPhaseTime / 1000.0} s.")
-    // Keep the downloaded chunks and plan until the applied marker is durable.
+    // Keep the downloaded chunks and plan until the applied marker write succeeds.
     // Reconstruction has already changed the state store at this point.
     writeMinimalFullBlockHeight(height + 1)
     // remove downloaded utxo set snapshots chunks
