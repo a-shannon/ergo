@@ -1,0 +1,41 @@
+name: Snapshot marker failure falsifier
+
+on:
+  push:
+    branches:
+      - feat/snapshot-marker-2546-diagnostic-20261017
+
+permissions:
+  contents: read
+
+jobs:
+  marker-failure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out exact pushed commit
+        uses: actions/checkout@v4
+      - name: Set up Java and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Cache sbt dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Exercise failed snapshot marker write and Holder fail-stop
+        run: sbt -batch -Denv=test ++2.12.20 "testOnly org.ergoplatform.nodeView.history.SnapshotAppliedMarkerFailureSpec org.ergoplatform.nodeView.viewholder.DigestSnapshotBootstrapSpecification"
+      - name: Retain JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-marker-falsifier-${{ github.sha }}
+          path: target/test-reports/
+          if-no-files-found: warn
+          retention-days: 7
