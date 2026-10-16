@@ -1,0 +1,39 @@
+name: Histogram query bounds diagnostic
+
+on:
+  push:
+    branches:
+      - feat/histogram-query-bounds-20261017
+
+permissions:
+  contents: read
+
+jobs:
+  focused_histogram_route:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout tested branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run focused route regression
+        run: sbt -Denv=test ++2.12.20 "testOnly org.ergoplatform.http.routes.TransactionApiRouteSpec -- -z histogram"

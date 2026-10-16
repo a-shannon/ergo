@@ -158,6 +158,26 @@ class TransactionApiRouteSpec extends AnyFlatSpec
     }
   }
 
+  it should "reject invalid histogram bin counts before building a response" in {
+    val sealedRoute = Route.seal(route)
+    // Keep the pre-fix response bounded while establishing a 1000-bin limit.
+    val firstDisallowedBinCount = 1001
+
+    val zeroBinsStatus = Get(prefix + "/poolHistogram?bins=0") ~> sealedRoute ~> check {
+      status
+    }
+    val excessBinsStatus = Get(prefix + s"/poolHistogram?bins=$firstDisallowedBinCount") ~> sealedRoute ~> check {
+      status
+    }
+    val oneBinResponse = Get(prefix + "/poolHistogram?bins=1") ~> sealedRoute ~> check {
+      (status, responseAs[Json].asArray.map(_.length))
+    }
+
+    zeroBinsStatus.intValue() / 100 shouldBe 4
+    excessBinsStatus.intValue() / 100 shouldBe 4
+    oneBinResponse shouldBe ((StatusCodes.OK, Some(2)))
+  }
+
   it should "return unconfirmed tx by output ergoTree from mempool" in {
     val searchedBox = txs.head.outputs.head.ergoTree.bytesHex
     Post(prefix + s"/unconfirmed/byErgoTree", searchedBox) ~> route ~> check {
