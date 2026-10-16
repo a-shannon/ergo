@@ -318,7 +318,12 @@ class DigestSnapshotBootstrapSpecification extends ErgoCorePropertyTest with Nod
           val reconstructedStore = new LDBVersionedStore(new File(nodeSettings.directory, "state"),
             initialKeepVersions = nodeSettings.nodeSettings.keepVersions)
           try {
-            reconstructedStore.lastVersionID.map(Algos.encode(_)) shouldBe Some(Algos.encode(snapshotHeader.stateRoot))
+            // Digest.fromSnapshot moves the store version from the AVL root to the block ID
+            // before completion writes the applied marker.
+            val expectedVersion = if (markerWriteFailure && mode == StateType.Digest)
+              Algos.encode(versionToBytes(idToVersion(snapshotHeader.id)))
+            else Algos.encode(snapshotHeader.stateRoot)
+            reconstructedStore.lastVersionID.map(Algos.encode(_)) shouldBe Some(expectedVersion)
           } finally reconstructedStore.close()
           val reopenedHistory = ErgoHistory.readOrGenerate(nodeSettings)(null)
           try {
