@@ -158,24 +158,31 @@ class TransactionApiRouteSpec extends AnyFlatSpec
     }
   }
 
-  it should "reject invalid histogram bin counts before building a response" in {
+  it should "reject invalid histogram parameters before building a response" in {
     val sealedRoute = Route.seal(route)
-    // Keep the pre-fix response bounded while establishing a 1000-bin limit.
-    val firstDisallowedBinCount = 1001
+    // The largest rejected bin count allocates only 1002 bins on the pre-fix route.
+    val invalidQueries = Seq(
+      "bins=0",
+      "bins=1001",
+      "bins=1&maxtime=0",
+      "bins=1&maxtime=-1",
+      "bins=2&maxtime=1"
+    )
 
-    val zeroBinsStatus = Get(prefix + "/poolHistogram?bins=0") ~> sealedRoute ~> check {
-      status
-    }
-    val excessBinsStatus = Get(prefix + s"/poolHistogram?bins=$firstDisallowedBinCount") ~> sealedRoute ~> check {
-      status
-    }
-    val oneBinResponse = Get(prefix + "/poolHistogram?bins=1") ~> sealedRoute ~> check {
-      (status, responseAs[Json].asArray.map(_.length))
+    invalidQueries.foreach { query =>
+      Get(prefix + s"/poolHistogram?$query") ~> sealedRoute ~> check {
+        withClue(query) {
+          status.intValue() / 100 shouldBe 4
+        }
+      }
     }
 
-    zeroBinsStatus.intValue() / 100 shouldBe 4
-    excessBinsStatus.intValue() / 100 shouldBe 4
-    oneBinResponse shouldBe ((StatusCodes.OK, Some(2)))
+    Seq((1, 1), (1000, 1000)).foreach { case (bins, maxtime) =>
+      Get(prefix + s"/poolHistogram?bins=$bins&maxtime=$maxtime") ~> sealedRoute ~> check {
+        status shouldBe StatusCodes.OK
+        responseAs[Json].asArray.map(_.length) shouldBe Some(bins + 1)
+      }
+    }
   }
 
   it should "return unconfirmed tx by output ergoTree from mempool" in {

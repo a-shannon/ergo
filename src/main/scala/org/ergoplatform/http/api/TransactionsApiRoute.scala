@@ -221,9 +221,14 @@ case class TransactionsApiRoute(readersHolder: ActorRef,
   }
 
   val feeHistogramParameters: Directive[(Int, Long)] = parameters("bins".as[Int] ? 10, "maxtime".as[Long] ? (60*1000L))
+  private val maxFeeHistogramBins = 1000
 
   def getFeeHistogramR: Route = (path("poolHistogram") & get & feeHistogramParameters) { (bins, maxtime) =>
-    ApiResponse(getMemPool.map(p => getFeeHistogram(System.currentTimeMillis(), bins, maxtime, p.weightedTransactionIds(Int.MaxValue)).asJson))
+    if (bins < 1 || bins > maxFeeHistogramBins || maxtime < bins.toLong) {
+      BadRequest(s"bins must be between 1 and $maxFeeHistogramBins, and maxtime must be at least bins")
+    } else {
+      ApiResponse(getMemPool.map(p => getFeeHistogram(System.currentTimeMillis(), bins, maxtime, p.weightedTransactionIds(Int.MaxValue)).asJson))
+    }
   }
 
   val feeRequestParameters: Directive[(Int, Int)] = parameters("waitTime".as[Int] ? 1, "txSize".as[Int] ? 100)
