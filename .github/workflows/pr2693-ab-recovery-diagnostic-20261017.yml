@@ -25,9 +25,10 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse 5b60b410a17213ad5bb9e90017624168369aaa30^)" = "3f8b7782d6d00e187a34a8e672b25e777532e2c3"
-          git merge-base --is-ancestor 5b60b410a17213ad5bb9e90017624168369aaa30 HEAD
-          git diff --exit-code 3f8b7782d6d00e187a34a8e672b25e777532e2c3 5b60b410a17213ad5bb9e90017624168369aaa30 -- src/main
-          git diff --exit-code 5b60b410a17213ad5bb9e90017624168369aaa30 HEAD -- src/test
+          test "$(git rev-parse 27e9ae67cef882533563525dc0eeb8e3a7cac65b^)" = "fa29864bd0f3b4471bd145e8cefbf86218d5bd58"
+          git merge-base --is-ancestor 27e9ae67cef882533563525dc0eeb8e3a7cac65b HEAD
+          git diff --exit-code 3f8b7782d6d00e187a34a8e672b25e777532e2c3 27e9ae67cef882533563525dc0eeb8e3a7cac65b -- src/main
+          git diff --exit-code 27e9ae67cef882533563525dc0eeb8e3a7cac65b HEAD -- src/test
       - name: Set up Java and Scala
         uses: coursier/setup-action@v3
         with:
