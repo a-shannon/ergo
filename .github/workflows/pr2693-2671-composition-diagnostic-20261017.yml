@@ -41,9 +41,9 @@ jobs:
             ~/.coursier/cache/v1
             ~/.cache/coursier/v1
           key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
-      - name: Run cancellation-window regression
+      - name: Run affected snapshot and delivery suites
         timeout-minutes: 40
-        run: sbt -batch -Denv=test ++2.12.20 "testOnly org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification -- -z ChangedHistory"
+        run: sbt -batch -Denv=test ++2.12.20 "testOnly org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification org.ergoplatform.nodeView.history.UtxoSetSnapshotProcessorSpecification org.ergoplatform.network.SnapshotBootstrapJoinSpec org.ergoplatform.network.DeliveryExpirationSpec"
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
