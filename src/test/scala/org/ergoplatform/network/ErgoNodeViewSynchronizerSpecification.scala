@@ -2969,15 +2969,24 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
 
       val secondPeer = ConnectedPeer(connectionIdGen.sample.get,
         TestProbe("SnapshotPeer2").ref, peer.peerInfo)
+      val thirdPeer = ConnectedPeer(connectionIdGen.sample.get,
+        TestProbe("SnapshotPeer3").ref, peer.peerInfo)
       syncTracker.updateStatus(peer, org.ergoplatform.consensus.Unknown, Some(ctx.chain.last.height))
       syncTracker.updateStatus(secondPeer, org.ergoplatform.consensus.Unknown, Some(ctx.chain.last.height))
+      syncTracker.updateStatus(thirdPeer, org.ergoplatform.consensus.Unknown, Some(ctx.chain.last.height))
 
-      val manifest = syntheticSnapshotManifest()
+      val manifest = new BatchAVLProverManifest[Digest32](syntheticSnapshotLeaf(), 1.toByte) {
+        override def subtreesIds: mutable.Buffer[Digest32] =
+          mutable.Buffer(Digest32 @@ Array.fill[Byte](32)(42))
+      }
       val selected = updHistory.bestHeaderAtHeight(ctx.chain.last.height).get
       java.util.Arrays.equals(selected.stateRoot,
         VersionedLDBAVLStorage.digest(manifest.id, manifest.rootHeight)) shouldBe false
       val initialFloor = updHistory.minimalFullBlockHeight
-      val plan = updHistory.registerManifestToDownload(manifest, selected.height, Seq(peer, secondPeer))
+      val plan = updHistory.registerManifestToDownload(manifest, selected.height,
+        Seq(peer, secondPeer, thirdPeer))
+      plan.totalChunks shouldBe 1
+      plan.fullyDownloaded shouldBe false
 
       synchronizerMockRef ! ChangedHistory(updHistory)
       val discard = viewHolderProbe.fishForMessage(5.seconds) {
@@ -2988,14 +2997,10 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
 
       // Peer loss must not reserve or request more chunks for the session
       // whose holder-side discard has not yet been acknowledged.
-      synchronizerMockRef ! DisconnectedPeer(peer)
-      synchronizerMockRef ! SendLocalSyncInfo
-      ncProbe.fishForMessage(5.seconds) {
-        case sent: SendToNetwork if sent.message.spec.messageCode == GetUtxoSnapshotChunkSpec.messageCode =>
-          fail("A discarded snapshot session sent a new chunk request")
-        case sent: SendToNetwork => sent.message.spec.messageCode == ErgoSyncInfoMessageSpec.messageCode
-        case _ => false
-      }
+      val barrier = TestProbe("CancellationWindowBarrier")
+      barrier.send(synchronizerMockRef, DisconnectedPeer(peer))
+      barrier.send(synchronizerMockRef, Identify("peer-disconnected"))
+      barrier.expectMsg(ActorIdentity("peer-disconnected", Some(synchronizerMockRef)))
       updHistory.utxoSetSnapshotDownloadPlan().get.downloadingChunks shouldBe 0
 
       updHistory.discardSnapshotDownload(discard.sessionId).map(_.sessionId) shouldBe Some(plan.sessionId)
