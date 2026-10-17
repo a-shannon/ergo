@@ -43,7 +43,7 @@ import scorex.testkit.utils.AkkaFixture
 import sigma.Colls
 import sigma.data.Digest32Coll
 import sigma.interpreter.{ContextExtension, ProverResult}
-import sigmastate.ErgoTree
+import sigma.ast.ErgoTree
 import sigmastate.helpers.TestingHelpers._
 
 import scala.concurrent.duration.{Duration, _}
