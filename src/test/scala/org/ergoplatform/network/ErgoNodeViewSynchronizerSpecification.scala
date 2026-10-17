@@ -15,6 +15,7 @@ import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages._
 import org.ergoplatform.network.ErgoNodeViewSynchronizer._
 import org.ergoplatform.nodeView.ErgoNodeViewHolder
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.GetDataFromCurrentView
+import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.LocallyGeneratedTransaction
 import org.ergoplatform.nodeView.history.{ErgoHistory, ErgoHistoryReader, ErgoSyncInfoMessageSpec, ErgoSyncInfoV2}
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.nodeView.mempool.ErgoMemPoolUtils.ProcessingOutcome
@@ -88,6 +89,23 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
   }
 
   class NodeViewHolderMock extends ErgoNodeViewHolder[UtxoState](settings)
+
+  private case class InstallRelayView(history: ErgoHistory, state: UtxoState)
+  private case object RelayViewInstalled
+
+  private class RelayUtxoHolder(settings: ErgoSettings) extends ErgoNodeViewHolder[UtxoState](settings) {
+    override def receive: Receive = {
+      case InstallRelayView(nextHistory, nextState) =>
+        val previousHistory = history()
+        val previousState = minimalState()
+        updateNodeView(updatedHistory = Some(nextHistory), updatedState = Some(nextState))
+        previousHistory.closeStorage()
+        previousState.closeStorage()
+        sender() ! RelayViewInstalled
+    } orElse super.receive
+  }
+
+  private class RelayDigestHolder(settings: ErgoSettings) extends ErgoNodeViewHolder[DigestState](settings)
 
   class SynchronizerMock(networkControllerRef: ActorRef,
                          viewHolderRef: ActorRef,
@@ -1687,7 +1705,26 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
       val digest = DigestState.create(Some(utxo.version), Some(utxo.rootDigest),
         createTempDir, lightModeSettings)
 
+      def isolated(base: ErgoSettings): ErgoSettings = {
+        val dir = createTempDir.getAbsolutePath
+        val storage = base.walletSettings.secretStorage.copy(secretDir = s"$dir/wallet/keystore")
+        base.copy(directory = dir,
+          walletSettings = base.walletSettings.copy(secretStorage = storage))
+      }
+
+      // The two Holder/Synchronizer pairs need separate event streams: otherwise both
+      // synchronizers would receive both nodes' transaction outcomes.
+      val digestSystem = ActorSystem("digest-relay")
+      var receiverOwnsUtxo = false
       try {
+        val receiverHolder = system.actorOf(Props(new RelayUtxoHolder(isolated(settings))))
+        val receiverSubmit = TestProbe("ReceiverSubmit")
+        val receiverEvents = TestProbe("ReceiverTransactionEvents")
+        receiverSubmit.send(receiverHolder, InstallRelayView(declinedHistory, utxo))
+        receiverSubmit.expectMsg(RelayViewInstalled)
+        receiverOwnsUtxo = true
+        system.eventStream.subscribe(receiverEvents.ref, classOf[FailedTransaction])
+
         def spend(box: ErgoBox): ErgoTransaction = ErgoTransaction(
           IndexedSeq(Input(box.id, ProverResult.empty)),
           IndexedSeq(
@@ -1714,20 +1751,33 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
         ErgoMemPool.empty(settings).process(UnconfirmedTransaction(missingInput, None), utxo)
           ._2 shouldBe a[ProcessingOutcome.Declined]
 
-        val senderNcProbe = TestProbe("DigestSenderNetworkController")
-        val senderHolderProbe = TestProbe("DigestSenderViewHolder")
-        val senderHandlerProbe = TestProbe("DigestSenderPeerHandler")
-        val sender = system.actorOf(Props(new SynchronizerMock(
-          senderNcProbe.ref, senderHolderProbe.ref, ErgoSyncInfoMessageSpec,
-          lightModeSettings, ErgoSyncTracker(lightModeSettings.scorexSettings.network),
-          DeliveryTracker.empty(lightModeSettings)
-        )(ec)))
-        sender ! ChangedHistory(declinedHistory)
-        sender ! ChangedMempool(digestPool)
-        // The Digest holder's SuccessfulTransaction event is forwarded here explicitly;
-        // this test does not claim to exercise its event-stream subscription.
-        val accepted = digestResult.asInstanceOf[ProcessingOutcome.Accepted]
-        sender ! SuccessfulTransaction(accepted.tx)
+        val senderSettings = isolated(lightModeSettings)
+        val senderHolder = digestSystem.actorOf(Props(new RelayDigestHolder(senderSettings)))
+        val senderNcProbe = TestProbe("DigestSenderNetworkController")(digestSystem)
+        val senderSubmit = TestProbe("DigestSenderSubmit")(digestSystem)
+        val senderEvents = TestProbe("DigestTransactionEvents")(digestSystem)
+        val senderHandlerProbe = TestProbe("DigestSenderPeerHandler")(digestSystem)
+        digestSystem.eventStream.subscribe(senderEvents.ref, classOf[SuccessfulTransaction])
+        val sender = TestActorRef(Props(new SynchronizerMock(
+          senderNcProbe.ref, senderHolder, ErgoSyncInfoMessageSpec,
+          senderSettings, ErgoSyncTracker(senderSettings.scorexSettings.network),
+          DeliveryTracker.empty(senderSettings)
+        )(digestSystem.dispatcher)))(digestSystem)
+        senderSubmit.send(senderHolder, GetDataFromCurrentView[DigestState, Boolean](_ => true))
+        senderSubmit.expectMsg(true)
+        senderSubmit.send(senderHolder, LocallyGeneratedTransaction(UnconfirmedTransaction(tx, None)))
+        senderSubmit.expectMsgType[ProcessingOutcome.Accepted](10.seconds)
+        val observedAccepted = senderEvents.expectMsgType[SuccessfulTransaction](10.seconds)
+        observedAccepted.transaction.id shouldBe tx.id
+
+        val receiverNcProbe = TestProbe("ReceiverNetworkController")
+        val receiver = TestActorRef(Props(new SynchronizerMock(
+          receiverNcProbe.ref, receiverHolder, ErgoSyncInfoMessageSpec,
+          settings, ErgoSyncTracker(settings.scorexSettings.network),
+          DeliveryTracker.empty(settings)
+        )(ec)))(system)
+        receiverSubmit.send(receiverHolder, GetDataFromCurrentView[UtxoState, Boolean](_ => true))
+        receiverSubmit.expectMsg(true)
 
         val announced = senderNcProbe.fishForMessage(5.seconds) {
           case stn: SendToNetwork if stn.message.spec.messageCode == InvSpec.messageCode =>
@@ -1738,10 +1788,10 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
         announced.sendingStrategy shouldBe scorex.core.network.Broadcast
         val senderAsPeer = newPeer
         val receiverAsPeer = newPeer.copy(handlerRef = senderHandlerProbe.ref)
-        synchronizerRef ! Message(InvSpec, Left(InvSpec.toBytes(
+        receiver ! Message(InvSpec, Left(InvSpec.toBytes(
           announced.message.data.get.asInstanceOf[InvData])), Some(senderAsPeer))
 
-        val request = ncProbe.fishForMessage(5.seconds) {
+        val request = receiverNcProbe.fishForMessage(5.seconds) {
           case stn: SendToNetwork if stn.message.spec.messageCode == RequestModifierSpec.messageCode =>
             val data = stn.message.data.get.asInstanceOf[InvData]
             data.typeId == ErgoTransaction.modifierTypeId && data.ids == Seq(tx.id)
@@ -1759,32 +1809,21 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
         val modifiers = delivered.data.get
         modifiers.modifiers.keySet shouldBe Set(tx.id)
         modifiers.modifiers(tx.id).toSeq shouldBe tx.bytes.toSeq
-        synchronizerRef ! Message(ModifiersSpec, Left(ModifiersSpec.toBytes(modifiers)),
+        receiver ! Message(ModifiersSpec, Left(ModifiersSpec.toBytes(modifiers)),
           Some(senderAsPeer))
 
-        val forwarded = vhProbe.fishForMessage(5.seconds) {
-          case received: ErgoNodeViewHolder.ReceivableMessages.TransactionFromRemote =>
-            received.unconfirmedTx.id == tx.id
-          case _ => false
-        }.asInstanceOf[ErgoNodeViewHolder.ReceivableMessages.TransactionFromRemote]
-        forwarded.unconfirmedTx.source shouldBe Some(senderAsPeer)
-        ncProbe.receiveWhile(200.millis) { case msg => msg }
-          .collect { case penalty: PenalizePeer => penalty } shouldBe empty
-        val rejected = ErgoMemPool.empty(settings).process(forwarded.unconfirmedTx, utxo)._2
-        rejected shouldBe a[ProcessingOutcome.Invalidated]
-        val invalidated = rejected.asInstanceOf[ProcessingOutcome.Invalidated]
-        // The real holder maps this outcome to FailedTransaction; the probe substitutes only
-        // for that holder, while the synchronizer makes the actual peer-penalty decision.
-        synchronizerRef ! FailedTransaction(
-          forwarded.unconfirmedTx.withCost(invalidated.cost), invalidated.e)
-        ncProbe.fishForMessage(5.seconds) {
+        val rejected = receiverEvents.expectMsgType[FailedTransaction](10.seconds)
+        rejected.transaction.id shouldBe tx.id
+        rejected.transaction.source shouldBe Some(senderAsPeer)
+        receiverNcProbe.fishForMessage(5.seconds) {
           case _: PenalizePeer => true
           case _ => false
         } shouldBe PenalizePeer(senderAsPeer.connectionId.remoteAddress,
           PenaltyType.MisbehaviorPenalty)
       } finally {
+        Await.result(digestSystem.terminate(), Duration.Inf)
         digest.close()
-        utxo.closeStorage()
+        if (!receiverOwnsUtxo) utxo.closeStorage()
       }
     }
   }
