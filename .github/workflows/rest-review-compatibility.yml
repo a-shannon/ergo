@@ -1,0 +1,59 @@
+name: REST review compatibility diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2374-review-diagnostic-20261017
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [candidate, previous-route]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Java and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Restore only the old route for the negative control
+        if: matrix.variant == 'previous-route'
+        run: |
+          git restore --source=b0d3a07128371c2de1a6105397bdb50d54be2172 -- src/main/scala/org/ergoplatform/http/api/TransactionsApiRoute.scala
+          git diff --stat
+      - name: Run affected suites
+        if: matrix.variant == 'candidate'
+        run: >-
+          sbt -Denv=test ++2.12.20
+          "testOnly org.ergoplatform.http.routes.TransactionApiRouteSpec org.ergoplatform.http.routes.UtxoApiRouteSpec org.ergoplatform.http.routes.UtilsApiRouteSpec org.ergoplatform.nodeView.mempool.HistogramStatsSpec org.ergoplatform.nodeView.mempool.ErgoMemPoolSpec"
+      - name: Exercise the two formerly rejected valid inputs
+        if: matrix.variant == 'previous-route'
+        run: >-
+          sbt -Denv=test ++2.12.20
+          'testOnly org.ergoplatform.http.routes.TransactionApiRouteSpec -- -z "overflow bin when maxtime is zero" -z "accept fee estimation waits beyond"'
+      - name: Preserve test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rest-review-${{ matrix.variant }}
+          path: target/test-reports/
+          if-no-files-found: warn
