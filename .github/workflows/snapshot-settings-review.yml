@@ -1,0 +1,49 @@
+name: Snapshot settings review diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2546-settings-review-diagnostic-20261017
+
+permissions:
+  contents: read
+
+jobs:
+  settings:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [candidate, previous-reader]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Restore the previous reader only
+        if: matrix.variant == 'previous-reader'
+        run: |
+          git restore --source=a84d6cdf34f4caecd7a933e515bcd184be6ec746 -- src/main/scala/org/ergoplatform/settings/ErgoSettingsReader.scala
+          git diff --stat
+      - name: Run settings and supported-mode checks
+        run: sbt -Denv=test ++2.12.20 "testOnly org.ergoplatform.settings.ErgoSettingsSpecification"
+      - name: Preserve test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-settings-${{ matrix.variant }}
+          path: target/test-reports/
+          if-no-files-found: warn
