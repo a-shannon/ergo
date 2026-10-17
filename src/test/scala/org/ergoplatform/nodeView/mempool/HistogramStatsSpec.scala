@@ -18,4 +18,29 @@ class HistogramStatsSpec extends AnyFlatSpec with Matchers {
       FeeHistogramBin(1, 11L)
     )
   }
+
+  it should "keep non-divisible intervals inside the documented bins" in {
+    val now = 100L
+    val fourMsOld = WeightedTxId(bytesToId(Array.fill(32)(3.toByte)), 1L, 7L, now - 4L)
+    HistogramStats.getFeeHistogram(now, 3, 5L, Seq(fourMsOld)).toSeq shouldBe Seq(
+      FeeHistogramBin(0, 0L),
+      FeeHistogramBin(0, 0L),
+      FeeHistogramBin(1, 7L),
+      FeeHistogramBin(0, 0L)
+    )
+
+    val twoMsOld = WeightedTxId(bytesToId(Array.fill(32)(4.toByte)), 1L, 11L, now - 2L)
+    HistogramStats.getFeeHistogram(now, 2, 3L, Seq(twoMsOld)).toSeq shouldBe Seq(
+      FeeHistogramBin(0, 0L),
+      FeeHistogramBin(1, 11L),
+      FeeHistogramBin(0, 0L)
+    )
+  }
+
+  it should "preserve the last regular bin when scaling a large wait time" in {
+    val nearlyMaxAge = WeightedTxId(bytesToId(Array.fill(32)(5.toByte)), 1L, 13L, 1L)
+    val histogram = HistogramStats.getFeeHistogram(Long.MaxValue, 1000, Long.MaxValue, Seq(nearlyMaxAge))
+    histogram(999) shouldBe FeeHistogramBin(1, 13L)
+    histogram(1000) shouldBe FeeHistogramBin(0, 0L)
+  }
 }
