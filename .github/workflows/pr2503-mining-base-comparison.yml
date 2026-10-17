@@ -1,0 +1,101 @@
+name: PR 2503 mining base comparison
+
+on:
+  push:
+    branches:
+      - feat/pr2503-mining-base-comparison-20261017
+
+permissions:
+  contents: read
+
+jobs:
+  mining-base-comparison:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact weak-blocks base
+        uses: actions/checkout@v4
+        with:
+          ref: 214d09cba633a5b709ccd43e3bc5ea049fd71739
+          fetch-depth: 0
+
+      - name: Verify source identity
+        run: test "$(git rev-parse HEAD)" = '214d09cba633a5b709ccd43e3bc5ea049fd71739'
+
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Build pinned SigmaState dependency
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
+
+      - name: Setup Java and Scala
+        uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+
+      - name: Run three mining suites
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p diagnostic
+          sbt -Denv=test ++2.12.20 "testOnly org.ergoplatform.mining.CandidateGeneratorPropSpec org.ergoplatform.mining.CandidateGeneratorSpec org.ergoplatform.mining.ErgoMinerSpec" 2>&1 \
+            | awk 'NR <= 120 || /^\[info\]/ || /^\[error\]/ || /\*\*\* FAILED \*\*\*|TestFailedException|AssertionError|Exception in thread/ { if (shown < 3000) { print substr($0, 1, 2000); fflush() } else if (shown == 3000) { print "Further diagnostic lines suppressed; JUnit reports retain failures"; fflush() } shown++ }' \
+            | tee diagnostic/mining-tests-filtered.log
+
+      - name: Summarize JUnit evidence
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+          import xml.etree.ElementTree as ET
+
+          reports = sorted(Path("target/test-reports").glob("TEST-*.xml"))
+          expected = {
+              "org.ergoplatform.mining.CandidateGeneratorPropSpec",
+              "org.ergoplatform.mining.CandidateGeneratorSpec",
+              "org.ergoplatform.mining.ErgoMinerSpec",
+          }
+          suites = set()
+          tests = failures = errors = skipped = 0
+          for path in reports:
+              root = ET.parse(path).getroot()
+              name = root.attrib.get("name", path.stem)
+              suites.add(name)
+              tests += int(root.attrib.get("tests", "0"))
+              failures += int(root.attrib.get("failures", "0"))
+              errors += int(root.attrib.get("errors", "0"))
+              skipped += int(root.attrib.get("skipped", "0"))
+              for case in root.findall("testcase"):
+                  problem = case.find("failure")
+                  if problem is None:
+                      problem = case.find("error")
+                  if problem is not None:
+                      first_line = problem.attrib.get("message", "").splitlines()[0][:240]
+                      print(f"FAIL {name} :: {case.attrib.get('name', '')} :: {first_line}")
+          print(f"JUnit reports: {len(reports)}; suites: {sorted(suites)}")
+          print(f"Tests: {tests - failures - errors - skipped} passed, {failures} failed, {errors} errors, {skipped} skipped")
+          if suites != expected or tests != 47:
+              print("Unexpected or empty mining suite selection", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Retain filtered output and JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr2503-mining-base-comparison-${{ github.run_id }}
+          path: |
+            diagnostic/mining-tests-filtered.log
+            target/test-reports/**
+          if-no-files-found: warn
