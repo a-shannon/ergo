@@ -1,0 +1,86 @@
+name: PR 2743 UTXO state sync diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2743-it-diagnostic-20261017
+
+permissions:
+  contents: read
+
+jobs:
+  focused-it:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: base-2548
+            revision: 5272698fd6cb1f7199c7fc9d6bc19679ba638a81
+          - label: candidate-2743
+            revision: 87140afc55a6c4ebbc92cfbf2463d89b567df2a2
+    timeout-minutes: 45
+    steps:
+      - name: Checkout pinned source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.revision }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Java and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-pr2743-it-${{ hashFiles('source/**/*.sbt') }}-${{ hashFiles('source/project/build.properties') }}
+
+      - name: Build node image and run only UtxoStateNodesSyncSpec
+        id: focused-test
+        timeout-minutes: 35
+        working-directory: source
+        run: |
+          mkdir -p tmp
+          TMPDIR="$(pwd)/tmp" sbt -Denv=test clean ++2.12.20 docker "it:testOnly org.ergoplatform.it.UtxoStateNodesSyncSpec"
+
+      - name: Save remaining node container state and logs
+        if: always()
+        env:
+          TEST_OUTCOME: ${{ steps.focused-test.outcome }}
+        run: |
+          mkdir -p source/target/logs/containers
+          printf 'focused-test-outcome=%s\n' "$TEST_OUTCOME" > source/target/logs/containers/runner-state.txt
+          docker version >> source/target/logs/containers/runner-state.txt 2>&1 || true
+          docker ps -a --filter name=ergo-itest- --no-trunc \
+            >> source/target/logs/containers/runner-state.txt 2>&1 || true
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              [ -n "$id" ] || continue
+              docker inspect --format '{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} finished={{.State.FinishedAt}}' "$id" \
+                >> source/target/logs/containers/runner-state.txt 2>&1 || true
+              docker logs --timestamps "$id" \
+                > "source/target/logs/containers/$name.log" 2>&1 || true
+            done
+
+      - name: Upload node logs and test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr2743-utxostate-sync-${{ matrix.label }}-attempt-${{ github.run_attempt }}
+          path: |
+            source/target/logs/
+            source/target/it-reports/
+            source/target/**/it-reports/
+          if-no-files-found: warn
+          retention-days: 30
