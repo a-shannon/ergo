@@ -1,0 +1,60 @@
+name: PR 2503 exact-head node test diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2503-node-verdict-20261017
+
+permissions:
+  contents: read
+
+jobs:
+  node-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact PR source
+        uses: actions/checkout@v4
+        with:
+          ref: 94065cbdd7337695edb01237e6ded2f6714fdd23
+          fetch-depth: 0
+
+      - name: Verify source identity
+        run: test "$(git rev-parse HEAD)" = '94065cbdd7337695edb01237e6ded2f6714fdd23'
+
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Build pinned SigmaState dependency
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
+
+      - name: Setup Java and Scala
+        uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+
+      - name: Run exact native node test command
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p diagnostic
+          sbt -Denv=test clean ++2.12.20 test 2>&1 | tee diagnostic/node-tests.log
+
+      - name: Retain node test log and JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr2503-node-tests-${{ github.run_id }}
+          path: |
+            diagnostic/node-tests.log
+            **/target/test-reports/**
+          if-no-files-found: warn
