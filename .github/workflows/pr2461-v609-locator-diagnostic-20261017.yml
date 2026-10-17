@@ -1,0 +1,79 @@
+name: PR 2461 v6.0.9 V2 locator diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2461-v609-locator-diagnostic-20261017
+
+permissions:
+  contents: read
+
+jobs:
+  locator-composition:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        spec: [ForkResolutionSpec, DeepRollBackSpec]
+    steps:
+      - name: Checkout exact composition
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify diagnostic ancestry and two-file increment
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=91d4a654b57319e197276fa7a7011d9ff596e7b7
+          git merge-base --is-ancestor "$base" HEAD
+          expected=$(printf '%s\n' \
+            '.github/workflows/pr2461-v609-locator-diagnostic-20261017.yml' \
+            'src/main/scala/org/ergoplatform/nodeView/history/ErgoHistoryReader.scala' | sort)
+          actual=$(git diff --name-only "$base" HEAD | sort)
+          test "$actual" = "$expected"
+          git diff --exit-code bec8c75284ecfff3e57450656c7540b9da9fced4 "$base" -- src/main
+          git diff --check "$base" HEAD
+          git show --no-patch --format=fuller "$base"
+      - name: Set up Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Cache sbt dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Run focused integration scenario
+        timeout-minutes: 50
+        run: |
+          mkdir -p tmp
+          TMPDIR="$PWD/tmp" sbt -batch -Denv=test clean ++2.12.20 docker "it:testOnly *${{ matrix.spec }}"
+      - name: Save remaining container logs
+        if: always()
+        timeout-minutes: 3
+        run: |
+          mkdir -p target/logs/containers
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              docker inspect --format '{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' "$id" > "target/logs/containers/$name.state.log" 2>&1 || true
+              docker logs --timestamps "$id" > "target/logs/containers/$name.log" 2>&1 || true
+            done
+      - name: Upload test report and node logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr2461-v609-locator-${{ matrix.spec }}-${{ github.run_attempt }}
+          path: |
+            target/logs/
+            target/it-reports/
+          if-no-files-found: warn
+          retention-days: 14
