@@ -3757,6 +3757,7 @@ paths:
           type: integer
           format: int32
           minimum: 1
+          maximum: 1000
           default: 10
       - in: query
         name: maxtime
@@ -3765,7 +3766,7 @@ paths:
         schema:
           type: integer
           format: int64
-          minimum: 0
+          minimum: 1
           default: 60000
     get:
       summary: Get histogram (waittime, (n_trans, sum(fee)) for transactions in mempool.
