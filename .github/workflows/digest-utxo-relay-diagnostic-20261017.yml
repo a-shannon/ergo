@@ -1,0 +1,58 @@
+name: Digest to UTXO relay diagnostic
+
+on:
+  push:
+    branches:
+      - feat/digest-utxo-relay-falsifier-20261017
+
+permissions:
+  contents: read
+
+jobs:
+  focused-test:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release base and test-only increment
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse e756bb08f^)" = "a058799b285b11064f2a2b1e8769e6f49227657e"
+          git merge-base --is-ancestor e756bb08f HEAD
+          test "$(git diff --name-only a058799b285b11064f2a2b1e8769e6f49227657e e756bb08f)" = "src/test/scala/org/ergoplatform/network/ErgoNodeViewSynchronizerSpecification.scala"
+          git diff --exit-code e756bb08f HEAD -- src/test src/main
+      - name: Set up Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Cache sbt dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Run focused relay test
+        timeout-minutes: 30
+        run: sbt -batch -Denv=test ++2.12.20 "testOnly org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification -- -z penalizes"
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-utxo-relay-${{ github.run_attempt }}
+          path: |
+            target/test-reports/
+            target/scala-2.12/test-reports/
+            target/logs/
+          if-no-files-found: ignore
+          retention-days: 14
