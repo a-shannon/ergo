@@ -1,0 +1,57 @@
+name: PR 2693 holder discard review diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2693-review-candidate-20261017
+
+permissions:
+  contents: read
+
+jobs:
+  focused-test:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify pinned source increment
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse 7416269a03519b1095da497e72c7424cec301273^)" = "27e9ae67cef882533563525dc0eeb8e3a7cac65b"
+          git merge-base --is-ancestor 7416269a03519b1095da497e72c7424cec301273 HEAD
+          test -z "$(git diff --name-only 7416269a03519b1095da497e72c7424cec301273 HEAD -- src/main src/test)"
+      - name: Set up Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Cache sbt dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Run affected snapshot suites
+        timeout-minutes: 40
+        run: sbt -batch -Denv=test ++2.12.20 "testOnly org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification org.ergoplatform.nodeView.history.UtxoSetSnapshotProcessorSpecification"
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr2693-holder-discard-${{ github.run_attempt }}
+          path: |
+            target/test-reports/
+            target/scala-2.12/test-reports/
+            target/logs/
+          if-no-files-found: ignore
+          retention-days: 14
