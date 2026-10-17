@@ -94,7 +94,7 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
   private case object RelayViewInstalled
 
   private class RelayUtxoHolder(settings: ErgoSettings) extends ErgoNodeViewHolder[UtxoState](settings) {
-    override def receive: Receive = {
+    private def installRelayView: Receive = {
       case InstallRelayView(nextHistory, nextState) =>
         val previousHistory = history()
         val previousState = minimalState()
@@ -102,7 +102,9 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
         previousHistory.closeStorage()
         previousState.closeStorage()
         sender() ! RelayViewInstalled
-    } orElse super.receive
+    }
+
+    override def receive: Receive = installRelayView.orElse(super.receive)
   }
 
   private class RelayDigestHolder(settings: ErgoSettings) extends ErgoNodeViewHolder[DigestState](settings)
