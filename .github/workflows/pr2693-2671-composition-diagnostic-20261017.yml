@@ -1,0 +1,57 @@
+name: Snapshot recovery composition diagnostic
+
+on:
+  push:
+    branches:
+      - feat/pr2693-pr2671-composition-20261017
+
+permissions:
+  contents: read
+
+jobs:
+  cancellation-window:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source parents
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor 5e6f82b1525202c194f2fb9995507c73a18f54b1 HEAD
+          git merge-base --is-ancestor 7398bacf88917ed82fe38784172191427f603e99 HEAD
+          git merge-base --is-ancestor 30f4304ca52c07a93ba6c66251c08e8dce511993 HEAD
+      - name: Set up Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Cache sbt dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Run cancellation-window regression
+        timeout-minutes: 40
+        run: sbt -batch -Denv=test ++2.12.20 "testOnly org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification -- -z ChangedHistory"
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-recovery-composition-${{ github.run_attempt }}
+          path: |
+            target/test-reports/
+            target/scala-2.12/test-reports/
+            target/logs/
+          if-no-files-found: ignore
+          retention-days: 14

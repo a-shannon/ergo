@@ -2984,6 +2984,20 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
         case command: DiscardSnapshotDownload => command.sessionId == plan.sessionId
         case _ => false
       }.asInstanceOf[DiscardSnapshotDownload]
+      updHistory.utxoSetSnapshotDownloadPlan().get.downloadingChunks shouldBe 0
+
+      // Peer loss must not reserve or request more chunks for the session
+      // whose holder-side discard has not yet been acknowledged.
+      synchronizerMockRef ! DisconnectedPeer(peer)
+      synchronizerMockRef ! SendLocalSyncInfo
+      ncProbe.fishForMessage(5.seconds) {
+        case sent: SendToNetwork if sent.message.spec.messageCode == GetUtxoSnapshotChunkSpec.messageCode =>
+          fail("A discarded snapshot session sent a new chunk request")
+        case sent: SendToNetwork => sent.message.spec.messageCode == ErgoSyncInfoMessageSpec.messageCode
+        case _ => false
+      }
+      updHistory.utxoSetSnapshotDownloadPlan().get.downloadingChunks shouldBe 0
+
       updHistory.discardSnapshotDownload(discard.sessionId).map(_.sessionId) shouldBe Some(plan.sessionId)
       system.eventStream.publish(SnapshotApplicationRejected(discard.sessionId))
       ncProbe.fishForMessage(5.seconds) {
