@@ -24,10 +24,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "507ae919a66840fd6303b82246aa8530ad250fcb"
+          test "$(git rev-parse HEAD^)" = "3e7c5504d9def5546822d121a33d39c44830a4da"
           test "$(git rev-parse 2615299d9527f5891172c7268cf43bf657705530^1)" = "7416269a03519b1095da497e72c7424cec301273"
           test "$(git rev-parse 2615299d9527f5891172c7268cf43bf657705530^2)" = "a058799b285b11064f2a2b1e8769e6f49227657e"
-          test -z "$(git diff --name-only 507ae919a66840fd6303b82246aa8530ad250fcb HEAD -- src/main src/test)"
+          test -z "$(git diff --name-only 3e7c5504d9def5546822d121a33d39c44830a4da HEAD -- src/main src/test)"
       - name: Set up Java and Scala
         uses: coursier/setup-action@v3
         with:
