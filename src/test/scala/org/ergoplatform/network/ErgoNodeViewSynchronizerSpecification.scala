@@ -4,7 +4,8 @@ import java.net.InetSocketAddress
 
 import akka.actor.{ActorRef, ActorSystem, Cancellable, Props}
 import akka.testkit.{TestActorRef, TestProbe}
-import org.ergoplatform.Input
+import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
+import org.ergoplatform.mining.emission.EmissionRules.CoinsInOneErgo
 import org.ergoplatform.modifiers.history.header.{Header, HeaderSerializer}
 import org.ergoplatform.modifiers.history.extension.Extension
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
@@ -16,10 +17,11 @@ import org.ergoplatform.nodeView.ErgoNodeViewHolder
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.GetDataFromCurrentView
 import org.ergoplatform.nodeView.history.{ErgoHistory, ErgoHistoryReader, ErgoSyncInfoMessageSpec, ErgoSyncInfoV2}
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
+import org.ergoplatform.nodeView.mempool.ErgoMemPoolUtils.ProcessingOutcome
 import org.ergoplatform.nodeView.state.wrapped.WrappedUtxoState
-import org.ergoplatform.nodeView.state.{StateType, UtxoState}
+import org.ergoplatform.nodeView.state.{BoxHolder, DigestState, StateType, UtxoState}
 import org.ergoplatform.sanity.ErgoSanity._
-import org.ergoplatform.settings.Constants.TrueTree
+import org.ergoplatform.settings.Constants.{FalseTree, TrueTree}
 import org.ergoplatform.settings.{ErgoSettings, ErgoSettingsReader, UtxoSettings}
 import org.ergoplatform.utils.BoxUtils
 import org.ergoplatform.validation.{ParentHeaderNotFoundError, RecoverableModifierError}
@@ -39,7 +41,9 @@ import org.scalatest.propspec.AnyPropSpec
 import org.scalatestplus.scalacheck.ScalaCheckPropertyChecks
 import scorex.testkit.utils.AkkaFixture
 import sigma.Colls
+import sigma.data.Digest32Coll
 import sigma.interpreter.{ContextExtension, ProverResult}
+import sigmastate.ErgoTree
 import sigmastate.helpers.TestingHelpers._
 
 import scala.concurrent.duration.{Duration, _}
@@ -1663,6 +1667,125 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
     }
     finally {
       Await.result(fixture.system.terminate(), Duration.Inf)
+    }
+  }
+
+  property("Digest local admission can relay a stateless transaction that penalizes its sender at a UTXO peer") {
+    withDeclinedTransactionsFixture { ctx =>
+      import ctx._
+
+      val value = 10L * CoinsInOneErgo
+      val fee = CoinsInOneErgo
+      def inputBox(script: ErgoTree, seed: Byte): ErgoBox =
+        new ErgoBox(value, script, Colls.fromArray(Array.empty[(Digest32Coll, Long)]),
+          Map.empty, bytesToId(Array.fill(32)(seed)), 0.toShort, creationHeight = 0)
+
+      val falseBox = inputBox(FalseTree, 1.toByte)
+      val trueBox = inputBox(TrueTree, 2.toByte)
+      val utxo = WrappedUtxoState(BoxHolder(Seq(falseBox, trueBox)),
+        createTempDir, settings.launchParameters, settings)
+      val digest = DigestState.create(Some(utxo.version), Some(utxo.rootDigest),
+        createTempDir, lightModeSettings)
+
+      try {
+        def spend(box: ErgoBox): ErgoTransaction = ErgoTransaction(
+          IndexedSeq(Input(box.id, ProverResult.empty)),
+          IndexedSeq(
+            new ErgoBoxCandidate(value - fee, TrueTree, creationHeight = 0),
+            new ErgoBoxCandidate(fee, settings.chainSettings.monetary.feeProposition,
+              creationHeight = 0)
+          )
+        )
+
+        val tx = spend(falseBox)
+        tx.statelessValidity().isSuccess shouldBe true
+        val (digestPool, digestResult) =
+          ErgoMemPool.empty(lightModeSettings).process(UnconfirmedTransaction(tx, None), digest)
+        digestResult shouldBe a[ProcessingOutcome.Accepted]
+        digestPool.contains(tx.id) shouldBe true
+
+        // A valid-script spend and an absent input distinguish script failure from a malformed
+        // transaction or an unavailable box on the same UTXO state.
+        ErgoMemPool.empty(settings).process(UnconfirmedTransaction(spend(trueBox), None), utxo)
+          ._2 shouldBe a[ProcessingOutcome.Accepted]
+        val missingInput = tx.copy(inputs = IndexedSeq(
+          Input(ADKey @@ Array.fill(32)(42.toByte), ProverResult.empty)))
+        missingInput.statelessValidity().isSuccess shouldBe true
+        ErgoMemPool.empty(settings).process(UnconfirmedTransaction(missingInput, None), utxo)
+          ._2 shouldBe a[ProcessingOutcome.Declined]
+
+        val senderNcProbe = TestProbe("DigestSenderNetworkController")
+        val senderHolderProbe = TestProbe("DigestSenderViewHolder")
+        val senderHandlerProbe = TestProbe("DigestSenderPeerHandler")
+        val sender = system.actorOf(Props(new SynchronizerMock(
+          senderNcProbe.ref, senderHolderProbe.ref, ErgoSyncInfoMessageSpec,
+          lightModeSettings, ErgoSyncTracker(lightModeSettings.scorexSettings.network),
+          DeliveryTracker.empty(lightModeSettings)
+        )(ec)))
+        sender ! ChangedHistory(declinedHistory)
+        sender ! ChangedMempool(digestPool)
+        // The Digest holder's SuccessfulTransaction event is forwarded here explicitly;
+        // this test does not claim to exercise its event-stream subscription.
+        val accepted = digestResult.asInstanceOf[ProcessingOutcome.Accepted]
+        sender ! SuccessfulTransaction(accepted.tx)
+
+        val announced = senderNcProbe.fishForMessage(5.seconds) {
+          case stn: SendToNetwork if stn.message.spec.messageCode == InvSpec.messageCode =>
+            val data = stn.message.data.get.asInstanceOf[InvData]
+            data.typeId == ErgoTransaction.modifierTypeId && data.ids == Seq(tx.id)
+          case _ => false
+        }.asInstanceOf[SendToNetwork]
+        announced.sendingStrategy shouldBe scorex.core.network.Broadcast
+        val senderAsPeer = newPeer
+        val receiverAsPeer = newPeer.copy(handlerRef = senderHandlerProbe.ref)
+        synchronizerRef ! Message(InvSpec, Left(InvSpec.toBytes(
+          announced.message.data.get.asInstanceOf[InvData])), Some(senderAsPeer))
+
+        val request = ncProbe.fishForMessage(5.seconds) {
+          case stn: SendToNetwork if stn.message.spec.messageCode == RequestModifierSpec.messageCode =>
+            val data = stn.message.data.get.asInstanceOf[InvData]
+            data.typeId == ErgoTransaction.modifierTypeId && data.ids == Seq(tx.id)
+          case _ => false
+        }.asInstanceOf[SendToNetwork]
+        request.sendingStrategy shouldBe scorex.core.network.SendToPeer(senderAsPeer)
+        val requested = request.message.data.get.asInstanceOf[InvData]
+        sender ! Message(RequestModifierSpec, Left(RequestModifierSpec.toBytes(requested)),
+          Some(receiverAsPeer))
+
+        val delivered = senderHandlerProbe.fishForMessage(5.seconds) {
+          case msg: Message[_] => msg.spec.messageCode == ModifiersSpec.messageCode
+          case _ => false
+        }.asInstanceOf[Message[ModifiersData]]
+        val modifiers = delivered.data.get
+        modifiers.modifiers.keySet shouldBe Set(tx.id)
+        modifiers.modifiers(tx.id).toSeq shouldBe tx.bytes.toSeq
+        synchronizerRef ! Message(ModifiersSpec, Left(ModifiersSpec.toBytes(modifiers)),
+          Some(senderAsPeer))
+
+        val forwarded = vhProbe.fishForMessage(5.seconds) {
+          case received: ErgoNodeViewHolder.ReceivableMessages.TransactionFromRemote =>
+            received.unconfirmedTx.id == tx.id
+          case _ => false
+        }.asInstanceOf[ErgoNodeViewHolder.ReceivableMessages.TransactionFromRemote]
+        forwarded.unconfirmedTx.source shouldBe Some(senderAsPeer)
+        ncProbe.receiveWhile(200.millis) { case msg => msg }
+          .collect { case penalty: PenalizePeer => penalty } shouldBe empty
+        val rejected = ErgoMemPool.empty(settings).process(forwarded.unconfirmedTx, utxo)._2
+        rejected shouldBe a[ProcessingOutcome.Invalidated]
+        val invalidated = rejected.asInstanceOf[ProcessingOutcome.Invalidated]
+        // The real holder maps this outcome to FailedTransaction; the probe substitutes only
+        // for that holder, while the synchronizer makes the actual peer-penalty decision.
+        synchronizerRef ! FailedTransaction(
+          forwarded.unconfirmedTx.withCost(invalidated.cost), invalidated.e)
+        ncProbe.fishForMessage(5.seconds) {
+          case _: PenalizePeer => true
+          case _ => false
+        } shouldBe PenalizePeer(senderAsPeer.connectionId.remoteAddress,
+          PenaltyType.MisbehaviorPenalty)
+      } finally {
+        digest.close()
+        utxo.closeStorage()
+      }
     }
   }
 
