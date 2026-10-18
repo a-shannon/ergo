@@ -1,0 +1,61 @@
+name: History typed-read repair composition
+
+on:
+  push:
+    branches: [feat/history-typed-repair-compose-20261018]
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [candidate, typed-presence]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Restore only typed presence for the negative control
+        if: matrix.variant == 'typed-presence'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/main/scala/org/ergoplatform/nodeView/history/storage/HistoryStorage.scala')
+          data = path.read_bytes()
+          old = b'def contains(id: ModifierId): Boolean = get(id).isDefined'
+          new = b'def contains(id: ModifierId): Boolean = modifierById(id).isDefined'
+          assert data.count(old) == 1
+          path.write_bytes(data.replace(old, new))
+          PY
+          git diff --stat
+      - name: Exercise typed identity and existing repair
+        if: matrix.variant == 'candidate'
+        run: >-
+          sbt -Denv=test ++2.12.20
+          "testOnly org.ergoplatform.nodeView.history.storage.HistoryStorageIdentitySpec org.ergoplatform.nodeView.history.RepairAfterCorruptionSpecification"
+      - name: Exercise repair with the rejected presence predicate
+        if: matrix.variant == 'typed-presence'
+        run: >-
+          sbt -Denv=test ++2.12.20
+          "testOnly org.ergoplatform.nodeView.history.RepairAfterCorruptionSpecification"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: repair-composition-${{ matrix.variant }}
+          path: target/test-reports/
+          if-no-files-found: warn
