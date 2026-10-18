@@ -1,0 +1,55 @@
+name: History typed-read identity diagnostic
+
+on:
+  push:
+    branches: [feat/history-typed-reads-diagnostic-20261018]
+
+permissions:
+  contents: read
+
+jobs:
+  identity:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [candidate, previous-storage]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Restore only the previous storage implementation
+        if: matrix.variant == 'previous-storage'
+        run: |
+          git restore --source=2675ebfab12f498ef5380785eeb9bdad35afb184 -- src/main/scala/org/ergoplatform/nodeView/history/storage/HistoryStorage.scala
+          git diff --stat
+      - name: Exercise storage and affected typed-read consumers
+        if: matrix.variant == 'candidate'
+        run: >-
+          sbt -Denv=test ++2.12.20
+          "testOnly org.ergoplatform.nodeView.history.storage.HistoryStorageIdentitySpec org.ergoplatform.nodeView.history.storage.HistoryStorageSpec org.ergoplatform.nodeView.history.BlockSectionValidationSpecification org.ergoplatform.nodeView.history.VerifyNonADHistorySpecification"
+      - name: Exercise both identity regressions without the guards
+        if: matrix.variant == 'previous-storage'
+        run: >-
+          sbt -Denv=test ++2.12.20
+          "testOnly org.ergoplatform.nodeView.history.storage.HistoryStorageIdentitySpec"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: typed-identity-${{ matrix.variant }}
+          path: target/test-reports/
+          if-no-files-found: warn
