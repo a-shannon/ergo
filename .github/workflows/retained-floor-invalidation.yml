@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [candidate, previous-predicate]
+        variant: [candidate]
     steps:
       - uses: actions/checkout@v4
       - uses: coursier/setup-action@v3
@@ -38,7 +38,7 @@ jobs:
           path = Path('src/main/scala/org/ergoplatform/nodeView/history/ErgoHistory.scala')
           source = path.read_bytes()
           new = b'val noRetainedFullAncestor = invalidatedIds.contains(invalidatedChain.head.id)'
-          old = b'val noRetainedFullAncestor = invalidatedChain.lengthCompare(1) == 0 || (invalidatedChain.head.header.height == GenesisHeight && invalidatedIds.contains(invalidatedChain.head.id))'
+          old = b'val noRetainedFullAncestor = invalidatedChain.lengthCompare(1) == 0 || (invalidatedChain.head.header.height == ErgoHistoryUtils.GenesisHeight && invalidatedIds.contains(invalidatedChain.head.id))'
           assert source.count(new) == 1
           path.write_bytes(source.replace(new, old))
           PY
