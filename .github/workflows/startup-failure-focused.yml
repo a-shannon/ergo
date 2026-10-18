@@ -1,0 +1,53 @@
+name: Focused startup recovery failure diagnostic
+
+on:
+  push:
+    branches: [feat/pr2677-focused-diagnostic-20261018]
+
+permissions:
+  contents: read
+
+jobs:
+  startup:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [candidate, previous-holder]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Restore only the release Holder
+        if: matrix.variant == 'previous-holder'
+        run: git restore --source=2675ebfab12f498ef5380785eeb9bdad35afb184 -- src/main/scala/org/ergoplatform/nodeView/ErgoNodeViewHolder.scala
+      - name: Exercise recovery failures and affected consumers
+        if: matrix.variant == 'candidate'
+        run: >-
+          sbt -Denv=test ++2.12.20
+          "testOnly org.ergoplatform.nodeView.history.extra.HistoryOpenFailureShutdownSpec org.ergoplatform.nodeView.history.extra.RestoreStateFailureWitnessSpec org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification"
+      - name: Exercise failure witnesses on the release implementation
+        if: matrix.variant == 'previous-holder'
+        run: >-
+          sbt -Denv=test ++2.12.20
+          "testOnly org.ergoplatform.nodeView.history.extra.HistoryOpenFailureShutdownSpec org.ergoplatform.nodeView.history.extra.RestoreStateFailureWitnessSpec"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: startup-failure-${{ matrix.variant }}
+          path: target/test-reports/
+          if-no-files-found: warn
