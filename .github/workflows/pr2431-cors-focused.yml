@@ -1,0 +1,104 @@
+name: Release CORS and authentication diagnostic
+
+on:
+  push:
+    branches: [feat/pr2431-cors-diagnostic-20261018]
+
+permissions:
+  contents: read
+
+jobs:
+  cors:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [candidate, previous-service]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Restore only the previous HTTP service for the control
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          service=src/main/scala/org/ergoplatform/http/ErgoHttpService.scala
+          test "$(git hash-object "$service")" = fea5861de094b7dceb9dc478507e11785bd9e422
+          if [ "$VARIANT" = previous-service ]; then
+            git restore --source=2675ebfab12f498ef5380785eeb9bdad35afb184 -- "$service"
+            test "$(git diff --name-only HEAD)" = "$service"
+          else
+            git diff --exit-code HEAD
+          fi
+          git hash-object "$service"
+      - name: Exercise the real HTTP service, settings and query logging
+        timeout-minutes: 18
+        run: |
+          set +e
+          sbt -Denv=test ++2.12.20 "testOnly org.ergoplatform.http.ErgoHttpServiceSpec org.ergoplatform.settings.ErgoSettingsSpecification org.ergoplatform.http.routes.ErgoHttpServiceSpec"
+          result=$?
+          printf '%s\n' "$result" > cors-test-exit.txt
+          exit 0
+      - name: Require the exact candidate or single-fault outcome
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          expected = {
+              'org.ergoplatform.http.ErgoHttpServiceSpec',
+              'org.ergoplatform.settings.ErgoSettingsSpecification',
+              'org.ergoplatform.http.routes.ErgoHttpServiceSpec',
+          }
+          reports = {}
+          for path in Path('target/test-reports').glob('*.xml'):
+              root = ET.parse(path).getroot()
+              if root.get('name') in expected:
+                  reports[root.get('name')] = root
+          assert set(reports) == expected, expected - set(reports)
+          control = os.environ['VARIANT'] == 'previous-service'
+          for name, root in reports.items():
+              count = int(root.get('tests', '0'))
+              errors = int(root.get('errors', '0'))
+              failures = int(root.get('failures', '0'))
+              assert count > 0 and errors == 0, (name, count, errors)
+              assert int(root.get('skipped', '0')) == 0, name
+              if name == 'org.ergoplatform.http.ErgoHttpServiceSpec':
+                  assert count == 8, count
+                  assert failures == (5 if control else 0), failures
+                  auth = [t for t in root.findall('testcase') if 'preserve API key authentication' in t.get('name', '')]
+                  assert len(auth) == 3, len(auth)
+                  assert all(t.find('failure') is None and t.find('error') is None for t in auth)
+              else:
+                  assert failures == 0, (name, failures)
+              print(name, count, failures, errors)
+          result = int(Path('cors-test-exit.txt').read_text().strip())
+          assert (result != 0) if control else (result == 0), result
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-cors-${{ matrix.variant }}
+          path: |
+            target/test-reports/
+            cors-test-exit.txt
+          if-no-files-found: warn
+          retention-days: 14
