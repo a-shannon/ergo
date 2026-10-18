@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [candidate, previous-storage]
+        variant: [candidate]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,21 +32,10 @@ jobs:
             ~/.coursier/cache/v1
             ~/.cache/coursier/v1
           key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
-      - name: Restore only the previous storage implementation
-        if: matrix.variant == 'previous-storage'
-        run: |
-          git restore --source=2675ebfab12f498ef5380785eeb9bdad35afb184 -- src/main/scala/org/ergoplatform/nodeView/history/storage/HistoryStorage.scala
-          git diff --stat
-      - name: Exercise storage and affected typed-read consumers
-        if: matrix.variant == 'candidate'
+      - name: Exercise typed identity and startup repair together
         run: >-
           sbt -Denv=test ++2.12.20
-          "testOnly org.ergoplatform.nodeView.history.storage.HistoryStorageIdentitySpec org.ergoplatform.nodeView.history.storage.HistoryStorageSpec org.ergoplatform.nodeView.history.BlockSectionValidationSpecification org.ergoplatform.nodeView.history.VerifyNonADHistorySpecification"
-      - name: Exercise both identity regressions without the guards
-        if: matrix.variant == 'previous-storage'
-        run: >-
-          sbt -Denv=test ++2.12.20
-          "testOnly org.ergoplatform.nodeView.history.storage.HistoryStorageIdentitySpec"
+          "testOnly org.ergoplatform.nodeView.history.storage.HistoryStorageIdentitySpec org.ergoplatform.nodeView.history.StartupContinuationRepairSpecification"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
