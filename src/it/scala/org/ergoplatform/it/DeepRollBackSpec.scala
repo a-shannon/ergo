@@ -168,27 +168,45 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
       genesisAGen shouldBe genesisBGen
       Async.await(observeNodes("initial shared chain", minerAGen, minerBGen))
 
-      // 2. Stop all nodes
+      // Freeze the producer, then let the non-mining nodes reach the same full tip.
       docker.stopNode(minerAGen.containerId)
+      docker.removeFromMountedVolume(localVolumeA, remoteVolumeA, "peers")
+      val minerAFrozen: Node = docker.startDevNetNode(minerAConfigNonGen,
+        specialVolumeOpt = Some((localVolumeA, remoteVolumeA))).get
+      val (sharedInfo, _) = Async.await(
+        waitForSameBestBlock(minerAFrozen, minerBGen, minerAGenBestHeight, 5.minutes))
+      sharedInfo.isMining shouldBe Some(false)
+      Async.await(minerBGen.info).isMining shouldBe Some(false)
+      val sharedHeight = sharedInfo.bestBlockHeightOpt.get
+
+      // 2. Stop all nodes before isolated mining
+      docker.stopNode(minerAFrozen.containerId)
       docker.stopNode(minerBGen.containerId)
 
-      val minerAIsolated: Node = docker.startDevNetNode(minerAConfig, isolatedPeersConfig,
+      val minerAIsolated: Node = docker.startDevNetNode(minerAConfig, noConnectionsConfig,
         specialVolumeOpt = Some((localVolumeA, remoteVolumeA))).get
+      Async.await(minerAIsolated.connectedPeers) shouldBe empty
 
       // 1. Let nodeA mine `chainLength + delta` blocks in isolation
-      Async.await(minerAIsolated.waitForHeight(chainLength + delta))
+      Async.await(minerAIsolated.waitForHeight(sharedHeight + chainLength + delta))
 
-      val minerBIsolated: Node = docker.startDevNetNode(minerBConfig, isolatedPeersConfig,
+      val minerBIsolated: Node = docker.startDevNetNode(minerBConfig, noConnectionsConfig,
         specialVolumeOpt = Some((localVolumeB, remoteVolumeB))).get
+      Async.await(minerBIsolated.connectedPeers) shouldBe empty
       Async.await(observeNodes("isolated miners started", minerAIsolated, minerBIsolated))
 
       // 2. Let nodeB mine `chainLength` blocks in isolation
-      Async.await(minerBIsolated.waitForHeight(chainLength, 100.millis))
+      Async.await(minerBIsolated.waitForHeight(sharedHeight + chainLength, 100.millis))
 
       log.info("Mining phase done")
 
       val minerABestHeight = Async.await(minerAIsolated.fullHeight)
       val minerBBestHeight = Async.await(minerBIsolated.fullHeight)
+      Async.await(minerAIsolated.connectedPeers) shouldBe empty
+      Async.await(minerBIsolated.connectedPeers) shouldBe empty
+      val isolatedAId = Async.await(minerAIsolated.headerIdsByHeight(minerBBestHeight)).head
+      val isolatedBId = Async.await(minerBIsolated.headerIdsByHeight(minerBBestHeight)).head
+      isolatedAId should not be isolatedBId
       Async.await(observeNodes("isolated mining complete", minerAIsolated, minerBIsolated))
 
       docker.stopNode(minerAIsolated.containerId)
@@ -198,6 +216,9 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
       log.info("heightB: " + minerBBestHeight)
 
       (minerABestHeight > minerBBestHeight) shouldBe true
+
+      // B's configured seed is A. Avoid both nodes dialing each other on restart.
+      docker.removeFromMountedVolume(localVolumeA, remoteVolumeA, "peers")
 
       // 3. Restart nodeA and nodeB (having shorter chain) with disabled mining
       val minerA: Node = docker.startDevNetNode(minerAConfigNonGen,
@@ -209,11 +230,11 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
 
       val isMiningAOpt = Async.await(minerA.info).isMining
       log.info("isminingA: " + isMiningAOpt)
-      isMiningAOpt map (_ shouldBe false)
+      isMiningAOpt shouldBe Some(false)
 
       val isMiningBOpt = Async.await(minerB.info).isMining
       log.info("isminingB: " + isMiningBOpt)
-      isMiningBOpt map (_ shouldBe false)
+      isMiningBOpt shouldBe Some(false)
 
       // 5. Wait until it switches to the better chain
       val (minerAInfo, minerBInfo) =

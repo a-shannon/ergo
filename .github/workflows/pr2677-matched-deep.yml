@@ -1,0 +1,117 @@
+name: Matched startup recovery and deep rollback diagnostic
+
+on:
+  push:
+    branches: [feat/pr2677-deep-matched-20261018]
+
+permissions:
+  contents: read
+
+jobs:
+  matched:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [candidate, previous-holder]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Pin the only difference between the two variants
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          holder=src/main/scala/org/ergoplatform/nodeView/ErgoNodeViewHolder.scala
+          test "$(git hash-object "$holder")" = a21f6317065c1ff8d246fa78c6d2a00d50880fb7
+          if [ "$VARIANT" = previous-holder ]; then
+            git restore --source=2675ebfab12f498ef5380785eeb9bdad35afb184 -- "$holder"
+            test "$(git hash-object "$holder")" = cbbacabc35c7f9f7488c1499d862f284038c543d
+            test "$(git diff --name-only HEAD)" = "$holder"
+          else
+            git diff --exit-code HEAD
+          fi
+          git status --short
+          git ls-files -s src/main/scala/org/ergoplatform/nodeView/ErgoNodeViewHolder.scala
+          git hash-object "$holder"
+      - name: Exercise sync and scheduling prerequisites
+        timeout-minutes: 15
+        run: >-
+          sbt -Denv=test ++2.12.20
+          "testOnly org.ergoplatform.nodeView.history.BlockDownloadSchedulingSpecification org.ergoplatform.nodeView.history.DeepForkDownloadSpecification org.ergoplatform.nodeView.history.storage.modifierprocessors.UtxoBootstrapToDownloadSpecification org.ergoplatform.nodeView.history.PopowProcessorSpecification org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification org.ergoplatform.network.V2BoundedProgressSpecification org.ergoplatform.nodeView.history.NonVerifyADHistorySpecification"
+      - name: Verify every prerequisite suite actually ran
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          expected = {
+              'org.ergoplatform.nodeView.history.BlockDownloadSchedulingSpecification',
+              'org.ergoplatform.nodeView.history.DeepForkDownloadSpecification',
+              'org.ergoplatform.nodeView.history.storage.modifierprocessors.UtxoBootstrapToDownloadSpecification',
+              'org.ergoplatform.nodeView.history.PopowProcessorSpecification',
+              'org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification',
+              'org.ergoplatform.network.V2BoundedProgressSpecification',
+              'org.ergoplatform.nodeView.history.NonVerifyADHistorySpecification',
+          }
+          seen = set()
+          for path in Path('target/test-reports').glob('*.xml'):
+              suite = ET.parse(path).getroot()
+              name = suite.get('name')
+              if name in expected:
+                  assert int(suite.get('tests', '0')) > 0, name
+                  assert int(suite.get('errors', '0')) == 0, name
+                  assert int(suite.get('failures', '0')) == 0, name
+                  seen.add(name)
+          assert seen == expected, expected - seen
+          print('All seven prerequisite suites executed successfully')
+          PY
+      - name: Preserve prerequisite reports before clean
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matched-prerequisites-${{ matrix.variant }}
+          path: target/test-reports/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Build the selected Holder into the node image and run DeepRollBackSpec
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+          TMPDIR="$PWD/tmp" sbt -Denv=test clean ++2.12.20 docker "it:testOnly org.ergoplatform.it.DeepRollBackSpec"
+      - name: Save remaining node container logs
+        if: always()
+        timeout-minutes: 3
+        run: |
+          mkdir -p target/logs/containers
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              docker inspect --format '{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} finished={{.State.FinishedAt}}' "$id" || true
+              docker logs --timestamps "$id" > "target/logs/containers/$name.log" 2>&1 || true
+            done
+      - name: Preserve integration reports and all node logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matched-deep-rollback-${{ matrix.variant }}
+          path: |
+            target/logs/
+            target/it-reports/
+          if-no-files-found: warn
+          retention-days: 14
