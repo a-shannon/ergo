@@ -1,0 +1,59 @@
+name: Retained full-block floor invalidation diagnostic
+
+on:
+  push:
+    branches: [feat/pr2630-retained-floor-diagnostic-20261018]
+
+permissions:
+  contents: read
+
+jobs:
+  invalidation:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [candidate, previous-predicate]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Restore only the previous retained-ancestor predicate
+        if: matrix.variant == 'previous-predicate'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/main/scala/org/ergoplatform/nodeView/history/ErgoHistory.scala')
+          source = path.read_bytes()
+          new = b'val noRetainedFullAncestor = invalidatedIds.contains(invalidatedChain.head.id)'
+          old = b'val noRetainedFullAncestor = invalidatedChain.lengthCompare(1) == 0 || (invalidatedChain.head.header.height == GenesisHeight && invalidatedIds.contains(invalidatedChain.head.id))'
+          assert source.count(new) == 1
+          path.write_bytes(source.replace(new, old))
+          PY
+      - name: Exercise invalidation and current startup repair
+        if: matrix.variant == 'candidate'
+        run: >-
+          sbt -Denv=test ++2.12.20
+          "testOnly org.ergoplatform.nodeView.history.VerifyADHistorySpecification org.ergoplatform.nodeView.history.VerifyNonADHistorySpecification org.ergoplatform.nodeView.history.StartupContinuationRepairSpecification"
+      - name: Exercise the two retained-floor boundaries on the previous predicate
+        if: matrix.variant == 'previous-predicate'
+        run: |
+          sbt -Denv=test ++2.12.20 'testOnly org.ergoplatform.nodeView.history.VerifyADHistorySpecification -- -z "retained-floor full block"'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: retained-floor-${{ matrix.variant }}
+          path: target/test-reports/
+          if-no-files-found: warn
