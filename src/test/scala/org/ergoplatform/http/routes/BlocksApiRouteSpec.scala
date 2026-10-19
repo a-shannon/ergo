@@ -1,7 +1,7 @@
 package org.ergoplatform.http.routes
 
 import akka.http.scaladsl.model.{ContentTypes, HttpEntity, StatusCodes, UniversalEntity}
-import akka.http.scaladsl.server.{Directives, Route}
+import akka.http.scaladsl.server.{Directives, MalformedRequestContentRejection, Route}
 import akka.http.scaladsl.testkit.ScalatestRouteTest
 import akka.testkit.TestProbe
 import de.heikoseeberger.akkahttpcirce.FailFastCirceSupport
@@ -61,6 +61,26 @@ class BlocksApiRouteSpec
       val allow = response.headers.find(_.is("allow")).map(_.value()).getOrElse("")
       allow should include ("GET")
       allow should include ("POST")
+    }
+  }
+
+  it should "bound malformed request details while preserving ordinary errors" in {
+    def rejected(message: String): Route =
+      Directives.handleRejections(ApiRejectionHandler.rejectionHandler) {
+        Directives.reject(MalformedRequestContentRejection(message, new IllegalArgumentException(message)))
+      }
+
+    Get(prefix) ~> rejected("ordinary malformed content") ~> check {
+      status shouldBe StatusCodes.BadRequest
+      responseAs[Json].hcursor.get[String]("detail") shouldBe
+        Right("The request content was malformed:\nordinary malformed content")
+    }
+
+    val longMessage = "invalid\u0001" + ("x" * 250)
+    Get(prefix) ~> rejected(longMessage) ~> check {
+      status shouldBe StatusCodes.BadRequest
+      responseAs[Json].hcursor.get[String]("detail") shouldBe
+        Right("The request content was malformed:\n" + "invalid" + ("x" * 193) + "... (truncated)")
     }
   }
 
