@@ -31,6 +31,7 @@ on:
           - blocks-route-fix-v609
           - history-index-join-v609
           - history-repair-join-v609
+          - history-repair-owner-v609
 
 permissions:
   contents: read
@@ -48,7 +49,7 @@ jobs:
         run: |
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
-            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|wallet-deep-rollback|wallet-v609-composition|wallet-registry-addbox-result|blocks-route-v609|blocks-route-fix-v609|history-index-join-v609|history-repair-join-v609) ;;
+            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|wallet-deep-rollback|wallet-v609-composition|wallet-registry-addbox-result|blocks-route-v609|blocks-route-fix-v609|history-index-join-v609|history-repair-join-v609|history-repair-owner-v609) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -457,6 +458,68 @@ jobs:
               total += counts["tests"]
               print(f"{name}: {counts['tests']} passed, required cases present")
           print(f"Composed history repair: {total} tests across {len(expected)} suites")
+          PY
+      - name: Run v6.0.9 history repair owner regressions
+        if: inputs.suite == 'history-repair-owner-v609'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.history.storage.HistoryStorageRemoveSpec org.ergoplatform.nodeView.history.HistoryRepairSpec org.ergoplatform.nodeView.history.StartupContinuationRepairSpecification"
+      - name: Verify v6.0.9 history repair owner execution
+        if: ${{ always() && inputs.suite == 'history-repair-owner-v609' }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          expected = {
+              "org.ergoplatform.nodeView.history.storage.HistoryStorageRemoveSpec": (
+                  "remove propagates an object-store failure without changing caches or indexes",
+                  "remove propagates an index-store failure after invalidating only modifier caches",
+              ),
+              "org.ergoplatform.nodeView.history.HistoryRepairSpec": (
+                  "forgetHeader propagates removal 4 and stops subsequent deletions",
+                  "repair propagates removal 9 without clearing the retry index",
+                  "repair retry finishes after partial progress at removal 9",
+                  "repair retries when object removal commits but index removal 4 fails",
+                  "startup owner propagates removal 9 failure and closes storage",
+                  "UTXO cleanup removes a stored proof before its invalid header",
+              ),
+              "org.ergoplatform.nodeView.history.StartupContinuationRepairSpecification": (
+                  "startup removes stored proof, transactions and extension in UTXO mode",
+                  "startup retains an unknown continuation",
+                  "startup retains a mixed continuation row with a valid sibling",
+              ),
+          }
+          if len(expected) != 3:
+              raise SystemExit("Expected three history repair owner suites")
+          total = 0
+          for name, required in expected.items():
+              report = Path(f"target/test-reports/TEST-{name}.xml")
+              suite = ET.parse(report).getroot()
+              if suite.tag != "testsuite" or suite.attrib.get("name") != name:
+                  raise SystemExit(f"Unexpected test suite in {report}")
+              keys = ("tests", "failures", "errors", "skipped")
+              if any(key not in suite.attrib for key in keys):
+                  raise SystemExit(f"Missing JUnit counts in {report}")
+              counts = {key: int(suite.attrib[key]) for key in keys}
+              cases = suite.findall("testcase")
+              names = [case.attrib.get("name", "") for case in cases]
+              if counts["tests"] < len(required) or len(cases) != counts["tests"]:
+                  raise SystemExit(f"Testcase count mismatch in {report}")
+              if not all(names) or len(names) != len(set(names)):
+                  raise SystemExit(f"Missing or duplicate testcase names in {report}")
+              if any(counts[key] != 0 for key in ("failures", "errors", "skipped")):
+                  raise SystemExit(f"History repair owner suite did not pass: {report}")
+              if any(case.find(tag) is not None for case in cases
+                     for tag in ("failure", "error", "skipped")):
+                  raise SystemExit(f"Failed or skipped testcase in {report}")
+              for phrase in required:
+                  matching = [case_name for case_name in names if phrase in case_name]
+                  if len(matching) != 1:
+                      raise SystemExit(f"Missing or duplicate required case in {report}: {phrase}")
+              total += counts["tests"]
+              print(f"{name}: {counts['tests']} passed, required cases present")
+          print(f"History repair owner: {total} tests across {len(expected)} suites")
           PY
       # NiPoPoW runs use the real history producer, HTTP route and P2P cache consumer.
       - name: Run NiPoPoW producer and HTTP route regressions
