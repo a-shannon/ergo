@@ -26,6 +26,7 @@ on:
           - wallet-deep-rollback
           - wallet-v609-composition
           - wallet-v609-native
+          - wallet-registry-addbox-result
 
 permissions:
   contents: read
@@ -43,7 +44,7 @@ jobs:
         run: |
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
-            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|wallet-deep-rollback|wallet-v609-composition) ;;
+            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|wallet-deep-rollback|wallet-v609-composition|wallet-registry-addbox-result) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -202,6 +203,39 @@ jobs:
                   raise SystemExit(f"Missing required cases in {name}: {sorted(missing)}")
               total += tests
           print(f"Composed wallet regressions: {total} test(s) passed across {len(reports)} suites")
+          PY
+      - name: Run wallet registry AddBox result regression
+        if: inputs.suite == 'wallet-registry-addbox-result'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.wallet.persistence.WalletRegistryWriteResultSpec"
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          name = "org.ergoplatform.nodeView.wallet.persistence.WalletRegistryWriteResultSpec"
+          report = Path(f"target/test-reports/TEST-{name}.xml")
+          suite = ET.parse(report).getroot()
+          if suite.tag != "testsuite" or suite.attrib.get("name") != name:
+              raise SystemExit("Unexpected wallet registry test suite")
+          for key in ("tests", "failures", "errors", "skipped"):
+              if key not in suite.attrib:
+                  raise SystemExit(f"Missing {key} in {report}")
+          tests = int(suite.attrib["tests"])
+          if tests < 24 or any(int(suite.attrib[key]) != 0 for key in ("failures", "errors", "skipped")):
+              raise SystemExit("Wallet registry test suite did not pass")
+          cases = [case.attrib.get("name", "") for case in suite.findall("testcase")]
+          if len(cases) != tests or len(set(cases)) != tests:
+              raise SystemExit("Wallet registry testcase count or names do not match")
+          expected_addbox_cases = {
+              "should reply to AddBox with the registry success",
+              "should reply to AddBox with the registry write failure",
+              "should reply to AddBox with the registry validation failure",
+          }
+          addbox_cases = {case for case in cases if "AddBox" in case}
+          if addbox_cases != expected_addbox_cases:
+              raise SystemExit(f"Unexpected AddBox outcome cases: {sorted(addbox_cases)}")
+          print(f"WalletRegistryWriteResultSpec: {tests} test(s) passed with all AddBox outcomes")
           PY
       # NiPoPoW runs use the real history producer, HTTP route and P2P cache consumer.
       - name: Run NiPoPoW producer and HTTP route regressions
