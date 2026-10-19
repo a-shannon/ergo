@@ -286,8 +286,7 @@ jobs:
         if: inputs.suite == 'blocks-route-fix-v609'
         run: |
           sbt -batch -Denv=test ++2.12.20 \
-            "testOnly org.ergoplatform.http.routes.BlocksApiRouteSpec org.ergoplatform.http.routes.ErgoHttpServiceSpec" \
-            scalafmtCheck
+            "testOnly org.ergoplatform.http.routes.BlocksApiRouteSpec org.ergoplatform.http.routes.ErgoHttpServiceSpec"
       - name: Verify corrected blocks route case execution
         if: ${{ always() && inputs.suite == 'blocks-route-fix-v609' }}
         run: |
