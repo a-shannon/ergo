@@ -4,6 +4,7 @@ import akka.actor.{Actor, ActorRef, ActorSystem, Props, Status}
 import akka.pattern.ask
 import akka.testkit.{TestActorRef, TestProbe}
 import akka.util.{ByteString, Timeout}
+import com.google.common.hash.BloomFilter
 import com.google.common.primitives.Ints
 import org.ergoplatform._
 import org.ergoplatform.ErgoBox.R1
@@ -969,11 +970,13 @@ class ErgoWalletSpec extends ErgoCorePropertyTest with WalletTestOps with Mempoo
         val initial = ErgoWalletState.initial(scanSettings, parameters).get
         implicit val actorSystem: akka.actor.ActorSystem = w.actorSystem
         var completedScans = 0
+        var startupOutputsFilter: Option[BloomFilter[Array[Byte]]] = None
         val observingService = new ErgoWalletServiceImpl(scanSettings) {
           override def readWallet(state: ErgoWalletState,
                                   mnemonic: Option[SecretString],
                                   keys: Option[Int],
-                                  storage: SecretStorageSettings): ErgoWalletState = state
+                                  storage: SecretStorageSettings): ErgoWalletState =
+            state.copy(outputsFilter = startupOutputsFilter)
 
           override def scanBlockUpdate(state: ErgoWalletState,
                                        block: ErgoFullBlock,
@@ -988,17 +991,19 @@ class ErgoWalletSpec extends ErgoCorePropertyTest with WalletTestOps with Mempoo
         completedScans = 0
         scanned.registry.allUnspentBoxes() shouldBe empty
         scanned.outputsFilter.get.mightContain(box.id) shouldBe false
-        val loaded = if (warmFilter) scanned else scanned.copy(outputsFilter = None)
+        startupOutputsFilter = if (warmFilter) scanned.outputsFilter else None
+        initial.registry.close()
+        initial.storage.close()
         val actor = TestActorRef(new ErgoWalletActor(
-          scanSettings, parameters, observingService, null, getHistory) {
-          override def preStart(): Unit = ()
-        })
+          scanSettings, parameters, observingService, null, getHistory))
         val reader = new ErgoWalletReader {
           override val walletActor: ActorRef = actor
         }
         val scanId = ScanId @@ 100.toShort
         try {
-          actor ! ReadWallet(loaded)
+          eventually {
+            await(actor ? GetWalletStatus).asInstanceOf[WalletStatus].error shouldBe None
+          }
           await(reader.addBox(box, Set(scanId))).status.get
           await(reader.scanUnspentBoxes(scanId, false, 0, Int.MaxValue))
             .map(_.trackedBox.boxId) shouldBe Seq(scorex.util.bytesToId(box.id))
@@ -1020,9 +1025,7 @@ class ErgoWalletSpec extends ErgoCorePropertyTest with WalletTestOps with Mempoo
           spent.head.spendingHeightOpt shouldBe Some(spendingBlock.height)
           spent.head.spendingTxIdOpt shouldBe Some(spend.id)
         } finally {
-          actorSystem.stop(actor)
-          initial.registry.close()
-          initial.storage.close()
+          actor ! CloseWallet
         }
       }
     }
