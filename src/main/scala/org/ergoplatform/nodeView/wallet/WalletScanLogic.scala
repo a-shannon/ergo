@@ -96,8 +96,7 @@ object WalletScanLogic extends ScorexLogging {
     // determine reward maturity without delaying already mature rewards.
     val miningBoxes = registry.unspentBoxes(MiningScanId).filter(_.box.creationHeight <= maxMiningHeight)
     val resolvedBoxes = miningBoxes.map { tb =>
-      registry.removeScan(tb.box.id, MiningScanId)
-      tb.copy(scans = Set(PaymentsScanId))
+      tb.copy(scans = (tb.scans - MiningScanId) + PaymentsScanId)
     }
 
     val initialScanResults = ScanResults(resolvedBoxes, ArraySeq.empty, ArraySeq.empty)
@@ -142,8 +141,9 @@ object WalletScanLogic extends ScorexLogging {
             val inpId = inp.boxId
 
             unspentBoxes.get(bytesToId(inpId)).flatMap { _ =>
-              registry.getBox(inpId)
-                .orElse(scanResults.outputs.find(tb => tb.box.id.sameElements(inpId)))
+              // Prefer this block's association changes to the preceding registry state.
+              scanResults.outputs.find(tb => tb.box.id.sameElements(inpId))
+                .orElse(registry.getBox(inpId))
             }
           }
         } else {
@@ -169,7 +169,7 @@ object WalletScanLogic extends ScorexLogging {
     }
 
     // function effects: updating registry and offchainRegistry datasets
-    registry.updateOnBlock(scanRes, blockId, height)
+    registry.updateOnBlock(scanRes, blockId, height, miningBoxes)
       .map { _ =>
         //data needed to update the offchain-registry
         val walletUnspent = registry.walletUnspentBoxes()

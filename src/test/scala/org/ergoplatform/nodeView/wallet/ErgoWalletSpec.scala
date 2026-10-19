@@ -2,7 +2,7 @@ package org.ergoplatform.nodeView.wallet
 
 import akka.actor.{Actor, ActorRef, ActorSystem, Props, Status}
 import akka.pattern.ask
-import akka.testkit.TestProbe
+import akka.testkit.{TestActorRef, TestProbe}
 import akka.util.{ByteString, Timeout}
 import com.google.common.primitives.Ints
 import org.ergoplatform._
@@ -30,6 +30,7 @@ import org.ergoplatform.sdk.wallet.secrets.PrimitiveSecretKey
 import org.ergoplatform.sdk.SecretString
 import org.ergoplatform.serialization.ManifestSerializer
 import org.ergoplatform.settings.{Algos, Parameters}
+import org.ergoplatform.wallet.settings.SecretStorageSettings
 import org.ergoplatform.utils._
 import org.ergoplatform.utils.fixtures.WalletFixture
 import org.ergoplatform.wallet.boxes.BoxSelector.MinBoxValue
@@ -943,6 +944,87 @@ class ErgoWalletSpec extends ErgoCorePropertyTest with WalletTestOps with Mempoo
 
     withSeededWalletStorage(ordinarySettings, directory) { storage =>
       storage.readWalletRollbackIntentTry().get shouldBe None
+    }
+  }
+
+  for (warmFilter <- Seq(true, false)) {
+    property(s"manually tracked boxes are spent through the actor with warm filter $warmFilter") {
+      withFixture { implicit w =>
+        val fundingBlock = makeGenesisBlock(getPublicKeys.head.pubkey)
+        applyBlock(fundingBlock) shouldBe 'success
+        implicit val patienceConfig: PatienceConfig = PatienceConfig(5.seconds, 100.millis)
+        eventually {
+          getConfirmedBalances.height shouldBe fundingBlock.height
+        }
+        val box = boxesAvailable(fundingBlock, getPublicKeys.head.pubkey).head
+        val payment = PaymentRequest(Pay2SAddress(TrueTree), box.value, Array.empty, Map.empty)
+        val spend = await(wallet.generateTransaction(
+          Seq(payment), Seq(Base16.encode(ErgoBoxSerializer.toBytes(box))))).get
+        spend.inputs.map(_.boxId.toSeq) should contain(box.id.toSeq)
+        val spendingBlock = makeNextBlock(getUtxoState, Seq(spend))
+        // A second wallet has no automatic rule for the already-created box.
+        val scanSettings = w.settings.copy(
+          directory = new java.io.File(w.nodeViewDir, "manual-box-wallet").getPath,
+          walletSettings = w.settings.walletSettings.copy(keepSpentBoxes = true))
+        val initial = ErgoWalletState.initial(scanSettings, parameters).get
+        implicit val actorSystem: akka.actor.ActorSystem = w.actorSystem
+        var completedScans = 0
+        val observingService = new ErgoWalletServiceImpl(scanSettings) {
+          override def readWallet(state: ErgoWalletState,
+                                  mnemonic: Option[SecretString],
+                                  keys: Option[Int],
+                                  storage: SecretStorageSettings): ErgoWalletState = state
+
+          override def scanBlockUpdate(state: ErgoWalletState,
+                                       block: ErgoFullBlock,
+                                       dustLimit: Option[Long]): Try[ErgoWalletState] = {
+            super.scanBlockUpdate(state, block, dustLimit).map { updated =>
+              completedScans += 1
+              updated
+            }
+          }
+        }
+        val scanned = observingService.scanBlockUpdate(initial, fundingBlock, None).get
+        completedScans = 0
+        scanned.registry.allUnspentBoxes() shouldBe empty
+        scanned.outputsFilter.get.mightContain(box.id) shouldBe false
+        val loaded = if (warmFilter) scanned else scanned.copy(outputsFilter = None)
+        val actor = TestActorRef(new ErgoWalletActor(
+          scanSettings, parameters, observingService, null, getHistory) {
+          override def preStart(): Unit = ()
+        })
+        val reader = new ErgoWalletReader {
+          override val walletActor: ActorRef = actor
+        }
+        val scanId = ScanId @@ 100.toShort
+        try {
+          actor ! ReadWallet(loaded)
+          await(reader.addBox(box, Set(scanId))).status.get
+          await(reader.scanUnspentBoxes(scanId, false, 0, Int.MaxValue))
+            .map(_.trackedBox.boxId) shouldBe Seq(scorex.util.bytesToId(box.id))
+          applyBlock(spendingBlock) shouldBe 'success
+          eventually {
+            getConfirmedBalances.height shouldBe spendingBlock.height
+          }
+          getUtxoState.boxById(box.id) shouldBe None
+          actor ! ScanOnChain(spendingBlock)
+          // TestActorRef completes the real handler synchronously; the read also
+          // acknowledges the advanced checkpoint before negative assertions.
+          completedScans shouldBe 1
+          await(reader.confirmedBalances).height shouldBe spendingBlock.height
+          withClue("manual box spend missing after acknowledged scan: ") {
+            await(reader.scanUnspentBoxes(scanId, false, 0, Int.MaxValue)) shouldBe empty
+          }
+          val spent = await(reader.scanSpentBoxes(scanId)).map(_.trackedBox)
+          spent.map(_.boxId) shouldBe Seq(scorex.util.bytesToId(box.id))
+          spent.head.spendingHeightOpt shouldBe Some(spendingBlock.height)
+          spent.head.spendingTxIdOpt shouldBe Some(spend.id)
+        } finally {
+          actorSystem.stop(actor)
+          initial.registry.close()
+          initial.storage.close()
+        }
+      }
     }
   }
 

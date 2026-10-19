@@ -3753,8 +3753,13 @@ class ErgoWalletActor(settings: ErgoSettings,
         fail("Box tracking is unavailable while UTXO snapshot progress is unresolved"))
 
     case AddBox(box: ErgoBox, scanIds: Set[ScanId]) =>
-      state.registry.updateScans(scanIds, box)
-      sender() ! AddBoxResponse(Success(())) // todo: what is the reasoning behind returning always success?
+      val result = state.registry.updateScans(scanIds, box)
+      result.foreach { _ =>
+        if (scanIds.nonEmpty) {
+          state.outputsFilter.foreach(_.put(box.id))
+        }
+      }
+      sender() ! AddBoxResponse(result)
 
     case StopTracking(_, _) if hasPendingUtxoSnapshotScan(state) =>
       sender() ! StopTrackingResponse(
