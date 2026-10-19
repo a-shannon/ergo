@@ -1,6 +1,7 @@
 package org.ergoplatform.http.routes
 
 import akka.http.scaladsl.model.{ContentTypes, HttpEntity, StatusCodes, UniversalEntity}
+import akka.http.scaladsl.model.headers.RawHeader
 import akka.http.scaladsl.server.{Directives, Route}
 import akka.http.scaladsl.testkit.ScalatestRouteTest
 import akka.testkit.TestProbe
@@ -12,14 +13,18 @@ import org.ergoplatform.modifiers.ErgoFullBlock
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.NewBlockMined
 import org.ergoplatform.nodeView.LocallyGeneratedModifier
+import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.ResetBlockchainTo
 import org.ergoplatform.settings.Algos
 import org.ergoplatform.utils.Stubs
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import scorex.core.api.http.ApiRejectionHandler
+import scorex.crypto.hash.Blake2b256
 import scorex.util.ModifierId
 
+import scala.concurrent.{Await, Future}
 import scala.concurrent.duration.DurationInt
+import scala.util.Success
 
 class BlocksApiRouteSpec
   extends AnyFlatSpec
@@ -38,6 +43,23 @@ class BlocksApiRouteSpec
     Directives.handleRejections(ApiRejectionHandler.rejectionHandler) {
       route
     }
+
+  private val resetApiKey = "fixture-only-reset-key"
+  private val resetAuthSettings = settings.copy(
+    scorexSettings = settings.scorexSettings.copy(
+      restApi = settings.scorexSettings.restApi.copy(
+        apiKeyHash = Some(Algos.encoder.encode(Blake2b256(resetApiKey)))
+      )
+    )
+  )
+
+  private def resetAuthRoute(probe: TestProbe): Route =
+    Directives.handleRejections(ApiRejectionHandler.rejectionHandler) {
+      BlocksApiRoute(probe.ref, digestReadersRef, resetAuthSettings).route
+    }
+
+  private def resetRequestEntity: UniversalEntity =
+    HttpEntity(Map("height" -> 0).asJson.toString).withContentType(ContentTypes.`application/json`)
 
   val headerIdBytes: ModifierId = history.lastHeaders(1).headers.head.id
   val headerIdString: String    = Algos.encode(headerIdBytes)
@@ -246,6 +268,44 @@ class BlocksApiRouteSpec
       val detail = response.hcursor.get[String]("detail").getOrElse("")
       detail should include("higher than current height")
     }
+  }
+
+  it should "forbid reset without the configured API key before dispatch" in {
+    val probe = TestProbe()
+
+    Post(prefix + "/reset", resetRequestEntity) ~> resetAuthRoute(probe) ~> check {
+      status shouldBe StatusCodes.Forbidden
+    }
+    probe.expectNoMessage(200.millis)
+  }
+
+  it should "forbid reset with the wrong API key before dispatch" in {
+    val probe = TestProbe()
+
+    Post(prefix + "/reset", resetRequestEntity)
+      .addHeader(RawHeader("api_key", "fixture-only-wrong-key")) ~> resetAuthRoute(probe) ~> check {
+      status shouldBe StatusCodes.Forbidden
+    }
+    probe.expectNoMessage(200.millis)
+  }
+
+  it should "dispatch one reset with the configured API key" in {
+    val probe = TestProbe()
+    val reply = Future {
+      probe.expectMsg(ResetBlockchainTo(0))
+      probe.reply(Success("fixture reset accepted"))
+    }(system.dispatcher)
+
+    Post(prefix + "/reset", resetRequestEntity)
+      .addHeader(RawHeader("api_key", resetApiKey)) ~> resetAuthRoute(probe) ~> check {
+      status shouldBe StatusCodes.OK
+      val response = responseAs[Json]
+      response.hcursor.get[Boolean]("success") shouldBe Right(true)
+      response.hcursor.get[Int]("resetHeight") shouldBe Right(0)
+      response.hcursor.get[String]("message") shouldBe Right("fixture reset accepted")
+    }
+    Await.result(reply, 5.seconds)
+    probe.expectNoMessage(200.millis)
   }
 
   it should "invalidate block transactions, reset to deeper block, and re-apply blocks as valid" in {
