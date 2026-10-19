@@ -23,6 +23,7 @@ on:
           - nipopow-producer
           - nipopow-validation
           - nipopow-validation-remainder
+          - wallet-deep-rollback
 
 permissions:
   contents: read
@@ -39,7 +40,7 @@ jobs:
         run: |
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
-            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder) ;;
+            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|wallet-deep-rollback) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -47,6 +48,7 @@ jobs:
         with:
           ref: ${{ inputs.source_commit }}
           fetch-depth: 0
+          persist-credentials: false
       - name: Confirm tested commit
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
@@ -121,6 +123,28 @@ jobs:
             "testOnly org.ergoplatform.nodeView.mempool.AppliedTransactionConflictsSpec" \
             "testOnly org.ergoplatform.nodeView.mempool.ErgoMemPoolSpec" \
             "testOnly org.ergoplatform.nodeView.mempool.OrderedTxPoolSpec"
+      - name: Run deep rollback integration regression
+        if: inputs.suite == 'wallet-deep-rollback'
+        run: |
+          mkdir -p tmp
+          TMPDIR="$PWD/tmp" sbt -Denv=test clean ++2.12.20 docker \
+            'it:testOnly org.ergoplatform.it.DeepRollBackSpec'
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          report = Path("target/it-reports/TEST-org.ergoplatform.it.DeepRollBackSpec.xml")
+          suite = ET.parse(report).getroot()
+          if suite.attrib.get("name") != "org.ergoplatform.it.DeepRollBackSpec":
+              raise SystemExit("Unexpected integration suite")
+          for key in ("tests", "failures", "errors", "skipped"):
+              if key not in suite.attrib:
+                  raise SystemExit(f"Missing {key} in integration report")
+          tests = int(suite.attrib["tests"])
+          if tests < 1 or any(int(suite.attrib[key]) != 0 for key in ("failures", "errors", "skipped")):
+              raise SystemExit("DeepRollBackSpec did not pass")
+          print(f"DeepRollBackSpec: {tests} test(s) passed")
+          PY
       # NiPoPoW runs use the real history producer, HTTP route and P2P cache consumer.
       - name: Run NiPoPoW producer and HTTP route regressions
         if: inputs.suite == 'nipopow-producer'
@@ -154,6 +178,7 @@ jobs:
           name: focused-${{ inputs.suite }}-${{ inputs.source_commit }}
           path: |
             target/test-reports/
+            target/it-reports/
             ergo-core/target/test-reports/
           if-no-files-found: warn
           retention-days: 7
