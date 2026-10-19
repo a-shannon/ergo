@@ -27,6 +27,7 @@ on:
           - wallet-v609-composition
           - wallet-v609-native
           - wallet-registry-addbox-result
+          - blocks-route-v609
 
 permissions:
   contents: read
@@ -44,7 +45,7 @@ jobs:
         run: |
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
-            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|wallet-deep-rollback|wallet-v609-composition|wallet-registry-addbox-result) ;;
+            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|wallet-deep-rollback|wallet-v609-composition|wallet-registry-addbox-result|blocks-route-v609) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -236,6 +237,49 @@ jobs:
           if addbox_cases != expected_addbox_cases:
               raise SystemExit(f"Unexpected AddBox outcome cases: {sorted(addbox_cases)}")
           print(f"WalletRegistryWriteResultSpec: {tests} test(s) passed with all AddBox outcomes")
+          PY
+      - name: Run v6.0.9 blocks route contract
+        if: inputs.suite == 'blocks-route-v609'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.http.routes.BlocksApiRouteSpec"
+      - name: Verify blocks route case execution
+        if: ${{ always() && inputs.suite == 'blocks-route-v609' }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          name = "org.ergoplatform.http.routes.BlocksApiRouteSpec"
+          report = Path(f"target/test-reports/TEST-{name}.xml")
+          suite = ET.parse(report).getroot()
+          if suite.tag != "testsuite" or suite.attrib.get("name") != name:
+              raise SystemExit("Unexpected blocks route test suite")
+          for key in ("tests", "failures", "errors", "skipped"):
+              if key not in suite.attrib:
+                  raise SystemExit(f"Missing {key} in {report}")
+          cases = suite.findall("testcase")
+          if len(cases) != int(suite.attrib["tests"]):
+              raise SystemExit("Blocks route testcase count does not match")
+          expected = {
+              "should return method not allowed for PUT /blocks",
+              "should not submit a valid block at an unknown sub-path",
+              "should reject an unknown suffix after a known block id",
+          }
+          found = {}
+          for case in cases:
+              case_name = case.attrib.get("name", "")
+              if case_name in expected:
+                  if case_name in found or case.find("skipped") is not None:
+                      raise SystemExit(f"Duplicate or skipped blocks route case: {case_name}")
+                  found[case_name] = case
+          if set(found) != expected:
+              raise SystemExit(f"Missing blocks route cases: {sorted(expected - set(found))}")
+          for case_name in sorted(expected):
+              case = found[case_name]
+              outcome = ("error" if case.find("error") is not None else
+                         "failure" if case.find("failure") is not None else "passed")
+              print(f"{case_name}: {outcome}")
           PY
       # NiPoPoW runs use the real history producer, HTTP route and P2P cache consumer.
       - name: Run NiPoPoW producer and HTTP route regressions
