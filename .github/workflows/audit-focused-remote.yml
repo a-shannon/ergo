@@ -289,7 +289,7 @@ jobs:
       - name: Validate exact source identity
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
-        run: test "$SOURCE_COMMIT" = '6daeeab0c2f0ed731deb368f06c8d4585842176c'
+        run: test "$SOURCE_COMMIT" = '427d735e965b25dfbc335380d5ebcfac539545ab'
       - name: Checkout exact source
         uses: actions/checkout@v7
         with:
@@ -370,7 +370,7 @@ jobs:
       - name: Validate exact source identity
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
-        run: test "$SOURCE_COMMIT" = '6daeeab0c2f0ed731deb368f06c8d4585842176c'
+        run: test "$SOURCE_COMMIT" = '427d735e965b25dfbc335380d5ebcfac539545ab'
       - name: Checkout exact source
         uses: actions/checkout@v7
         with:
@@ -447,7 +447,7 @@ jobs:
       - name: Validate exact source identity
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
-        run: test "$SOURCE_COMMIT" = '6daeeab0c2f0ed731deb368f06c8d4585842176c'
+        run: test "$SOURCE_COMMIT" = '427d735e965b25dfbc335380d5ebcfac539545ab'
       - name: Checkout exact source
         uses: actions/checkout@v7
         with:
@@ -524,7 +524,7 @@ jobs:
       - name: Validate exact source identity
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
-        run: test "$SOURCE_COMMIT" = '6daeeab0c2f0ed731deb368f06c8d4585842176c'
+        run: test "$SOURCE_COMMIT" = '427d735e965b25dfbc335380d5ebcfac539545ab'
       - name: Checkout exact source
         uses: actions/checkout@v7
         with:
