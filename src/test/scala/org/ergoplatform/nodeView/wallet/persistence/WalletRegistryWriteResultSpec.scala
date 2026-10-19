@@ -1,14 +1,18 @@
 package org.ergoplatform.nodeView.wallet.persistence
 
+import akka.actor.ActorRef
 import akka.testkit.{TestActorRef, TestKit, TestProbe}
 import org.ergoplatform.ErgoBoxCandidate
 import org.ergoplatform.db.DBSpec
-import org.ergoplatform.nodeView.wallet.ErgoWalletActorMessages.{AddBox, AddBoxResponse, ReadWallet}
+import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{CurrentWalletView, RequestCurrentWalletView}
+import org.ergoplatform.nodeView.state.{ErgoStateContext, ErgoStateReader}
+import org.ergoplatform.nodeView.wallet.ErgoWalletActorMessages.{AddBox, AddBoxResponse, GetWalletStatus, WalletStatus}
 import org.ergoplatform.nodeView.wallet.WalletScanLogic.{ScanResults, SpentInputData}
-import org.ergoplatform.nodeView.wallet.{ErgoWalletActor, ErgoWalletServiceImpl, ErgoWalletState, WalletCache, WalletVars}
+import org.ergoplatform.nodeView.wallet.{ErgoWalletActor, ErgoWalletServiceImpl, ErgoWalletState, WalletCache}
 import org.ergoplatform.sdk.SecretString
 import org.ergoplatform.settings.Constants.TrueTree
 import org.ergoplatform.utils.ErgoNodeTestConstants.{extendedParameters, settings}
+import org.ergoplatform.utils.MempoolTestHelpers
 import org.ergoplatform.wallet.Constants.{MiningScanId, PaymentsScanId, ScanId}
 import org.ergoplatform.wallet.boxes.TrackedBox
 import org.ergoplatform.wallet.settings.SecretStorageSettings
@@ -18,9 +22,11 @@ import scorex.db.LDBVersionedStore
 import scorex.testkit.utils.AkkaFixture
 import scorex.util.bytesToId
 
+import java.lang.reflect.{InvocationHandler, Method, Proxy}
+import scala.concurrent.duration._
 import scala.util.{Failure, Success, Try}
 
-class WalletRegistryWriteResultSpec extends AnyFlatSpec with Matchers with DBSpec {
+class WalletRegistryWriteResultSpec extends AnyFlatSpec with Matchers with DBSpec with MempoolTestHelpers {
   info(s"Registry persistence backend: ${scorex.db.LDBFactory.factory.asInstanceOf[scorex.db.StoreRegistry].factory.getClass.getName}")
   private val appScan = ScanId @@ 11.toShort
   private val nextScan = ScanId @@ 12.toShort
@@ -223,20 +229,57 @@ class WalletRegistryWriteResultSpec extends AnyFlatSpec with Matchers with DBSpe
     it should s"reply to AddBox with the registry $outcome" in withRegistry() { (store, registry) =>
       val fixture = new AkkaFixture
       implicit val system = fixture.system
+      val walletDirectory = createTempDir.getAbsolutePath
+      val actorSettings = settings.copy(
+        directory = walletDirectory,
+        walletSettings = settings.walletSettings.copy(
+          testMnemonic = None,
+          secretStorage = settings.walletSettings.secretStorage.copy(
+            secretDir = s"$walletDirectory/wallet/keystore")),
+        nodeSettings = settings.nodeSettings.copy(
+          utxoSettings = settings.nodeSettings.utxoSettings.copy(utxoBootstrap = false)))
+      store.update(WalletRegistry.PreGenesisStateVersion,
+        Seq.empty[Array[Byte]], Seq.empty[(Array[Byte], Array[Byte])]).get
       val outputsFilter = WalletCache.emptyFilter(settings.walletSettings.walletProfile.outputsFilterSize)
       outputsFilter.mightContain(box.id) shouldBe false
-      val state = ErgoWalletState(null, None, registry, OffChainRegistry.empty, Some(outputsFilter),
-        WalletVars(None, Seq.empty), None, None, None, extendedParameters, 10, rescanInProgress = false)
-      val service = new ErgoWalletServiceImpl(settings) {
+      val stateContext = ErgoStateContext.empty(actorSettings.chainSettings, extendedParameters)
+      val stateReader = Proxy.newProxyInstance(
+        classOf[ErgoStateReader].getClassLoader,
+        Array(classOf[ErgoStateReader]),
+        new InvocationHandler {
+          override def invoke(proxy: Any, method: Method, args: Array[AnyRef]): AnyRef =
+            method.getName match {
+              case "stateContext" => stateContext
+              case "toString" => "registry-write-result-state-reader"
+              case "hashCode" => Int.box(System.identityHashCode(proxy))
+              case "equals" => Boolean.box(proxy.asInstanceOf[AnyRef] eq args(0))
+              case other => throw new UnsupportedOperationException(s"Unexpected state read: $other")
+            }
+        }).asInstanceOf[ErgoStateReader]
+      var openedStorage: Option[WalletStorage] = None
+      val service = new ErgoWalletServiceImpl(actorSettings) {
         override def readWallet(state: ErgoWalletState, mnemonic: Option[SecretString],
-                                keys: Option[Int], storage: SecretStorageSettings): ErgoWalletState = state
+                                keys: Option[Int], storage: SecretStorageSettings): ErgoWalletState = {
+          openedStorage = Some(state.storage)
+          state.registry.close()
+          state.copy(registry = registry, offChainRegistry = OffChainRegistry.empty,
+            outputsFilter = Some(outputsFilter))
+        }
       }
-      val actor = TestActorRef(new ErgoWalletActor(settings, extendedParameters, service, null, null) {
-        override def preStart(): Unit = ()
+      val viewRequests = TestProbe()
+      system.eventStream.subscribe(viewRequests.ref, classOf[RequestCurrentWalletView])
+      val actor = TestActorRef(new ErgoWalletActor(actorSettings, extendedParameters, service, null, null) {
+        override protected[wallet] def createUtxoSnapshotScanner(): ActorRef = system.deadLetters
       })
       try {
         val probe = TestProbe()
-        actor ! ReadWallet(state)
+        val request = viewRequests.expectMsgType[RequestCurrentWalletView]
+        request.replyTo ! CurrentWalletView(
+          request.requestId, stateReader, new FakeMempool(Seq.empty), appliedSnapshot = None)
+        probe.awaitAssert({
+          probe.send(actor, GetWalletStatus)
+          probe.expectMsgType[WalletStatus].error shouldBe None
+        }, 5.seconds, 100.millis)
         store.rejectWrites = outcome == "write failure"
         val scans = if (outcome == "validation failure") Set.empty[ScanId] else Set(appScan)
         actor.tell(AddBox(box, scans), probe.ref)
@@ -257,6 +300,7 @@ class WalletRegistryWriteResultSpec extends AnyFlatSpec with Matchers with DBSpe
       } finally {
         system.stop(actor)
         TestKit.shutdownActorSystem(system)
+        openedStorage.foreach(_.close())
       }
     }
   }
