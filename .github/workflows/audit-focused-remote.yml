@@ -24,6 +24,7 @@ on:
           - nipopow-validation
           - nipopow-validation-remainder
           - wallet-deep-rollback
+          - wallet-v609-composition
 
 permissions:
   contents: read
@@ -40,7 +41,7 @@ jobs:
         run: |
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
-            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|wallet-deep-rollback) ;;
+            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|wallet-deep-rollback|wallet-v609-composition) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -145,6 +146,61 @@ jobs:
               raise SystemExit("DeepRollBackSpec did not pass")
           print(f"DeepRollBackSpec: {tests} test(s) passed")
           PY
+      - name: Run v6.0.9 composed wallet regressions
+        if: inputs.suite == 'wallet-v609-composition'
+        run: |
+          mkdir -p tmp
+          TMPDIR="$PWD/tmp" sbt -batch -Denv=test ++2.12.20 \
+            "ergoWallet/testOnly org.ergoplatform.wallet.secrets.JsonSecretStoragePersistenceSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.ErgoWalletServiceSpec org.ergoplatform.nodeView.wallet.ErgoWalletSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.WalletScanLogicSpec org.ergoplatform.nodeView.wallet.persistence.WalletRegistrySpec" \
+            "testOnly org.ergoplatform.nodeView.history.storage.modifierprocessors.UtxoBootstrapToDownloadSpecification org.ergoplatform.nodeView.viewholder.ChainSwitchMempoolSpec"
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          reports = {
+              "org.ergoplatform.wallet.secrets.JsonSecretStoragePersistenceSpec": Path("ergo-wallet/target/test-reports/TEST-org.ergoplatform.wallet.secrets.JsonSecretStoragePersistenceSpec.xml"),
+              "org.ergoplatform.nodeView.wallet.ErgoWalletServiceSpec": Path("target/test-reports/TEST-org.ergoplatform.nodeView.wallet.ErgoWalletServiceSpec.xml"),
+              "org.ergoplatform.nodeView.wallet.ErgoWalletSpec": Path("target/test-reports/TEST-org.ergoplatform.nodeView.wallet.ErgoWalletSpec.xml"),
+              "org.ergoplatform.nodeView.wallet.WalletScanLogicSpec": Path("target/test-reports/TEST-org.ergoplatform.nodeView.wallet.WalletScanLogicSpec.xml"),
+              "org.ergoplatform.nodeView.wallet.persistence.WalletRegistrySpec": Path("target/test-reports/TEST-org.ergoplatform.nodeView.wallet.persistence.WalletRegistrySpec.xml"),
+              "org.ergoplatform.nodeView.history.storage.modifierprocessors.UtxoBootstrapToDownloadSpecification": Path("target/test-reports/TEST-org.ergoplatform.nodeView.history.storage.modifierprocessors.UtxoBootstrapToDownloadSpecification.xml"),
+              "org.ergoplatform.nodeView.viewholder.ChainSwitchMempoolSpec": Path("target/test-reports/TEST-org.ergoplatform.nodeView.viewholder.ChainSwitchMempoolSpec.xml"),
+          }
+          required_cases = {
+              "org.ergoplatform.nodeView.wallet.ErgoWalletSpec": {
+                  "reuse one actor-minted run for duplicate snapshot events and fence stale lifecycle messages",
+                  "mint unique UTXO snapshot run tokens across wallet actor incarnations",
+                  "fresh snapshot recovery installs each deferred registry and preserves the durable fence",
+                  "quarantine startup catch-up when the next wallet block was pruned",
+              },
+              "org.ergoplatform.nodeView.wallet.WalletScanLogicSpec": {
+                  "mining maturity does not credit an existing payment association twice",
+              },
+          }
+          if len(reports) != 7:
+              raise SystemExit("Expected seven composed-wallet suites")
+          total = 0
+          for name, report in reports.items():
+              suite = ET.parse(report).getroot()
+              if suite.tag != "testsuite" or suite.attrib.get("name") != name:
+                  raise SystemExit(f"Unexpected test suite in {report}")
+              for key in ("tests", "failures", "errors", "skipped"):
+                  if key not in suite.attrib:
+                      raise SystemExit(f"Missing {key} in {report}")
+              tests = int(suite.attrib["tests"])
+              if tests < 1 or any(int(suite.attrib[key]) != 0 for key in ("failures", "errors", "skipped")):
+                  raise SystemExit(f"Test suite did not pass: {name}")
+              cases = {case.attrib["name"] for case in suite.findall("testcase")}
+              if len(cases) != tests:
+                  raise SystemExit(f"Test count mismatch in {report}")
+              missing = required_cases.get(name, set()) - cases
+              if missing:
+                  raise SystemExit(f"Missing required cases in {name}: {sorted(missing)}")
+              total += tests
+          print(f"Composed wallet regressions: {total} test(s) passed across {len(reports)} suites")
+          PY
       # NiPoPoW runs use the real history producer, HTTP route and P2P cache consumer.
       - name: Run NiPoPoW producer and HTTP route regressions
         if: inputs.suite == 'nipopow-producer'
@@ -180,5 +236,6 @@ jobs:
             target/test-reports/
             target/it-reports/
             ergo-core/target/test-reports/
+            ergo-wallet/target/test-reports/
           if-no-files-found: warn
           retention-days: 7
