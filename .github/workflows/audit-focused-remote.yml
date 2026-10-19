@@ -411,13 +411,20 @@ jobs:
               ),
               "org.ergoplatform.nodeView.history.HistoryRepairSpec": (
                   "forgetHeader propagates removal 1 and stops subsequent deletions",
+                  "forgetHeader propagates removal 4 and stops subsequent deletions",
                   "repair propagates removal 7 without clearing the retry index",
-                  "repair retries when object removal commits but index removal 3 fails",
-                  "startup owner propagates removal 7 failure and closes storage",
+                  "repair propagates removal 9 without clearing the retry index",
+                  "repair retry finishes after partial progress at removal 9",
+                  "repair retries when object removal commits but index removal 4 fails",
+                  "startup owner propagates removal 9 failure and closes storage",
                   "startup preserves the repair error when closing storage also fails",
+                  "UTXO cleanup removes a stored proof before its invalid header",
               ),
               "org.ergoplatform.nodeView.history.StartupContinuationRepairSpecification": (
                   "startup removes a continuation row left behind by interrupted header cleanup",
+                  "startup removes stored proof, transactions and extension in UTXO mode",
+                  "startup retains an unknown continuation",
+                  "startup retains a mixed continuation row with a valid sibling",
               ),
           }
           if len(expected) != 5:
