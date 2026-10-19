@@ -25,12 +25,14 @@ on:
           - nipopow-validation-remainder
           - wallet-deep-rollback
           - wallet-v609-composition
+          - wallet-v609-native
 
 permissions:
   contents: read
 
 jobs:
   focused:
+    if: inputs.suite != 'wallet-v609-native'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -237,5 +239,325 @@ jobs:
             target/it-reports/
             ergo-core/target/test-reports/
             ergo-wallet/target/test-reports/
+          if-no-files-found: warn
+          retention-days: 7
+
+  native_wallet:
+    if: inputs.suite == 'wallet-v609-native'
+    name: Native wallet tests (${{ matrix.scala }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        scala: ['2.13.18', '2.12.20']
+    steps:
+      - name: Validate exact source identity
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: test "$SOURCE_COMMIT" = '6daeeab0c2f0ed731deb368f06c8d4585842176c'
+      - name: Checkout exact source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Confirm tested commit
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Run native wallet tests
+        shell: bash
+        run: |
+          set +e
+          sbt ++${{ matrix.scala }} ergoWallet/test > "$RUNNER_TEMP/native-wallet.log" 2>&1
+          result=$?
+          echo "sbt exit status: $result"
+          exit "$result"
+      - name: Verify JUnit results
+        if: always()
+        env:
+          REPORT_DIR: ergo-wallet/target/test-reports
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          reports = list(Path(os.environ['REPORT_DIR']).glob('TEST-*.xml'))
+          if not reports:
+              raise SystemExit('No wallet JUnit XML reports')
+          counts = {key: 0 for key in ('tests', 'failures', 'errors', 'skipped')}
+          for report in reports:
+              suite = ET.parse(report).getroot()
+              if suite.tag != 'testsuite':
+                  raise SystemExit('Unexpected wallet JUnit XML root')
+              for key in counts:
+                  if key not in suite.attrib:
+                      raise SystemExit(f'Missing {key} in {report}')
+                  counts[key] += int(suite.attrib[key])
+          print(f"Wallet XML: {len(reports)} suites, {counts}")
+          if counts['tests'] < 91 or counts['skipped'] > 0 or counts['failures'] or counts['errors']:
+              raise SystemExit('Wallet JUnit results failed')
+          PY
+      - name: Retain wallet XML reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-wallet-${{ matrix.scala }}-${{ inputs.source_commit }}
+          path: ergo-wallet/target/test-reports/TEST-*.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  native_core:
+    if: inputs.suite == 'wallet-v609-native'
+    name: Native core tests (${{ matrix.scala }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        scala: ['2.13.18', '2.12.20']
+    steps:
+      - name: Validate exact source identity
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: test "$SOURCE_COMMIT" = '6daeeab0c2f0ed731deb368f06c8d4585842176c'
+      - name: Checkout exact source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Confirm tested commit
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Run native core tests
+        shell: bash
+        run: |
+          set +e
+          sbt ++${{ matrix.scala }} ergoCore/test > "$RUNNER_TEMP/native-core.log" 2>&1
+          result=$?
+          echo "sbt exit status: $result"
+          exit "$result"
+      - name: Verify JUnit results
+        if: always()
+        env:
+          REPORT_DIR: ergo-core/target/test-reports
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          reports = list(Path(os.environ['REPORT_DIR']).glob('TEST-*.xml'))
+          if not reports:
+              raise SystemExit('No core JUnit XML reports')
+          counts = {key: 0 for key in ('tests', 'failures', 'errors', 'skipped')}
+          for report in reports:
+              suite = ET.parse(report).getroot()
+              if suite.tag != 'testsuite':
+                  raise SystemExit('Unexpected core JUnit XML root')
+              for key in counts:
+                  if key not in suite.attrib:
+                      raise SystemExit(f'Missing {key} in {report}')
+                  counts[key] += int(suite.attrib[key])
+          print(f"Core XML: {len(reports)} suites, {counts}")
+          if counts['tests'] < 108 or counts['skipped'] > 2 or counts['failures'] or counts['errors']:
+              raise SystemExit('Core JUnit results failed')
+          PY
+      - name: Retain core XML reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-core-${{ matrix.scala }}-${{ inputs.source_commit }}
+          path: ergo-core/target/test-reports/TEST-*.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  native_node:
+    if: inputs.suite == 'wallet-v609-native'
+    name: Native node tests (2.12.20)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Validate exact source identity
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: test "$SOURCE_COMMIT" = '6daeeab0c2f0ed731deb368f06c8d4585842176c'
+      - name: Checkout exact source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Confirm tested commit
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Run native node tests
+        shell: bash
+        run: |
+          set +e
+          sbt -Denv=test clean ++2.12.20 test > "$RUNNER_TEMP/native-node.log" 2>&1
+          result=$?
+          echo "sbt exit status: $result"
+          exit "$result"
+      - name: Verify JUnit results
+        if: always()
+        env:
+          REPORT_DIR: target/test-reports
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          reports = list(Path(os.environ['REPORT_DIR']).glob('TEST-*.xml'))
+          if not reports:
+              raise SystemExit('No node JUnit XML reports')
+          counts = {key: 0 for key in ('tests', 'failures', 'errors', 'skipped')}
+          for report in reports:
+              suite = ET.parse(report).getroot()
+              if suite.tag != 'testsuite':
+                  raise SystemExit('Unexpected node JUnit XML root')
+              for key in counts:
+                  if key not in suite.attrib:
+                      raise SystemExit(f'Missing {key} in {report}')
+                  counts[key] += int(suite.attrib[key])
+          print(f"Node XML: {len(reports)} suites, {counts}")
+          if counts['tests'] < 1366 or counts['skipped'] > 2 or counts['failures'] or counts['errors']:
+              raise SystemExit('Node JUnit results failed')
+          PY
+      - name: Retain node XML reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-node-2.12.20-${{ inputs.source_commit }}
+          path: target/test-reports/TEST-*.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  native_it:
+    if: inputs.suite == 'wallet-v609-native'
+    name: Native node IT (2.12.20)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate exact source identity
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: test "$SOURCE_COMMIT" = '6daeeab0c2f0ed731deb368f06c8d4585842176c'
+      - name: Checkout exact source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_commit }}
+          path: it
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Confirm tested commit
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: test "$(git -C it rev-parse HEAD)" = "$SOURCE_COMMIT"
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Run native node integration tests
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          set +e
+          cd it
+          mkdir tmp
+          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++2.12.20 it:test > "$RUNNER_TEMP/native-it.log" 2>&1
+          result=$?
+          echo "sbt exit status: $result"
+          exit "$result"
+      - name: Verify JUnit results
+        if: always()
+        env:
+          REPORT_DIR: it/target/it-reports
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          reports = list(Path(os.environ['REPORT_DIR']).glob('TEST-*.xml'))
+          if not reports:
+              raise SystemExit('No integration JUnit XML reports')
+          counts = {key: 0 for key in ('tests', 'failures', 'errors', 'skipped')}
+          for report in reports:
+              suite = ET.parse(report).getroot()
+              if suite.tag != 'testsuite':
+                  raise SystemExit('Unexpected integration JUnit XML root')
+              for key in counts:
+                  if key not in suite.attrib:
+                      raise SystemExit(f'Missing {key} in {report}')
+                  counts[key] += int(suite.attrib[key])
+          print(f"Integration XML: {len(reports)} suites, {counts}")
+          if counts['tests'] < 35 or counts['skipped'] > 0 or counts['failures'] or counts['errors']:
+              raise SystemExit('Integration JUnit results failed')
+          PY
+      - name: Retain integration XML reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-it-2.12.20-${{ inputs.source_commit }}
+          path: it/target/it-reports/TEST-*.xml
           if-no-files-found: warn
           retention-days: 7
