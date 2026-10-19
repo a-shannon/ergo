@@ -125,7 +125,7 @@ class RepairCacheRaceSpecification extends ErgoCorePropertyTest {
       val repairResult = new AtomicReference[Try[Boolean]]()
       repairThread = new Thread(new Runnable {
         override def run(): Unit = {
-          try repairResult.set(Try(ErgoHistory.repairIfNeeded(history)))
+          try repairResult.set(ErgoHistory.repairIfNeeded(history))
           finally repairDone.countDown()
         }
       }, "history-repair-race")
