@@ -29,6 +29,7 @@ on:
           - wallet-registry-addbox-result
           - blocks-route-v609
           - blocks-route-fix-v609
+          - history-index-join-v609
 
 permissions:
   contents: read
@@ -46,7 +47,7 @@ jobs:
         run: |
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
-            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|wallet-deep-rollback|wallet-v609-composition|wallet-registry-addbox-result|blocks-route-v609|blocks-route-fix-v609) ;;
+            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|wallet-deep-rollback|wallet-v609-composition|wallet-registry-addbox-result|blocks-route-v609|blocks-route-fix-v609|history-index-join-v609) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -340,6 +341,48 @@ jobs:
               print(f"{name}: {declared['tests']} case(s), "
                     f"{declared['failures']} failure(s), {declared['errors']} error(s), "
                     f"{declared['skipped']} skip(s)")
+          PY
+      - name: Run composed history index and cache regressions
+        if: inputs.suite == 'history-index-join-v609'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.history.VerifyADHistorySpecification org.ergoplatform.nodeView.history.RepairCacheRaceSpecification"
+      - name: Verify composed history regression execution
+        if: ${{ always() && inputs.suite == 'history-index-join-v609' }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          expected = {
+              "VerifyADHistorySpecification": (
+                  "invalidating a retained-floor full block clears its selected full tip",
+              ),
+              "RepairCacheRaceSpecification": (
+                  "a read racing repair cannot restore a removed height row",
+                  "a cached hit stays available while an index removal finishes",
+              ),
+          }
+          for short_name, required in expected.items():
+              name = f"org.ergoplatform.nodeView.history.{short_name}"
+              report = Path(f"target/test-reports/TEST-{name}.xml")
+              suite = ET.parse(report).getroot()
+              if suite.tag != "testsuite" or suite.attrib.get("name") != name:
+                  raise SystemExit(f"Unexpected test suite in {report}")
+              counts = {key: int(suite.attrib[key]) for key in
+                        ("tests", "failures", "errors", "skipped")}
+              cases = suite.findall("testcase")
+              names = [case.attrib.get("name", "") for case in cases]
+              if counts["tests"] < len(required) or len(cases) != counts["tests"]:
+                  raise SystemExit(f"Testcase count mismatch in {report}")
+              if not all(names) or len(names) != len(set(names)):
+                  raise SystemExit(f"Missing or duplicate testcase names in {report}")
+              if any(counts[key] != 0 for key in ("failures", "errors", "skipped")):
+                  raise SystemExit(f"History suite did not pass: {report}")
+              for phrase in required:
+                  if not any(phrase in case_name for case_name in names):
+                      raise SystemExit(f"Missing history case in {report}: {phrase}")
+              print(f"{name}: {counts['tests']} passed, required cases present")
           PY
       # NiPoPoW runs use the real history producer, HTTP route and P2P cache consumer.
       - name: Run NiPoPoW producer and HTTP route regressions
