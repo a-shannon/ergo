@@ -434,6 +434,7 @@ class VerifyADHistorySpecification extends ErgoCorePropertyTest with NoShrink {
 
   property("zero-retention pruning preserves the best full block and successor progress") {
     Seq(1, 0).foreach { blocksToKeep =>
+      info(s"running with blocksToKeep=$blocksToKeep")
       val initial = generateHistory(
         verifyTransactions = true,
         StateType.Digest,
