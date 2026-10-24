@@ -1,0 +1,63 @@
+name: Zero-retention best-full v6.0.9 diagnostic
+
+on:
+  push:
+    branches:
+      - a-shannon/zero-retention-best-full-v609-20261025
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact pushed commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify source pin
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run zero-retention History regression
+        run: >-
+          sbt -batch -Denv=test ++2.12.20
+          'testOnly org.ergoplatform.nodeView.history.VerifyADHistorySpecification -- -z zero-retention'
+
+      - name: Confirm the named property ran
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          name = 'zero-retention pruning preserves the best full block and successor progress'
+          cases = []
+          for report in Path('target/test-reports').rglob('TEST-*.xml'):
+              cases.extend(ET.parse(report).getroot().iter('testcase'))
+          selected = [case for case in cases if name in case.attrib.get('name', '')]
+          if len(selected) != 1 or selected[0].find('skipped') is not None:
+              raise SystemExit(f'Expected one executed property; found {len(selected)}')
+          case = selected[0]
+          print(f'Named property ran: failures={len(case.findall("failure"))}, '
+                f'errors={len(case.findall("error"))}')
+          PY

@@ -380,6 +380,40 @@ class VerifyADHistorySpecification extends ErgoCorePropertyTest with NoShrink {
     }
   }
 
+  property("zero-retention pruning preserves the best full block and successor progress") {
+    Seq(1, 0).foreach { blocksToKeep =>
+      info(s"running with blocksToKeep=$blocksToKeep")
+      val initial = generateHistory(
+        verifyTransactions = true,
+        StateType.Digest,
+        PoPoWBootstrap = false,
+        blocksToKeep = blocksToKeep
+      )
+      initial.writeMinimalFullBlockHeight(GenesisHeight)
+      initial.isHeadersChainSyncedVar = true
+      val chain = genChain(3, initial)
+
+      val afterFirst = applyBlock(initial, chain.head)
+      afterFirst.bestFullBlockOpt.value.header shouldBe chain.head.header
+
+      val second = chain(1)
+      val afterSecond = applyBlock(afterFirst, second)
+      afterSecond.bestFullBlockIdOpt.value shouldBe second.id
+      afterSecond.bestFullBlockOpt.value.header shouldBe second.header
+      afterSecond.contains(second.blockTransactions.id) shouldBe true
+      afterSecond.contains(second.extension.id) shouldBe true
+      afterSecond.contains(second.adProofs.value.id) shouldBe true
+
+      val third = chain(2)
+      val withHeader = afterSecond.append(third.header).get._1
+      val withTransactions = withHeader.append(third.blockTransactions).get._1
+      val withExtension = withTransactions.append(third.extension).get._1
+      val (afterThird, progress) = withExtension.append(third.adProofs.value).get
+      progress.toApply should contain (third)
+      afterThird.bestFullBlockOpt.value.header shouldBe third.header
+    }
+  }
+
   property("process fork from genesis") {
     var (history, c) = genHistory(1)
     val genesis = c.head
