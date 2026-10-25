@@ -15,7 +15,7 @@ concurrency:
 jobs:
   reader-diagnostic:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       SOURCE_COMMIT: 9b25896338c097b6487e521e31e66aad9f798f59
     steps:
@@ -23,7 +23,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 3
+          fetch-depth: 4
           persist-credentials: false
 
       - name: Verify exact release parent and test-only change
@@ -33,7 +33,7 @@ jobs:
           test "$GITHUB_REF" = refs/heads/a-shannon/v609-reader-release-diagnostic-20261025
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git merge-base --is-ancestor "$SOURCE_COMMIT" HEAD
-          test "$(git rev-list --count "$SOURCE_COMMIT"..HEAD)" -eq 2
+          test "$(git rev-list --count "$SOURCE_COMMIT"..HEAD)" -eq 3
           test -z "$(git rev-list --merges "$SOURCE_COMMIT"..HEAD)"
           mapfile -t changed < <(git diff --name-only "$SOURCE_COMMIT" HEAD)
           test "${#changed[@]}" -eq 2
@@ -47,37 +47,39 @@ jobs:
           jvm: temurin:8
           apps: sbt
 
-      - name: Run the single reader regression and classify the result
+      - name: Assemble the source JAR and probe its reader-only classpath
         shell: bash
-        timeout-minutes: 35
+        timeout-minutes: 50
         run: |
           set -euo pipefail
-          if sbt -batch -no-colors -Denv=test ++2.12.20 \
-            'testOnly org.ergoplatform.settings.ErgoSettingsReaderMainnetDefaultsSpec' \
-            > "$RUNNER_TEMP/v609-reader.log" 2>&1; then
+          sbt -batch -no-colors -Denv=test ++2.12.20 'Test / compile' assembly
+          mapfile -t jars < <(find target/scala-2.12 -maxdepth 1 -type f -name 'ergo-*.jar' -print)
+          test "${#jars[@]}" -eq 1
+          jar="${jars[0]}"
+          jar tf "$jar" > "$RUNNER_TEMP/v609-jar-entries.txt"
+          grep -Fxq 'application.conf' "$RUNNER_TEMP/v609-jar-entries.txt"
+          grep -Fxq 'mainnet.conf' "$RUNNER_TEMP/v609-jar-entries.txt"
+          test -f target/scala-2.12/test-classes/org/ergoplatform/settings/ErgoSettingsReaderMainnetDefaultsProbe.class
+          mkdir -p "$RUNNER_TEMP/v609-reader-tmp"
+          if java -Djava.io.tmpdir="$RUNNER_TEMP/v609-reader-tmp" \
+            -cp "$jar:target/scala-2.12/test-classes" \
+            org.ergoplatform.settings.ErgoSettingsReaderMainnetDefaultsProbe \
+            > "$RUNNER_TEMP/v609-packaged-reader.log" 2>&1; then
             result=0
           else
             result=$?
           fi
-          RUN_RESULT="$result" python3 - <<'PY'
+          PACKAGED_RESULT="$result" python3 - <<'PY'
           import os
           import pathlib
           import re
-          import xml.etree.ElementTree as ET
 
-          log = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'v609-reader.log').read_text(errors='replace')
-          report = pathlib.Path('target/test-reports/TEST-org.ergoplatform.settings.ErgoSettingsReaderMainnetDefaultsSpec.xml')
-          assert report.is_file(), 'The targeted test did not produce a JUnit report'
-          suite = ET.parse(report).getroot()
-          assert suite.get('name') == 'org.ergoplatform.settings.ErgoSettingsReaderMainnetDefaultsSpec'
-          assert int(suite.get('tests', '-1')) == 1
-          assert int(suite.get('failures', '-1')) == 1
-          assert int(suite.get('errors', '-1')) == 0
-          assert int(suite.get('skipped', '-1')) == 0
-          assert int(os.environ['RUN_RESULT']) != 0, 'The regression unexpectedly passed'
-          assert 'READER_CONTROL_OK' in log, 'The explicit-file control did not pass'
+          log = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'v609-packaged-reader.log').read_text(errors='replace')
+          assert int(os.environ['PACKAGED_RESULT']) != 0, 'The selected-network reader unexpectedly succeeded'
+          assert 'READER_CONTROL_OK' in log, 'The packaged application defaults did not pass the explicit-file control'
+          assert 'READER_SELECTED_OK' not in log, 'The selected-network reader unexpectedly passed'
           match = re.search(r'READER_SELECTED_FAILURE (UnresolvedSubstitution|NotResolved)', log)
           assert match, 'The selected-network failure was not the expected config-resolution error'
-          print('Exact v6.0.9 reader result: explicit-file control passed;')
-          print('selected MainNet without a user file failed with ' + match.group(1) + '.')
+          print('Exact v6.0.9 assembled-JAR classpath: explicit-file control passed;')
+          print('selected MainNet reader without a user file failed with ' + match.group(1) + '.')
           PY
