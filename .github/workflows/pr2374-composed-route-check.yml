@@ -1,0 +1,38 @@
+name: PR 2374 current-candidate route checks
+
+on:
+  push:
+    branches:
+      - a-shannon/pr2374-composed-validate-v610-20261025
+
+permissions:
+  contents: read
+
+jobs:
+  routes-and-mempool:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Run affected route and mempool suites
+        run: >-
+          sbt ++2.12.20 "testOnly
+          org.ergoplatform.http.routes.UtxoApiRouteSpec
+          org.ergoplatform.http.routes.TransactionApiRouteSpec
+          org.ergoplatform.http.routes.UtilsApiRouteSpec
+          org.ergoplatform.nodeView.mempool.ErgoMemPoolSpec
+          org.ergoplatform.nodeView.mempool.HistogramStatsSpec"
