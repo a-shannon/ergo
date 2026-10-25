@@ -243,6 +243,14 @@ jobs:
                           assert request('/wallet/status', headers)[0] == 403, 'Wallet access was not denied'
                       listeners = subprocess.check_output(['ss', '-H', '-ltnp'], text=True)
                       owned = [line for line in listeners.splitlines() if 'pid=' + str(process.pid) + ',' in line]
+                      for line in listeners.splitlines():
+                          fields = line.split()
+                          if len(fields) >= 5 and fields[3].rsplit(':', 1)[-1] in ('9052', '9021'):
+                              print('Target listener: ' + json.dumps({
+                                  'local': fields[3],
+                                  'expected_pid_present': 'pid=' + str(process.pid) + ',' in line,
+                              }), flush=True)
+                      print('Expected process listener count: ' + str(len(owned)), flush=True)
                       rest = [line for line in owned if line.split()[3].endswith(':9052')]
                       assert len(rest) == 1 and rest[0].split()[3] == '127.0.0.1:9052', 'REST bind mismatch'
                       p2p = [line for line in owned if line.split()[3].endswith(':9021')]
