@@ -1,0 +1,269 @@
+name: PR 2211 reader validation
+
+on:
+  push:
+    branches:
+      - a-shannon/pr2211-reader-validate-20261025
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr2211-reader-validation
+  cancel-in-progress: false
+
+jobs:
+  reader-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    env:
+      SOURCE_COMMIT: fdbe92315ef5585530a79e3b0a5d9f8a8e675bd2
+      READER: src/main/scala/org/ergoplatform/settings/ErgoSettingsReader.scala
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the event commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Require the exact source parent and workflow-only change
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/a-shannon/pr2211-reader-validate-20261025
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          read -r -a lineage <<< "$(git rev-list --parents -n 1 HEAD)"
+          test "${#lineage[@]}" -eq 2
+          test "${lineage[1]}" = "$SOURCE_COMMIT"
+          test "$(git diff --name-status "$SOURCE_COMMIT" HEAD)" = \
+            $'A\t.github/workflows/pr2211-reader-validation.yml'
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git show "$SOURCE_COMMIT:$READER" > "$RUNNER_TEMP/pr2211-reader.original"
+          cmp "$READER" "$RUNNER_TEMP/pr2211-reader.original"
+          sha256sum "$READER" > "$RUNNER_TEMP/pr2211-reader.sha256"
+          echo "Verified event commit, single pinned parent, and workflow-only diff."
+
+      - name: Set up Temurin 8 and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Run the four focused suites on Scala 2.12.20
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          java -version
+          sbt -batch -no-colors -Denv=test ++2.12.20 \
+            'show scalaVersion' 'set Test / parallelExecution := false' \
+            'testOnly org.ergoplatform.settings.ErgoSettingsReaderPrecedenceSpec org.ergoplatform.settings.RestApiDefaultsSpec scorex.core.api.http.ApiAuthenticationSpec org.ergoplatform.settings.ErgoSettingsSpecification' \
+            > "$RUNNER_TEMP/pr2211-positive.log" 2>&1 || {
+              echo '::error::Focused sbt run failed; no positive validation result.'
+              exit 1
+            }
+          python3 - <<'PY'
+          import os, pathlib, re, xml.etree.ElementTree as ET
+          log = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'pr2211-positive.log').read_text()
+          assert re.search(r'(?m)^\[info\] 2\.12\.20\s*$', log), 'Scala selection not observed'
+          expected = {
+              'org.ergoplatform.settings.ErgoSettingsReaderPrecedenceSpec': 1,
+              'org.ergoplatform.settings.RestApiDefaultsSpec': 2,
+              'scorex.core.api.http.ApiAuthenticationSpec': 6,
+              'org.ergoplatform.settings.ErgoSettingsSpecification': 11,
+          }
+          for name, count in expected.items():
+              report = pathlib.Path('target/test-reports') / ('TEST-' + name + '.xml')
+              root = ET.parse(report).getroot()
+              assert root.tag == 'testsuite' and root.get('name') == name, name
+              assert int(root.get('tests', '-1')) == count, name
+              assert len(root.findall('testcase')) == count, name
+              assert all(int(root.get(k, '0')) == 0 for k in ('failures', 'errors', 'skipped')), name
+              assert not root.findall('.//failure') and not root.findall('.//error'), name
+              assert not root.findall('.//skipped'), name
+              print(name + ': ' + str(count) + ' passed')
+          PY
+
+      - name: Matched negative control and exact source restoration
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          restore_reader() {
+            cp "$RUNNER_TEMP/pr2211-reader.original" "$READER"
+            cmp "$READER" "$RUNNER_TEMP/pr2211-reader.original"
+            sha256sum --check --status "$RUNNER_TEMP/pr2211-reader.sha256"
+          }
+          trap restore_reader EXIT
+          python3 - <<'PY'
+          import os, pathlib
+          path = pathlib.Path(os.environ['READER'])
+          original = path.read_bytes()
+          start = original.index(b'case (Some(networkConfigFile), None) =>')
+          end = original.index(b'case (Some(networkConfigFile), Some(file)) =>', start)
+          branch = original[start:end]
+          fallback = b'          .withFallback(ConfigFactory.defaultApplication())\n'
+          assert branch.count(fallback) == 1, 'No-user fallback is not uniquely identified'
+          mutant = original[:start] + branch.replace(fallback, b'', 1) + original[end:]
+          assert original.count(b'.withFallback(ConfigFactory.defaultApplication())') == 2
+          assert mutant.count(b'.withFallback(ConfigFactory.defaultApplication())') == 1
+          assert original[:start] == mutant[:start], 'Explicit-file path changed'
+          path.write_bytes(mutant)
+          PY
+          # A separate successful compile is mandatory before accepting a red test.
+          sbt -batch -no-colors -Denv=test ++2.12.20 'Test / compile' \
+            > "$RUNNER_TEMP/pr2211-mutant-compile.log" 2>&1 || {
+              echo '::error::Negative control did not compile; rejected as evidence.'
+              exit 1
+            }
+          find target/test-reports -maxdepth 1 -type f \
+            -name 'TEST-org.ergoplatform.settings.ErgoSettingsReaderPrecedenceSpec.xml' -delete
+          set +e
+          sbt -batch -no-colors -Denv=test ++2.12.20 \
+            'testOnly org.ergoplatform.settings.ErgoSettingsReaderPrecedenceSpec' \
+            > "$RUNNER_TEMP/pr2211-negative.log" 2>&1
+          negative_status=$?
+          set -e
+          test "$negative_status" -ne 0
+          python3 - <<'PY'
+          import os, pathlib, re, xml.etree.ElementTree as ET
+          report = pathlib.Path('target/test-reports/TEST-org.ergoplatform.settings.ErgoSettingsReaderPrecedenceSpec.xml')
+          root = ET.parse(report).getroot()
+          assert root.get('name') == 'org.ergoplatform.settings.ErgoSettingsReaderPrecedenceSpec'
+          assert int(root.get('tests', '-1')) == 1 and int(root.get('failures', '-1')) == 1
+          assert all(int(root.get(k, '0')) == 0 for k in ('errors', 'skipped'))
+          cases = root.findall('testcase')
+          assert len(cases) == 1 and cases[0].get('name') == (
+              'The settings reader should preserve every network and configuration layer')
+          failures = cases[0].findall('failure')
+          assert len(failures) == 1
+          failure = failures[0]
+          detail = failure.get('message', '') + ''.join(failure.itertext())
+          assert 'org.scalatest.exceptions.TestFailedException' in (failure.get('type', '') + detail)
+          assert 'mainnet:' in detail and '1 was not equal to 0' in detail
+          assert 'Exception in thread "main" com.typesafe.config.ConfigException$UnresolvedSubstitution' in detail
+          assert 'Could not resolve substitution' in detail and '${scorex.network.appVersion}' in detail
+          log = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'pr2211-negative.log').read_text()
+          forbidden = (
+              r'ClassNotFoundException|NoClassDefFoundError|Could not find or load main class|'
+              r'UnsupportedClassVersionError|Could not create the Java Virtual Machine|'
+              r'Unrecognized VM option|Compilation failed|compilation failed|'
+              r'OutOfMemoryError|NoSuchMethodError|NoSuchFieldError|ExceptionInInitializerError'
+          )
+          assert not re.search(forbidden, log + detail), 'Infrastructure failure invalidates negative control'
+          assert not root.findall('.//error') and not root.findall('.//skipped')
+          print('Negative control: one named ScalaTest assertion failed on the expected child substitution error.')
+          PY
+          restore_reader
+          trap - EXIT
+          git diff --exit-code -- "$READER"
+          echo "Restored exact product source bytes and SHA-256."
+
+      - name: Assemble restored product source
+        timeout-minutes: 18
+        run: |
+          set -euo pipefail
+          sha256sum --check --status "$RUNNER_TEMP/pr2211-reader.sha256"
+          git diff --exit-code
+          sbt -batch -no-colors -Denv=test ++2.12.20 assembly \
+            > "$RUNNER_TEMP/pr2211-assembly.log" 2>&1 || {
+              echo '::error::Assembly failed; packaged startup is unvalidated.'
+              exit 1
+            }
+          python3 - <<'PY'
+          import os, pathlib
+          jars = list(pathlib.Path('target/scala-2.12').glob('ergo-*.jar'))
+          assert len(jars) == 1, 'Expected exactly one assembled root JAR'
+          assert jars[0].stat().st_size > 0
+          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'pr2211-jar.path').write_text(str(jars[0].resolve()))
+          print('Assembly produced one nonempty Scala 2.12 JAR from restored source.')
+          PY
+
+      - name: Packaged DevNet smoke with no user file or REST overrides
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          jar=$(cat "$RUNNER_TEMP/pr2211-jar.path")
+          # Empty environment excludes config variables and inherited JVM option injection.
+          env -i PATH="$PATH" python3 - "$jar" "$JAVA_HOME/bin/java" <<'PY'
+          import http.client, json, os, pathlib, re, signal, subprocess, sys, tempfile, time, zipfile
+
+          def interrupted(signum, frame):
+              raise SystemExit('Packaged smoke interrupted')
+
+          signal.signal(signal.SIGTERM, interrupted)
+          signal.signal(signal.SIGINT, interrupted)
+          with zipfile.ZipFile(sys.argv[1]) as jar:
+              devnet = jar.read('devnet.conf').decode('utf-8')
+              assert len(re.findall(r'knownPeers\s*=', devnet)) == 1
+              assert re.search(r'knownPeers\s*=\s*\[\s*\]', devnet), 'DevNet must have no known peers'
+
+          def request(path, headers=None):
+              conn = http.client.HTTPConnection('127.0.0.1', 9052, timeout=2)
+              try:
+                  conn.request('GET', path, headers=headers or {})
+                  response = conn.getresponse()
+                  return response.status, response.read()
+              finally:
+                  conn.close()
+
+          with tempfile.TemporaryDirectory(prefix='pr2211-packaged-') as directory:
+              cwd = pathlib.Path(directory)
+              (cwd / 'tmp').mkdir()
+              environment = {'PATH': os.environ['PATH'], 'HOME': directory, 'LANG': 'C.UTF-8'}
+              command = [
+                  sys.argv[2], '-Xms128m', '-Xmx2g', '-Duser.home=' + directory,
+                  '-Djava.io.tmpdir=' + str(cwd / 'tmp'),
+                  '-Dergo.node.mining=false', '-Dergo.node.offlineGeneration=false',
+                  '-Dscorex.network.bindAddress=127.0.0.1:9021',
+                  '-Dscorex.network.peerDiscovery=false',
+                  '-Dscorex.network.upnpEnabled=false',
+                  '-jar', sys.argv[1], '--devnet',
+              ]
+              assert not any('restApi' in arg or 'config.file' in arg for arg in command)
+              assert not list(cwd.glob('*.conf'))
+              with (cwd / 'node.log').open('wb') as log:
+                  process = subprocess.Popen(command, cwd=cwd, env=environment,
+                                             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                  try:
+                      deadline = time.monotonic() + 90
+                      while True:
+                          assert process.poll() is None, 'Packaged node exited before readiness'
+                          try:
+                              status, body = request('/info')
+                              if status == 200:
+                                  assert isinstance(json.loads(body), dict)
+                                  break
+                          except (OSError, http.client.HTTPException):
+                              pass
+                          assert time.monotonic() < deadline, 'Packaged /info readiness timed out'
+                          time.sleep(1)
+                      for headers in ({}, {'api_key': 'pr2211-dummy-key'}):
+                          assert request('/wallet/status', headers)[0] == 403, 'Wallet access was not denied'
+                      listeners = subprocess.check_output(['ss', '-H', '-ltnp'], text=True)
+                      owned = [line for line in listeners.splitlines() if 'pid=' + str(process.pid) + ',' in line]
+                      rest = [line for line in owned if line.split()[3].endswith(':9052')]
+                      assert len(rest) == 1 and rest[0].split()[3] == '127.0.0.1:9052', 'REST bind mismatch'
+                      p2p = [line for line in owned if line.split()[3].endswith(':9021')]
+                      assert len(p2p) == 1 and p2p[0].split()[3] == '127.0.0.1:9021', 'P2P bind mismatch'
+                      assert process.poll() is None, 'Packaged node exited during checks'
+                      print('Packaged --devnet: /info 200; wallet 403 without/with dummy key; REST 127.0.0.1:9052 only.')
+                  finally:
+                      if process.poll() is None:
+                          os.killpg(process.pid, signal.SIGTERM)
+                          try:
+                              process.wait(timeout=15)
+                          except subprocess.TimeoutExpired:
+                              os.killpg(process.pid, signal.SIGKILL)
+                              process.wait(timeout=5)
+                      assert process.poll() is not None, 'Packaged process cleanup failed'
+          PY
+
+      - name: Verify the source is still exact
+        if: always()
+        run: |
+          set -euo pipefail
+          cmp "$READER" "$RUNNER_TEMP/pr2211-reader.original"
+          sha256sum --check --status "$RUNNER_TEMP/pr2211-reader.sha256"
+          git diff --exit-code
