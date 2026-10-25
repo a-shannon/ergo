@@ -187,7 +187,7 @@ jobs:
           jar=$(cat "$RUNNER_TEMP/pr2211-jar.path")
           # Empty environment excludes config variables and inherited JVM option injection.
           env -i PATH="$PATH" python3 - "$jar" "$JAVA_HOME/bin/java" <<'PY'
-          import http.client, json, os, pathlib, re, signal, subprocess, sys, tempfile, time, zipfile
+          import http.client, ipaddress, json, os, pathlib, re, signal, subprocess, sys, tempfile, time, zipfile
 
           def interrupted(signum, frame):
               raise SystemExit('Packaged smoke interrupted')
@@ -207,6 +207,20 @@ jobs:
                   return response.status, response.read()
               finally:
                   conn.close()
+
+          def is_ipv4_loopback_endpoint(endpoint, port):
+              host, separator, actual_port = endpoint.rpartition(':')
+              if not separator or actual_port != str(port):
+                  return False
+              if host.startswith('[') and host.endswith(']'):
+                  host = host[1:-1]
+              try:
+                  address = ipaddress.ip_address(host)
+              except ValueError:
+                  return False
+              if isinstance(address, ipaddress.IPv6Address):
+                  address = address.ipv4_mapped
+              return address == ipaddress.IPv4Address('127.0.0.1')
 
           with tempfile.TemporaryDirectory(prefix='pr2211-packaged-') as directory:
               cwd = pathlib.Path(directory)
@@ -252,9 +266,9 @@ jobs:
                               }), flush=True)
                       print('Expected process listener count: ' + str(len(owned)), flush=True)
                       rest = [line for line in owned if line.split()[3].endswith(':9052')]
-                      assert len(rest) == 1 and rest[0].split()[3] == '127.0.0.1:9052', 'REST bind mismatch'
+                      assert len(rest) == 1 and is_ipv4_loopback_endpoint(rest[0].split()[3], 9052), 'REST bind mismatch'
                       p2p = [line for line in owned if line.split()[3].endswith(':9021')]
-                      assert len(p2p) == 1 and p2p[0].split()[3] == '127.0.0.1:9021', 'P2P bind mismatch'
+                      assert len(p2p) == 1 and is_ipv4_loopback_endpoint(p2p[0].split()[3], 9021), 'P2P bind mismatch'
                       assert process.poll() is None, 'Packaged node exited during checks'
                       print('Packaged --devnet: /info 200; wallet 403 without/with dummy key; REST 127.0.0.1:9052 only.')
                   finally:
