@@ -1,11 +1,13 @@
 package org.ergoplatform.nodeView.wallet.scanning
 
 import io.circe.parser._
-import org.ergoplatform.ErgoBox.{R1, R4}
+import org.ergoplatform.ErgoBox.{R0, R1, R4}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.wallet.serialization.JsonCodecsWrapper
 import org.ergoplatform.{ErgoTreePredef, P2PKAddress}
-import sigma.ast.{ByteArrayConstant, ErgoTree, IntConstant, ShortConstant}
+import sigma.Colls
+import sigma.ast.{ByteArrayConstant, Constant, ErgoTree, IntConstant, LongConstant}
+import sigma.ast.{SCollection, SInt, ShortConstant}
 import sigmastate.eval.Extensions.ArrayByteOps
 import sigmastate.helpers.TestingHelpers._
 
@@ -76,6 +78,68 @@ class ScanningPredicateSpecification extends ErgoCorePropertyTest {
       val predicate = EqualsScanningPredicate(R4, ShortConstant(42.toShort))
 
       predicate.filter(box) shouldBe false
+    }
+  }
+
+  property("equals - short survives scan request and persistence") {
+    forAll(ergoAddressGen) { address =>
+      val registers = Map(R4 -> ShortConstant(42.toShort))
+      val box = testBox(1, address.script, 0, Seq.empty, registers)
+      val predicate = EqualsScanningPredicate(R4, ShortConstant(42.toShort))
+      val request = ScanRequest("short-r4", predicate, None, None)
+      val json = ScanJsonCodecs.scanReqEncoder(request)
+      val decoded = ScanJsonCodecs.scanReqDecoder.decodeJson(json).toOption.get
+      val persisted = ScanningPredicateSerializer.parseBytes(
+        ScanningPredicateSerializer.toBytes(decoded.trackingRule)
+      )
+
+      persisted.filter(box) shouldBe true
+    }
+  }
+
+  property("equals - long register matches") {
+    forAll(ergoAddressGen) { address =>
+      val box = testBox(1, address.script, 0, Seq.empty, Map(R4 -> LongConstant(42L)))
+
+      EqualsScanningPredicate(R4, LongConstant(42L)).filter(box) shouldBe true
+    }
+  }
+
+  property("equals - long predicate rejects int register") {
+    forAll(ergoAddressGen) { address =>
+      val box = testBox(1, address.script, 0, Seq.empty, Map(R4 -> IntConstant(42)))
+
+      EqualsScanningPredicate(R4, LongConstant(42L)).filter(box) shouldBe false
+    }
+  }
+
+  property("equals - mandatory value register") {
+    forAll(ergoAddressGen) { address =>
+      val box = testBox(value = 42, address.script, creationHeight = 0)
+
+      EqualsScanningPredicate(R0, LongConstant(42L)).filter(box) shouldBe true
+      EqualsScanningPredicate(R0, LongConstant(43L)).filter(box) shouldBe false
+    }
+  }
+
+  property("equals - collection register compares structure") {
+    forAll(ergoAddressGen) { address =>
+      val stored = Constant[SCollection[SInt.type]](
+        Colls.fromArray(Array(1, 2, 3)),
+        SCollection(SInt)
+      )
+      val matching = Constant[SCollection[SInt.type]](
+        Colls.fromArray(Array(1, 2, 3)),
+        SCollection(SInt)
+      )
+      val different = Constant[SCollection[SInt.type]](
+        Colls.fromArray(Array(1, 2, 4)),
+        SCollection(SInt)
+      )
+      val box = testBox(1, address.script, 0, Seq.empty, Map(R4 -> stored))
+
+      EqualsScanningPredicate(R4, matching).filter(box) shouldBe true
+      EqualsScanningPredicate(R4, different).filter(box) shouldBe false
     }
   }
 

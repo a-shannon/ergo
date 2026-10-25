@@ -3,6 +3,9 @@ package org.ergoplatform.nodeView.wallet.scanning
 import org.ergoplatform.ErgoBox
 import sigma.ast._
 import sigma.Extensions._
+import sigma.serialization.ValueSerializer
+
+import scala.util.Try
 
 /**
   * Basic interface for box scanning predicate functionality
@@ -48,13 +51,15 @@ case class ContainsScanningPredicate(regId: ErgoBox.RegisterId,
 
 
 /**
-  * Scanning predicate to track boxes which contain a register which, in turn, contains certain bytes
-  * (exact matching, so register contains exactly bytes)
+  * Scanning predicate to track boxes which contain an exact Sigma value in a register.
   *
   * @param regId - register identifier
-  * @param value - bytes to track
+  * @param value - Sigma value to track
   */
 case class EqualsScanningPredicate(regId: ErgoBox.RegisterId, value: EvaluatedValue[SType]) extends ScanningPredicate {
+  private lazy val serializedValue: Option[Array[Byte]] =
+    Try(ValueSerializer.serialize(value)).toOption
+
   //todo: try to remove boilerplate below
   override def filter(box: ErgoBox): Boolean = {
     value match {
@@ -93,11 +98,22 @@ case class EqualsScanningPredicate(regId: ErgoBox.RegisterId, value: EvaluatedVa
       case LongConstant(long) =>
         box.get(regId).exists {
           _ match {
-            case IntConstant(l) => long == l
+            case LongConstant(l) => long == l
             case _ => false
           }
         }
-      case _ => false
+      case _ =>
+        serializedValue.exists { expected =>
+          Try {
+            box.get(regId).exists { registerValue =>
+              if (registerValue.tpe != value.tpe) false
+              else {
+                val actual = ValueSerializer.serialize(registerValue)
+                java.util.Arrays.equals(actual, expected)
+              }
+            }
+          }.getOrElse(false)
+        }
     }
   }
 
