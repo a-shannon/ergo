@@ -1,0 +1,84 @@
+name: Public Circe HTTP depth validation
+
+on:
+  push:
+    branches:
+      - a-shannon/circe-http-depth-v610-20261025
+
+permissions:
+  contents: read
+
+jobs:
+  route-depth:
+    if: github.repository == 'a-shannon/ergo' && github.event_name == 'push' && github.ref == 'refs/heads/a-shannon/circe-http-depth-v610-20261025'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out the validation branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify exact candidate parent and two-file scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          base='15bc220ccec04cd8b15a368fdc3b5ad343e5789c'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$base"
+          test -z "$(git status --porcelain)"
+          expected="$(printf '%s\n' \
+            '.github/workflows/circe-http-depth-public.yml' \
+            'src/test/scala/org/ergoplatform/http/routes/UtilsApiRouteSpec.scala')"
+          actual="$(git diff --name-only "$base" HEAD | LC_ALL=C sort)"
+          test "$actual" = "$expected"
+          git diff --check "$base" HEAD
+
+      - name: Set up Java and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Verify resolved Jawn parser
+        shell: bash
+        run: |
+          set -euo pipefail
+          sbt -Dsbt.supershell=false ++2.12.20 'show Compile / dependencyClasspath' > "$RUNNER_TEMP/resolved-classpath.txt"
+          grep -q 'jawn-parser_2.12-1.7.0.jar' "$RUNNER_TEMP/resolved-classpath.txt"
+
+      - name: Run and classify one HTTP depth case
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          set -uo pipefail
+          set +e
+          sbt -batch -Denv=test -Dsbt.supershell=false ++2.12.20 \
+            'testOnly org.ergoplatform.http.routes.UtilsApiRouteSpec -- -z "reject deeply nested JSON before decoding its value type"' \
+            > "$RUNNER_TEMP/circe-http-depth.log" 2>&1
+          result=$?
+          set -e
+          python3 - "$result" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          exit_code = int(sys.argv[1])
+          report = Path('target/test-reports/TEST-org.ergoplatform.http.routes.UtilsApiRouteSpec.xml')
+          if not report.is_file():
+              raise SystemExit('selected JUnit report missing')
+          suite = ET.parse(report).getroot()
+          counts = {key: int(suite.attrib.get(key, '0')) for key in ('tests', 'failures', 'errors', 'skipped')}
+          cases = suite.findall('testcase')
+          case_name = cases[0].attrib.get('name', '') if len(cases) == 1 else ''
+          print(f'sbt_exit={exit_code} junit={counts} selected_case={case_name!r}')
+          if (suite.tag != 'testsuite' or
+                  suite.attrib.get('name') != 'org.ergoplatform.http.routes.UtilsApiRouteSpec' or
+                  counts != {'tests': 1, 'failures': 0, 'errors': 0, 'skipped': 0} or
+                  len(cases) != 1 or
+                  'reject deeply nested JSON before decoding its value type' not in case_name or
+                  cases[0].find('failure') is not None or
+                  cases[0].find('error') is not None or
+                  exit_code != 0):
+              raise SystemExit('selected HTTP depth case did not pass exactly')
+          PY

@@ -1,7 +1,8 @@
 package org.ergoplatform.http.routes
 
 import java.net.InetSocketAddress
-import akka.http.scaladsl.model.StatusCodes
+import akka.http.scaladsl.model.{ContentTypes, HttpEntity, StatusCodes}
+import akka.http.scaladsl.server.Directives.handleRejections
 import akka.http.scaladsl.server.Route
 import akka.http.scaladsl.testkit.ScalatestRouteTest
 import de.heikoseeberger.akkahttpcirce.FailFastCirceSupport
@@ -12,6 +13,7 @@ import org.ergoplatform.http.api.ErgoUtilsApiRoute
 import org.ergoplatform.settings.RESTApiSettings
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
+import scorex.core.api.http.ApiRejectionHandler
 import scorex.util.encode.Base16
 import sigma.serialization.ErgoTreeSerializer
 
@@ -150,6 +152,29 @@ class UtilsApiRouteSpec extends AnyFlatSpec
       c.downField("address").as[String] shouldEqual Right(invalidAddress)
       c.downField("isValid").as[Boolean] shouldEqual Right(false)
       c.downField("error").as[String] shouldEqual Right("requirement failed: Trying to decode mainnet address in testnet")
+    }
+  }
+
+  it should "reject deeply nested JSON before decoding its value type" in {
+    val handledRoute: Route = handleRejections(ApiRejectionHandler.rejectionHandler) {
+      route
+    }
+
+    val validBody = HttpEntity(ContentTypes.`application/json`, "\"hello\"")
+    Post(s"$prefix/hash/blake2b", validBody) ~> handledRoute ~> check {
+      status shouldBe StatusCodes.OK
+    }
+
+    val depth = 100000
+    val nested = ("[" * depth) + "0" + ("]" * depth)
+    val deeplyNestedBody = HttpEntity(ContentTypes.`application/json`, nested)
+    Post(s"$prefix/hash/blake2b", deeplyNestedBody) ~> handledRoute ~> check {
+      status shouldBe StatusCodes.BadRequest
+      val cursor = responseAs[Json].hcursor
+      cursor.downField("error").as[Int] shouldEqual Right(400)
+      cursor.downField("reason").as[String] shouldEqual Right("bad.request")
+      val detail = cursor.downField("detail").as[String].toOption.get
+      detail should include("The request content was malformed")
     }
   }
 
