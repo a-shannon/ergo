@@ -178,6 +178,51 @@ class OrderedTxPoolSpec extends AnyFlatSpec with Matchers with ErgoTestHelpers {
       bySizeBefore.transactionsRegistry(tx.id).weight
   }
 
+  it should "propagate only the changed base weight through a rechecked family" in {
+    implicit val monetarySettings = settings.chainSettings.monetary
+
+    val parent = ErgoTransaction(
+      IndexedSeq(new org.ergoplatform.Input(deterministicRootId(9003), emptyProverResult)),
+      outputCandidates(1)
+    )
+    val child = ErgoTransaction(
+      IndexedSeq(new org.ergoplatform.Input(parent.outputs.head.id, emptyProverResult)),
+      outputCandidates(1, 3000000L)
+    )
+    val parentUtx = UnconfirmedTransaction(parent, None).withCost(1000)
+    val childUtx = UnconfirmedTransaction(child, None).withCost(1000)
+    val before = OrderedTxPool.empty(settings).put(parentUtx, 1000).put(childUtx, 1000)
+    val parentBefore = before.transactionsRegistry(parent.id)
+    val childBefore = before.transactionsRegistry(child.id)
+    assertConsistent(before, Set(parent.id, child.id))
+
+    val childAfter = before.put(childUtx.withCost(2000), 2000)
+    val childBaseAfter = OrderedTxPool.weighted(child, 2000).feePerFactor
+    val childDelta = childBaseAfter - childBefore.feePerFactor
+    childAfter.transactionsRegistry(child.id).weight shouldBe childBaseAfter
+    childAfter.transactionsRegistry(child.id).feePerFactor shouldBe childBaseAfter
+    childAfter.transactionsRegistry(child.id).created shouldBe childBefore.created
+    childAfter.transactionsRegistry(parent.id).weight shouldBe parentBefore.weight + childDelta
+    childAfter.transactionsRegistry(parent.id).feePerFactor shouldBe parentBefore.feePerFactor
+    childAfter.transactionsRegistry(parent.id).created shouldBe parentBefore.created
+    assertConsistent(childAfter, Set(parent.id, child.id))
+
+    val parentAfter = childAfter.put(parentUtx.withCost(2000), 2000)
+    val parentBaseAfter = OrderedTxPool.weighted(parent, 2000).feePerFactor
+    val parentDelta = parentBaseAfter - parentBefore.feePerFactor
+    parentAfter.transactionsRegistry(parent.id).weight shouldBe
+      childAfter.transactionsRegistry(parent.id).weight + parentDelta
+    parentAfter.transactionsRegistry(parent.id).feePerFactor shouldBe parentBaseAfter
+    parentAfter.transactionsRegistry(parent.id).created shouldBe parentBefore.created
+    parentAfter.transactionsRegistry(child.id).weight shouldBe childBaseAfter
+    parentAfter.transactionsRegistry(child.id).created shouldBe childBefore.created
+    assertConsistent(parentAfter, Set(parent.id, child.id))
+
+    val unchanged = parentAfter.put(parentUtx.withCost(2000), 2000)
+    unchanged.transactionsRegistry(parent.id).weight shouldBe parentAfter.transactionsRegistry(parent.id).weight
+    assertConsistent(unchanged, Set(parent.id, child.id))
+  }
+
   it should "keep indexes consistent when a transaction closes a reconvergent family" in {
     val fixture = fixtureWithSharedAncestorLast()
     val beforeIds = Set(fixture.a.id, fixture.b.id, fixture.c.id)

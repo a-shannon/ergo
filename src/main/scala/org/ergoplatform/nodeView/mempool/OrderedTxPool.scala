@@ -101,13 +101,21 @@ class OrderedTxPool(val orderedTransactions: TreeMap[WeightedTxId, UnconfirmedTr
     val newPool = transactionsRegistry.get(tx.id) match {
       case Some(wtx) =>
         val currentWtx = currentTransaction(tx.id).map(_._1).getOrElse(wtx)
-        new OrderedTxPool(
-          withoutTransaction(tx.id).updated(currentWtx, unconfirmedTx),
-          transactionsRegistry.updated(tx.id, currentWtx),
-          invalidatedTxIds,
-          outputs ++ tx.outputs.map(_.id -> currentWtx),
-          inputs ++ tx.inputs.map(_.boxId -> currentWtx)
+        val newFeePerFactor = weighted(tx, feeFactor).feePerFactor
+        val weightDelta = newFeePerFactor - currentWtx.feePerFactor
+        val updatedWtx = currentWtx.copy(
+          weight = currentWtx.weight + weightDelta,
+          feePerFactor = newFeePerFactor
         )
+        val updatedPool = new OrderedTxPool(
+          withoutTransaction(tx.id).updated(updatedWtx, unconfirmedTx),
+          transactionsRegistry.updated(tx.id, updatedWtx),
+          invalidatedTxIds,
+          outputs ++ tx.outputs.map(_.id -> updatedWtx),
+          inputs ++ tx.inputs.map(_.boxId -> updatedWtx)
+        )
+        if (weightDelta == 0) updatedPool
+        else updatedPool.updateFamily(tx, weightDelta, System.currentTimeMillis(), 0)
       case None =>
         val wtx = weighted(tx, feeFactor)
         new OrderedTxPool(
