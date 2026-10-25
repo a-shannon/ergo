@@ -1,0 +1,42 @@
+name: CheckSeed caller ownership checks
+
+on:
+  push:
+    branches:
+      - a-shannon/checkseed-caller-validate-v610-20261025
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Run storage and actor suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sbt -Dsbt.supershell=false ++2.12.20 \
+            "ergoWallet/testOnly org.ergoplatform.wallet.secrets.JsonSecretStorageSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.ErgoWalletSpec org.ergoplatform.nodeView.wallet.WalletCheckSeedErasureSpec" \
+            | tee focused.log
+          grep -q 'JsonSecretStorageSpec:' focused.log
+          grep -q 'ErgoWalletSpec:' focused.log
+          grep -q 'WalletCheckSeedErasureSpec:' focused.log
+          grep -q 'All tests passed.' focused.log
