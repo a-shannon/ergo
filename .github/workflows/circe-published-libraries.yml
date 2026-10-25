@@ -1,0 +1,54 @@
+name: Circe published-library classpaths
+
+on:
+  push:
+    branches:
+      - a-shannon/circe-published-libs-validate-v610-20261025
+
+permissions:
+  contents: read
+
+jobs:
+  classpaths:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      matrix:
+        include:
+          - scala: 2.12.20
+            binary: '2.12'
+          - scala: 2.13.18
+            binary: '2.13'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Verify both release-library classpaths
+        shell: bash
+        run: |
+          set -euo pipefail
+          for project in ergoCore ergoWallet; do
+            sbt -Dsbt.supershell=false ++${{ matrix.scala }} "show $project / Compile / dependencyClasspath" > "$project.classpath"
+            if ! grep -q "jawn-parser_${{ matrix.binary }}-1.7.0.jar" "$project.classpath"; then
+              echo "$project did not resolve Jawn 1.7.0"
+              grep -oE 'jawn-parser_[^/ )]+\.jar' "$project.classpath" || true
+              exit 1
+            fi
+            if grep -q "jawn-parser_${{ matrix.binary }}-1.6.0.jar" "$project.classpath"; then
+              echo "$project retained affected Jawn 1.6.0"
+              exit 1
+            fi
+            echo "$project resolved Jawn 1.7.0 for Scala ${{ matrix.scala }}"
+          done
