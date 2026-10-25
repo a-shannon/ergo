@@ -1,9 +1,10 @@
-name: AVLD candidate composition
+name: AVLD and zero-retention candidate composition
 
 on:
   push:
     branches:
       - a-shannon/avldb-v610-compose-20261025
+      - a-shannon/avldb-2813-v610-compose-20261025
 
 permissions:
   contents: read
@@ -40,3 +41,7 @@ jobs:
 
       - name: Run AVLD tests
         run: sbt ++${{ matrix.scala }} avldb/test
+
+      - name: Run version-store reopen tests
+        if: matrix.scala == '2.12.20'
+        run: sbt ++2.12.20 "testOnly org.ergoplatform.db.VersionedStoreSpec"
