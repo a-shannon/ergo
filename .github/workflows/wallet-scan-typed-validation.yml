@@ -1,0 +1,39 @@
+name: Wallet scan typed equality validation
+
+on:
+  push:
+    branches:
+      - a-shannon/wallet-scan-typed-validate-v610-20261025
+
+permissions:
+  contents: read
+
+jobs:
+  scan-typed:
+    name: Scanning predicate and codec specifications
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact branch head
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check exact source packet
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "c128c2d4b22732df7f4ca86b6c0dff1df13c9bbf"
+          git merge-base --is-ancestor 8e7cfe4a00bbf603f8a38dd980e01bdce273ebaa HEAD
+
+      - name: Set up Java and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Run focused wallet scan tests
+        run: |
+          predicate_spec=org.ergoplatform.nodeView.wallet.scanning.ScanningPredicateSpecification
+          codec_spec=org.ergoplatform.nodeView.wallet.scanning.ScanningPredicateJsonCodecsSpecification
+          sbt -Denv=test ++2.12.20 "testOnly $predicate_spec $codec_spec"
