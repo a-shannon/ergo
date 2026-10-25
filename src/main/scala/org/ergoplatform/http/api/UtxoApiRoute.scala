@@ -82,7 +82,11 @@ case class UtxoApiRoute(readersHolder: ActorRef, override val settings: RESTApiS
         boxIds(ids) { boxIds =>
           ApiResponse(getStateAndPool.map {
             case (usr: UtxoStateReader, mp) =>
-              boxIds.flatMap(id => usr.withMempool(mp).boxById(id))
+              if (boxIds.isEmpty) Seq.empty
+              else {
+                val pooledState = usr.withMempool(mp)
+                boxIds.flatMap(pooledState.boxById)
+              }
             case _ => Seq.empty
           })
         }
