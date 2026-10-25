@@ -1,7 +1,7 @@
 package org.ergoplatform.nodeView.wallet
 
 import java.io.File
-import java.nio.file.Files
+import java.nio.file.{FileAlreadyExistsException, Files}
 
 import org.ergoplatform.ErgoBox.{NonMandatoryRegisterId, R1}
 import org.ergoplatform._
@@ -41,7 +41,7 @@ import sigmastate.eval.Extensions._
 import sigmastate.helpers.TestingHelpers.testBox
 
 import scala.collection.compat.immutable.ArraySeq
-import scala.util.{Random, Success}
+import scala.util.{Failure, Random, Success, Try}
 
 class ErgoWalletServiceSpec
   extends ErgoCorePropertyTest
@@ -483,6 +483,35 @@ class ErgoWalletServiceSpec
       directory.listFiles().map(_.getName).toSet shouldBe
         (before + initialized.secretStorageOpt.get.secretFile.getName)
       Files.readAllBytes(invalidCandidate) shouldBe originalBytes
+    }
+  }
+
+  property("a failed registry rebuild leaves a wallet file for a fresh read") {
+    withInitializationFixture { fixture =>
+      val rejected = new IllegalStateException("synthetic registry failure")
+      val service = new ErgoWalletServiceImpl(fixture.settings) {
+        override def recreateRegistry(state: ErgoWalletState,
+                                      settings: ErgoSettings): Try[ErgoWalletState] = Failure(rejected)
+      }
+      val pass = "synthetic wallet password"
+      val storageSettings = fixture.settings.walletSettings.secretStorage
+
+      val failed = service.initWallet(fixture.state, fixture.settings,
+        SecretString.create(pass), None)
+      failed.failed.get shouldBe rejected
+      fixture.state.secretStorageOpt shouldBe None
+
+      val retry = fixture.service.initWallet(fixture.state, fixture.settings,
+        SecretString.create(pass), None)
+      retry.failed.get shouldBe a[FileAlreadyExistsException]
+
+      fixture.state.storage.close()
+      fixture.state.registry.close()
+      val fresh = fixture.retain(ErgoWalletState.initial(fixture.settings, parameters).get)
+      val loaded = fixture.retain(fixture.service.readWallet(fresh, None, None, storageSettings))
+      loaded.secretStorageOpt shouldBe defined
+      loaded.secretStorageOpt.get.isLocked shouldBe true
+      loaded.secretStorageOpt.get.unlock(SecretString.create(pass)) shouldBe 'success
     }
   }
 

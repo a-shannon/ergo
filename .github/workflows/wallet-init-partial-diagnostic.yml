@@ -1,0 +1,44 @@
+name: Wallet initialization diagnostic
+
+on:
+  push:
+    branches:
+      - a-shannon/wallet-init-partial-recovery-v610-20261025
+
+permissions:
+  contents: read
+
+jobs:
+  wallet_init_partial:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify candidate base
+        shell: bash
+        run: |
+          test "$GITHUB_REF" = "refs/heads/a-shannon/wallet-init-partial-recovery-v610-20261025"
+          test "$(git rev-parse HEAD^)" = "8e7cfe4a00bbf603f8a38dd980e01bdce273ebaa"
+
+      - name: Set up Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run wallet service regression suite
+        run: sbt -Denv=test clean ++2.12.20 "testOnly org.ergoplatform.nodeView.wallet.ErgoWalletServiceSpec"
