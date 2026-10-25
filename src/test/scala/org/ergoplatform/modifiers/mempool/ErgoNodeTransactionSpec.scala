@@ -472,6 +472,31 @@ class ErgoNodeTransactionSpec extends ErgoCorePropertyTest with ErgoCompilerHelp
     tx.statefulValidity(from, IndexedSeq(), sc, accumulatedCost = 1)(ErgoInterpreter(sc.currentParameters)) shouldBe 'failure
   }
 
+  property("the same valid transaction has a different cost with a higher input-cost parameter") {
+    val (from, tx) = validErgoTransactionGenTemplate(0, 0, 10, trueLeafGen).sample.get
+    tx.inputs.nonEmpty shouldBe true
+    val initialParameters = Parameters(0, Parameters.DefaultParameters, ErgoValidationSettingsUpdate.empty)
+    val higherCostParameters = Parameters(
+      0,
+      Parameters.DefaultParameters.updated(Parameters.InputCostIncrease, 2020),
+      ErgoValidationSettingsUpdate.empty
+    )
+    val initialContext = stateContextWith(initialParameters)
+    val higherCostContext = stateContextWith(higherCostParameters)
+
+    initialContext.currentParameters.inputCost shouldBe 2000
+    higherCostContext.currentParameters.inputCost shouldBe 2020
+    tx.statelessValidity().isSuccess shouldBe true
+
+    val initialValidation = tx.statefulValidity(from, IndexedSeq(), initialContext)(
+      ErgoInterpreter(initialContext.currentParameters))
+    val higherCostValidation = tx.statefulValidity(from, IndexedSeq(), higherCostContext)(
+      ErgoInterpreter(higherCostContext.currentParameters))
+    initialValidation.isSuccess shouldBe true
+    higherCostValidation.isSuccess shouldBe true
+    higherCostValidation.get shouldBe initialValidation.get + tx.inputs.size * 20
+  }
+
   property("cost accumulated correctly across inputs") {
     val accInitCost = 100000
 
