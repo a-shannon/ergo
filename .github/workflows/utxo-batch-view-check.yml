@@ -1,0 +1,32 @@
+name: UTXO batch mempool view check
+
+on:
+  push:
+    branches:
+      - a-shannon/v610-mempool-view-validate-20261025
+
+permissions:
+  contents: read
+
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Run UTXO route tests
+        run: sbt ++2.12.20 "testOnly org.ergoplatform.http.routes.UtxoApiRouteSpec"
