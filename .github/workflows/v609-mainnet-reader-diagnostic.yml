@@ -23,7 +23,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
 
       - name: Verify exact release parent and test-only change
@@ -32,7 +32,9 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/a-shannon/v609-reader-release-diagnostic-20261025
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git rev-parse HEAD^)" = "$SOURCE_COMMIT"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" HEAD
+          test "$(git rev-list --count "$SOURCE_COMMIT"..HEAD)" -eq 2
+          test -z "$(git rev-list --merges "$SOURCE_COMMIT"..HEAD)"
           mapfile -t changed < <(git diff --name-only "$SOURCE_COMMIT" HEAD)
           test "${#changed[@]}" -eq 2
           test "${changed[0]}" = .github/workflows/v609-mainnet-reader-diagnostic.yml
@@ -49,11 +51,14 @@ jobs:
         shell: bash
         timeout-minutes: 35
         run: |
-          set -uo pipefail
-          sbt -batch -no-colors -Denv=test ++2.12.20 \
+          set -euo pipefail
+          if sbt -batch -no-colors -Denv=test ++2.12.20 \
             'testOnly org.ergoplatform.settings.ErgoSettingsReaderMainnetDefaultsSpec' \
-            > "$RUNNER_TEMP/v609-reader.log" 2>&1
-          result=$?
+            > "$RUNNER_TEMP/v609-reader.log" 2>&1; then
+            result=0
+          else
+            result=$?
+          fi
           RUN_RESULT="$result" python3 - <<'PY'
           import os
           import pathlib
