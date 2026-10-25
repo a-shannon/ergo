@@ -141,6 +141,43 @@ class OrderedTxPoolSpec extends AnyFlatSpec with Matchers with ErgoTestHelpers {
     )(settings)
   }
 
+  it should "refresh fee-per-cost priority when a rechecked transaction changes cost" in {
+    implicit val monetarySettings = settings.chainSettings.monetary
+
+    def transaction(nonce: Int): ErgoTransaction = ErgoTransaction(
+      IndexedSeq(new org.ergoplatform.Input(deterministicRootId(nonce), emptyProverResult)),
+      outputCandidates(1)
+    )
+
+    val tx = transaction(9001)
+    val otherTx = transaction(9002)
+    val firstCost = 1000
+    val otherCost = 1500
+    val recheckedCost = 2000
+    val initial = UnconfirmedTransaction(tx, None).withCost(firstCost)
+    val rechecked = initial.withCost(recheckedCost)
+    val other = UnconfirmedTransaction(otherTx, None).withCost(otherCost)
+
+    val before = OrderedTxPool.empty(settings)
+      .put(initial, firstCost)
+      .put(other, otherCost)
+    before.orderedTransactions.firstKey.id shouldBe tx.id
+
+    val after = before.put(rechecked, recheckedCost)
+    after.get(tx.id).flatMap(_.lastCost) shouldBe Some(recheckedCost)
+    val freshWeight = OrderedTxPool.weighted(tx, recheckedCost).weight
+    freshWeight should be < before.transactionsRegistry(tx.id).weight
+    after.transactionsRegistry(tx.id).weight shouldBe freshWeight
+    after.orderedTransactions.firstKey.id shouldBe otherTx.id
+
+    val sizeFactor = tx.size
+    val bySizeBefore = OrderedTxPool.empty(settings).put(initial, sizeFactor)
+    val bySizeAfter = bySizeBefore.put(rechecked, sizeFactor)
+    bySizeAfter.get(tx.id).flatMap(_.lastCost) shouldBe Some(recheckedCost)
+    bySizeAfter.transactionsRegistry(tx.id).weight shouldBe
+      bySizeBefore.transactionsRegistry(tx.id).weight
+  }
+
   it should "keep indexes consistent when a transaction closes a reconvergent family" in {
     val fixture = fixtureWithSharedAncestorLast()
     val beforeIds = Set(fixture.a.id, fixture.b.id, fixture.c.id)
