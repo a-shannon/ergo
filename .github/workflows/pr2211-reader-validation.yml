@@ -27,24 +27,24 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 2
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Require the exact source parent and workflow-only change
+        id: pin
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/a-shannon/pr2211-reader-validate-20261025
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          read -r -a lineage <<< "$(git rev-list --parents -n 1 HEAD)"
-          test "${#lineage[@]}" -eq 2
-          test "${lineage[1]}" = "$SOURCE_COMMIT"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" HEAD
+          test -z "$(git rev-list --merges "$SOURCE_COMMIT"..HEAD)"
           test "$(git diff --name-status "$SOURCE_COMMIT" HEAD)" = \
             $'A\t.github/workflows/pr2211-reader-validation.yml'
           test -z "$(git status --porcelain --untracked-files=all)"
           git show "$SOURCE_COMMIT:$READER" > "$RUNNER_TEMP/pr2211-reader.original"
           cmp "$READER" "$RUNNER_TEMP/pr2211-reader.original"
           sha256sum "$READER" > "$RUNNER_TEMP/pr2211-reader.sha256"
-          echo "Verified event commit, single pinned parent, and workflow-only diff."
+          echo "Verified event commit, pinned source ancestry, and workflow-only diff."
 
       - name: Set up Temurin 8 and sbt
         uses: coursier/setup-action@v3
@@ -269,7 +269,7 @@ jobs:
           PY
 
       - name: Verify the source is still exact
-        if: always()
+        if: ${{ always() && steps.pin.outcome == 'success' }}
         run: |
           set -euo pipefail
           cmp "$READER" "$RUNNER_TEMP/pr2211-reader.original"
