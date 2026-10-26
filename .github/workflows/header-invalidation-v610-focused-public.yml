@@ -1,0 +1,193 @@
+name: Header invalidation v6.0.10 focused check
+
+on:
+  push:
+    branches:
+      - a-shannon/header-invalidation-v610-current-20261026
+
+permissions:
+  contents: read
+
+jobs:
+  history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Confirm source, ancestry and path scope
+        env:
+          BASE_SHA: f2f932bd6a0f8b3516a39f45f9f33f41b6b6f47e
+          PORT_SHA: 8b910390e0de18b83ac3b2aa012b720a1043ec1c
+          PORT_TREE: 3e24f2b531b5c5a0dc3853f5b824e59a65eb17d7
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$PORT_SHA"
+          test "$(git rev-parse HEAD~2)" = "$BASE_SHA"
+          test "$(git show -s --format=%T "$PORT_SHA")" = "$PORT_TREE"
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          base = os.environ["BASE_SHA"]
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", f"{base}...HEAD"], text=True
+          ).splitlines()
+          expected = [
+              ".github/workflows/header-invalidation-v610-focused-public.yml",
+              "src/main/resources/api/openapi.yaml",
+              "src/main/scala/org/ergoplatform/nodeView/history/ErgoHistory.scala",
+              "src/main/scala/org/ergoplatform/nodeView/history/ErgoHistoryReader.scala",
+              "src/main/scala/org/ergoplatform/nodeView/history/storage/HistoryStorage.scala",
+              "src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/HeadersProcessor.scala",
+              "src/test/scala/org/ergoplatform/nodeView/history/VerifyADHistorySpecification.scala",
+          ]
+          if sorted(changed) != sorted(expected):
+              raise SystemExit(f"Unexpected changed paths: {changed!r}")
+          PY
+          mkdir -p out
+          printf 'base=%s\nport=%s\ncommit=%s\ntree=%s\n' \
+            "$BASE_SHA" "$PORT_SHA" "$GITHUB_SHA" "$(git rev-parse HEAD^{tree})" > out/tree.txt
+
+      - name: Set up Java 8 and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache Scala dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-header-invalidation-sbt-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
+
+      - name: Run affected History suites
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.history.VerifyADHistorySpecification.xml
+          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.history.VerifyNonADHistorySpecification.xml
+          rc=0
+          sbt -batch \
+            "testOnly org.ergoplatform.nodeView.history.VerifyADHistorySpecification" \
+            "testOnly org.ergoplatform.nodeView.history.VerifyNonADHistorySpecification" \
+            > "$RUNNER_TEMP/header-invalidation-sbt.log" 2>&1 || rc=$?
+          printf '%s\n' "$rc" > out/sbt-exit.txt
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          log_path = Path(os.environ["RUNNER_TEMP"]) / "header-invalidation-sbt.log"
+          raw = log_path.read_bytes()
+          log = raw.decode("utf-8", errors="replace")
+          locations = re.findall(r"([A-Za-z0-9_]+\.scala):(\d+)", log)
+          categories = {
+              "compiler_error_lines": log.count("[error]"),
+              "java_exception_lines": sum("Exception" in line for line in log.splitlines()),
+              "dependency_resolution_lines": sum(
+                  "Error downloading" in line or "ResolveException" in line
+                  for line in log.splitlines()
+              ),
+          }
+          summary = {
+              "kind": "bounded-setup-observation",
+              "sbt_exit": int(Path("out/sbt-exit.txt").read_text().strip()),
+              "log_bytes": len(raw),
+              "log_lines": len(log.splitlines()),
+              "scala_locations": [
+                  {"file": name, "line": int(number)} for name, number in locations[:12]
+              ],
+              "categories": categories,
+          }
+          Path("out/setup.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
+          PY
+
+      - name: Check named History results
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          suites = (
+              "VerifyADHistorySpecification",
+              "VerifyNonADHistorySpecification",
+          )
+          expected_new = {
+              "invalidating a header-only tip should select the other header at its height",
+              "invalidating a header-only best tip marks its semantic validity invalid",
+              "invalidating the only selected header clears its tip before an equal-score sibling",
+              "invalidating the only full genesis clears both selected tips",
+              "invalidating full genesis selects a previously received full sibling",
+              "invalidating a retained-floor full block clears its selected full tip",
+              "successive invalidations retain a third valid sibling at the same height",
+          }
+          observed = {}
+          names = set()
+          failures = []
+          for suite in suites:
+              path = Path(
+                  "target/test-reports/TEST-org.ergoplatform.nodeView.history." + suite + ".xml"
+              )
+              if not path.is_file():
+                  raise SystemExit(f"No named JUnit report for {suite}; see bounded setup receipt")
+              root = ET.parse(path).getroot()
+              if root.tag != "testsuite":
+                  raise SystemExit(f"Unexpected JUnit root for {suite}")
+              counts = {
+                  key: int(root.get(key, "0"))
+                  for key in ("tests", "failures", "errors", "skipped")
+              }
+              cases = root.findall("testcase")
+              if counts["tests"] < 1 or len(cases) != counts["tests"]:
+                  raise SystemExit(f"JUnit count mismatch for {suite}")
+              names.update(case.get("name") for case in cases if suite == suites[0])
+              failures.extend(
+                  {"suite": suite, "name": case.get("name")}
+                  for case in cases
+                  if case.find("failure") is not None or case.find("error") is not None
+              )
+              observed[suite] = counts
+          missing = sorted(expected_new - names)
+          result = {
+              "kind": "focused-header-invalidation",
+              "suites": observed,
+              "new_cases_present": len(expected_new) - len(missing),
+              "missing_new_cases": missing,
+              "failed_case_names": failures[:12],
+              "sbt_exit": int(Path("out/sbt-exit.txt").read_text().strip()),
+          }
+          Path("out/diagnostic.json").write_text(json.dumps(result, sort_keys=True) + "\n")
+          if (
+              missing
+              or failures
+              or any(c["failures"] or c["errors"] or c["skipped"] for c in observed.values())
+              or result["sbt_exit"] != 0
+          ):
+              raise SystemExit("Focused History suites did not meet the exact-input oracle")
+          print("Focused History suites passed with all seven new invalidation cases")
+          PY
+          echo "Focused source test only; no full release or network verdict." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain bounded receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: header-invalidation-v610-${{ github.sha }}
+          path: |
+            out/tree.txt
+            out/sbt-exit.txt
+            out/setup.json
+            out/diagnostic.json
+          if-no-files-found: error
+          retention-days: 7
