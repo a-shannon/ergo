@@ -8,10 +8,12 @@ import org.ergoplatform.settings.{Algos, ErgoSettings}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.core.VersionTag
 import org.ergoplatform.serialization.{ManifestSerializer, SubtreeSerializer}
-import scorex.db.LDBVersionedStore
+import scorex.db.{ByteArrayWrapper, LDBKVStore, LDBVersionedStore}
 import scorex.util.ModifierId
 
+import scala.collection.mutable
 import scala.util.Random
+import scala.util.{Failure, Success, Try}
 
 class UtxoSetSnapshotProcessorSpecification extends ErgoCorePropertyTest {
   import org.ergoplatform.utils.HistoryTestHelpers.generateHistory
@@ -96,6 +98,121 @@ class UtxoSetSnapshotProcessorSpecification extends ErgoCorePropertyTest {
     bh.sortedBoxes.foreach { box =>
       restoredState.boxById(box.id).isDefined shouldBe true
     }
+  }
+
+  property("snapshot floor write failure retains the download needed for retry") {
+    val holder = boxesHolderGenOfSize(32 * 1024).sample.get
+    val state = createUtxoState(holder, parameters)
+    val snapshotHeight = epochLength - 1
+    state.dumpSnapshot(snapshotHeight, state.rootDigest.dropRight(1)).get
+    val manifestId = state.snapshotsDb.readSnapshotsInfo.availableManifests(snapshotHeight)
+    val manifest = ManifestSerializer.defaultSerializer.parseBytes(
+      state.snapshotsDb.readManifestBytes(manifestId).get)
+    val chunks = manifest.subtreesIds.map(state.snapshotsDb.readSubtreeBytes(_).get)
+    val blockId = ModifierId @@ Algos.encode(Array.fill(32)(42.toByte))
+
+    def processor(storage: HistoryStorage, configured: ErgoSettings): UtxoSetSnapshotProcessor =
+      new UtxoSetSnapshotProcessor {
+        override protected val settings: ErgoSettings = configured
+        override protected val historyStorage: HistoryStorage = storage
+      }
+
+    def restoreBeforeFinalization(p: UtxoSetSnapshotProcessor): Unit = {
+      p.registerManifestToDownload(manifest, snapshotHeight, Seq.empty)
+      val requested = p.getChunkIdsToDownload(manifest.subtreesIds.size)
+      requested.size shouldBe chunks.size
+      requested.zip(manifest.subtreesIds).forall { case (actual, expected) =>
+        actual.sameElements(expected)
+      } shouldBe true
+      requested.zip(chunks).foreach { case (id, bytes) =>
+        p.registerDownloadedChunk(id, bytes)
+      }
+      p.utxoSetSnapshotDownloadPlan().get.fullyDownloaded shouldBe true
+      val store = new LDBVersionedStore(createTempDir, initialKeepVersions = 100)
+      try {
+        p.createPersistentProver(store, history, snapshotHeight, blockId).isSuccess shouldBe true
+      } finally {
+        store.close()
+      }
+    }
+
+    val healthySettings = s.copy(
+      directory = createTempDir.getAbsolutePath,
+      chainSettings = s.chainSettings.copy(voting = s.chainSettings.voting.copy(votingLength = epochLength)))
+    val healthyStorage = HistoryStorage(healthySettings)
+    try {
+      val healthy = processor(healthyStorage, healthySettings)
+      restoreBeforeFinalization(healthy)
+      healthy.onUtxoSnapshotApplied(snapshotHeight)
+      healthy.utxoSetSnapshotDownloadPlan() shouldBe None
+      healthy.readMinimalFullBlockHeight() shouldBe snapshotHeight + 1
+    } finally {
+      healthyStorage.close()
+    }
+    val reopenedStorage = HistoryStorage(healthySettings)
+    try {
+      processor(reopenedStorage, healthySettings).readMinimalFullBlockHeight() shouldBe snapshotHeight + 1
+    } finally {
+      reopenedStorage.close()
+    }
+
+    val objectsStore = new SnapshotMemoryStore
+    val indexStore = new SnapshotMemoryStore
+    val extraStore = new SnapshotMemoryStore
+    val failedStorage = new HistoryStorage(indexStore, objectsStore, extraStore, s.cacheSettings)
+    try {
+      val failed = processor(failedStorage, healthySettings)
+      restoreBeforeFinalization(failed)
+      val chunksBefore = objectsStore.rowCount
+      chunksBefore should be > 0
+      indexStore.failNextBatchInsert = true
+      failed.onUtxoSnapshotApplied(snapshotHeight)
+      indexStore.batchInsertFailures shouldBe 1
+
+      val planRetained = failed.utxoSetSnapshotDownloadPlan().nonEmpty
+      val chunksRetained = objectsStore.rowCount == chunksBefore
+      val floor = failed.readMinimalFullBlockHeight()
+      withClue(s"planRetained=$planRetained, chunksRetained=$chunksRetained, floor=$floor: ") {
+        (planRetained && chunksRetained && floor == GenesisHeight) shouldBe true
+      }
+    } finally {
+      failedStorage.close()
+    }
+  }
+
+  private class SnapshotMemoryStore extends LDBKVStore(null) {
+    private val rows = mutable.Map.empty[ByteArrayWrapper, Array[Byte]]
+    var failNextBatchInsert: Boolean = false
+    var batchInsertFailures: Int = 0
+
+    def rowCount: Int = rows.size
+
+    override def get(key: Array[Byte]): Option[Array[Byte]] =
+      rows.get(ByteArrayWrapper(key)).map(_.clone())
+
+    override def insert(key: Array[Byte], value: Array[Byte]): Try[Unit] = {
+      rows.update(ByteArrayWrapper(key.clone()), value.clone())
+      Success(())
+    }
+
+    override def insert(keys: Array[Array[Byte]], values: Array[Array[Byte]]): Try[Unit] = {
+      require(keys.length == values.length)
+      if (failNextBatchInsert) {
+        failNextBatchInsert = false
+        batchInsertFailures += 1
+        Failure(new IllegalStateException("injected snapshot floor write failure"))
+      } else {
+        keys.indices.foreach(i => rows.update(ByteArrayWrapper(keys(i).clone()), values(i).clone()))
+        Success(())
+      }
+    }
+
+    override def remove(keys: Array[Array[Byte]]): Try[Unit] = {
+      keys.foreach(key => rows.remove(ByteArrayWrapper(key)))
+      Success(())
+    }
+
+    override def close(): Unit = ()
   }
 
 }
