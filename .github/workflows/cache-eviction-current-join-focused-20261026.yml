@@ -24,13 +24,15 @@ jobs:
           PR_SHA: 0c8f73bb9a9c8cd5b37f0a96c28a0952ae83727b
           MERGE_SHA: 18a38c25e8d4dc902a7df3344e4f36be0a857188
           MERGE_TREE: 9621f58ce773c70487d330946741110065636d22
+          WORKFLOW_PARENT_SHA: b0e9820eba0d227b07e518a58cb5bcb16e5c10fb
           PRODUCT_BLOB: 3793345f637c3132eda02abbe6ddd8e9480b40d7
           CACHE_TEST_BLOB: eabc76b31e8a68bb6768981496678c425f44e8d3
           HOLDER_TEST_BLOB: 00bda290222ee80f591ca84ea2bacf9f0c16a2c3
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git rev-parse HEAD^)" = "$MERGE_SHA"
+          test "$(git rev-parse HEAD^)" = "$WORKFLOW_PARENT_SHA"
+          test "$(git rev-parse "$WORKFLOW_PARENT_SHA^")" = "$MERGE_SHA"
           test "$(git rev-parse "$MERGE_SHA^1")" = "$BASE_SHA"
           test "$(git rev-parse "$MERGE_SHA^2")" = "$PR_SHA"
           test "$(git show -s --format=%T "$MERGE_SHA")" = "$MERGE_TREE"
@@ -46,6 +48,7 @@ jobs:
 
           base = os.environ["BASE_SHA"]
           merge = os.environ["MERGE_SHA"]
+          workflow_parent = os.environ["WORKFLOW_PARENT_SHA"]
           source_paths = subprocess.check_output(
               ["git", "diff", "--name-only", f"{base}..{merge}"], text=True
           ).splitlines()
@@ -57,10 +60,15 @@ jobs:
           workflow_paths = subprocess.check_output(
               ["git", "diff", "--name-only", f"{merge}..HEAD"], text=True
           ).splitlines()
+          parent_paths = subprocess.check_output(
+              ["git", "diff", "--name-only", f"{workflow_parent}..HEAD"], text=True
+          ).splitlines()
           if sorted(source_paths) != sorted(expected_source_paths):
               raise SystemExit(f"Unexpected source paths: {source_paths!r}")
           if workflow_paths != [".github/workflows/cache-eviction-current-join-focused-20261026.yml"]:
               raise SystemExit(f"Unexpected workflow paths: {workflow_paths!r}")
+          if parent_paths != workflow_paths:
+              raise SystemExit(f"Unexpected new workflow paths: {parent_paths!r}")
           Path("out").mkdir(exist_ok=True)
           record = {
               "base": base,
@@ -70,6 +78,7 @@ jobs:
               "product_blob": os.environ["PRODUCT_BLOB"],
               "cache_test_blob": os.environ["CACHE_TEST_BLOB"],
               "holder_test_blob": os.environ["HOLDER_TEST_BLOB"],
+              "workflow_parent": workflow_parent,
               "workflow": os.environ["GITHUB_SHA"],
               "workflow_tree": subprocess.check_output(
                   ["git", "rev-parse", "HEAD^{tree}"], text=True
@@ -122,7 +131,7 @@ jobs:
               ),
               "ErgoNodeViewHolderSpec": (
                   "org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec",
-                  17,
+                  110,
                   "remote section cache evicts the oldest pending section after queue cleanup",
               ),
           }
