@@ -25,21 +25,39 @@ jobs:
           LOCK_SHA: d4019b692ab86304612dc3f58421919b34057134
           COMPOSE_SHA: bd9f1e21e7289c6041246d0d5f0dd06f2a674730
           COMPOSE_TREE: 729e99706ef8f83222033b3b01dd388dc5692b56
-          WORKFLOW_PARENT_SHA: 606bca08c9ce1b3eda4589b5ba5f9d10ce1e5161
+          INITIAL_WORKFLOW_SHA: 606bca08c9ce1b3eda4589b5ba5f9d10ce1e5161
+          PHASE_WORKFLOW_SHA: f814a3906898e76536fbd8e64cd58ea2a4e02fe9
+          WORKFLOW_PARENT_SHA: e3aabb374efecb8a0628b871240133b1937784ba
+          SOURCE_FIX_TREE: a5c4ddd21188cbf5b5af96dd09563c3d151d5e6d
+          REPAIR_TEST_BLOB: 0aae0df8c5291f896d3db3deba2a437e09108ae7
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD^)" = "$WORKFLOW_PARENT_SHA"
-          test "$(git rev-parse "$WORKFLOW_PARENT_SHA^")" = "$COMPOSE_SHA"
+          test "$(git rev-parse "$WORKFLOW_PARENT_SHA^")" = "$PHASE_WORKFLOW_SHA"
+          test "$(git rev-parse "$PHASE_WORKFLOW_SHA^")" = "$INITIAL_WORKFLOW_SHA"
+          test "$(git rev-parse "$INITIAL_WORKFLOW_SHA^")" = "$COMPOSE_SHA"
           test "$(git rev-parse "$COMPOSE_SHA^1")" = "$PORT_SHA"
           test "$(git rev-parse "$COMPOSE_SHA^2")" = "$LOCK_SHA"
           test "$(git rev-parse "$PORT_SHA^")" = "$BASE_SHA"
           test "$(git show -s --format=%T "$COMPOSE_SHA")" = "$COMPOSE_TREE"
+          test "$(git show -s --format=%T "$WORKFLOW_PARENT_SHA")" = "$SOURCE_FIX_TREE"
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/RepairCacheRaceSpecification.scala)" = "$REPAIR_TEST_BLOB"
           python3 - <<'PY'
           import os
           import subprocess
 
           base = os.environ["BASE_SHA"]
+          source_delta = subprocess.check_output(
+              ["git", "diff", "--name-only", os.environ["COMPOSE_SHA"] + ".." + os.environ["WORKFLOW_PARENT_SHA"]],
+              text=True,
+          ).splitlines()
+          expected_source_delta = [
+              ".github/workflows/header-cache-lock-v610-focused-public.yml",
+              "src/test/scala/org/ergoplatform/nodeView/history/RepairCacheRaceSpecification.scala",
+          ]
+          if sorted(source_delta) != sorted(expected_source_delta):
+              raise SystemExit(f"Unexpected source-fix paths: {source_delta!r}")
           changed = subprocess.check_output(
               ["git", "diff", "--name-only", f"{base}...HEAD"], text=True
           ).splitlines()
@@ -57,8 +75,8 @@ jobs:
               raise SystemExit(f"Unexpected changed paths: {changed!r}")
           PY
           mkdir -p out
-          printf 'base=%s\nport=%s\nlock=%s\ncompose=%s\nworkflow_parent=%s\ncommit=%s\ntree=%s\n' \
-            "$BASE_SHA" "$PORT_SHA" "$LOCK_SHA" "$COMPOSE_SHA" "$WORKFLOW_PARENT_SHA" "$GITHUB_SHA" \
+          printf 'base=%s\nport=%s\nlock=%s\ncompose=%s\ncompose_tree=%s\ninitial_workflow=%s\nphase_workflow=%s\nsource_fix=%s\nsource_fix_tree=%s\nrepair_test_blob=%s\ncommit=%s\ntree=%s\n' \
+            "$BASE_SHA" "$PORT_SHA" "$LOCK_SHA" "$COMPOSE_SHA" "$COMPOSE_TREE" "$INITIAL_WORKFLOW_SHA" "$PHASE_WORKFLOW_SHA" "$WORKFLOW_PARENT_SHA" "$SOURCE_FIX_TREE" "$REPAIR_TEST_BLOB" "$GITHUB_SHA" \
             "$(git rev-parse HEAD^{tree})" > out/tree.txt
 
       - name: Set up Java 8 and sbt
