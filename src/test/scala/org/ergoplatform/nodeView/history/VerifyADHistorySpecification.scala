@@ -660,4 +660,61 @@ class VerifyADHistorySpecification extends ErgoCorePropertyTest with NoShrink {
     }
   }
 
+  // The first restart leaves the prune record at 4. A fresh header then persists floor 5 without pruning height 4.
+  // Removing only the record at that point models an older database reopened after this header/block cutpoint.
+  private def checkPruningAfterFloorAdvance(removeRecord: Boolean): Unit = {
+    val settings = prunedHistorySettings()
+    var history = ErgoHistory.readOrGenerate(settings)(null)
+    history.writeMinimalFullBlockHeight(GenesisHeight)
+    history.isHeadersChainSyncedVar = true
+    val chain = genChain(BlocksToKeep + 9)
+    def at(h: Int) = chain(h - 1)
+    def sections(h: Int) = at(h).header.sectionIds.map(_._2)
+
+    (1 to 14).foreach(h => history = applyBlock(history, at(h)))
+    history.readMinimalFullBlockHeight() shouldBe 4
+    history.readPrunedBelowHeight() shouldBe Some(4)
+    sections(4).forall(history.contains) shouldBe true
+    history.closeStorage()
+
+    history = ErgoHistory.readOrGenerate(settings)(null)
+    history.readPrunedBelowHeight() shouldBe Some(4)
+    history.isHeadersChainSynced shouldBe false
+    history = applyHeaderChain(history, HeaderChain(Seq(at(15).header)))
+    history.isHeadersChainSynced shouldBe true
+    history.readMinimalFullBlockHeight() shouldBe 5
+    history.bestFullBlockOpt.value.header shouldBe at(14).header
+    sections(4).forall(history.contains) shouldBe true
+
+    if (removeRecord) {
+      history.historyStorage.remove(Array(history.PrunedBelowHeightKey), Array.empty).get
+      history.readPrunedBelowHeight() shouldBe None
+    } else {
+      history.readPrunedBelowHeight() shouldBe Some(4)
+    }
+    history.closeStorage()
+
+    history = ErgoHistory.readOrGenerate(settings)(null)
+    history.isHeadersChainSynced shouldBe false
+    history.readMinimalFullBlockHeight() shouldBe 5
+    history.bestFullBlockOpt.value.header shouldBe at(14).header
+    sections(4).forall(history.contains) shouldBe true
+    history.setHeadersChainSynced()
+    (15 to 20).foreach(h => history = applyBlock(history, at(h)))
+
+    val floor = history.readMinimalFullBlockHeight()
+    floor shouldBe 10
+    (2 until floor).filter(h => sections(h).exists(history.contains)) shouldBe empty
+    (floor to 20).filter(h => !sections(h).forall(history.contains)) shouldBe empty
+    history.closeStorage()
+  }
+
+  property("prune the old floor after a restart with its record intact") {
+    checkPruningAfterFloorAdvance(removeRecord = false)
+  }
+
+  property("prune the old floor after a legacy restart without its record") {
+    checkPruningAfterFloorAdvance(removeRecord = true)
+  }
+
 }

@@ -1,0 +1,137 @@
+name: PR 2845 pruned record cutpoint diagnostic
+
+on:
+  push:
+    branches:
+      - a-shannon/pr2845-prune-cutpoint-v609-20261026
+
+permissions:
+  contents: read
+
+jobs:
+  cutpoint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Confirm source and path scope
+        env:
+          BASE_SHA: 574fefb0c82eb67e8dde0b4334f67e1aec0a3537
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          base = os.environ["BASE_SHA"]
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", f"{base}...HEAD"], text=True
+          ).splitlines()
+          expected = [
+              ".github/workflows/pr2845-prune-cutpoint-public.yml",
+              "src/test/scala/org/ergoplatform/nodeView/history/VerifyADHistorySpecification.scala",
+          ]
+          if sorted(changed) != sorted(expected):
+              raise SystemExit(f"Unexpected changed paths: {changed!r}")
+          PY
+          mkdir -p out
+          printf 'base=%s\ncommit=%s\ntree=%s\n' "$BASE_SHA" "$GITHUB_SHA" "$(git rev-parse HEAD^{tree})" > out/tree.txt
+
+      - name: Set up Java 8 and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache Scala dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-prune-cutpoint-sbt-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
+
+      - name: Run one affected History suite
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.history.VerifyADHistorySpecification.xml
+          rc=0
+          sbt -batch "testOnly org.ergoplatform.nodeView.history.VerifyADHistorySpecification" > "$RUNNER_TEMP/prune-cutpoint-sbt.log" 2>&1 || rc=$?
+          printf '%s\n' "$rc" > out/sbt-exit.txt
+
+      - name: Check the isolated expected failure
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = Path("target/test-reports/TEST-org.ergoplatform.nodeView.history.VerifyADHistorySpecification.xml")
+          output = Path("out")
+          output.mkdir(exist_ok=True)
+          if not report.is_file():
+              raise SystemExit("No named JUnit report: compile/setup result is not a test verdict")
+          root = ET.parse(report).getroot()
+          if root.tag != "testsuite":
+              raise SystemExit("Unexpected JUnit root")
+          counts = {key: int(root.get(key, "0")) for key in ("tests", "failures", "errors", "skipped")}
+          cases = root.findall("testcase")
+          if len(cases) != counts["tests"]:
+              raise SystemExit("JUnit case count disagrees with suite summary")
+          healthy = "prune the old floor after a restart with its record intact"
+          recordless = "prune the old floor after a legacy restart without its record"
+          named = {case.get("name"): case for case in cases}
+          if healthy not in named or recordless not in named:
+              raise SystemExit("One or both cutpoint controls did not execute")
+          if named[healthy].find("failure") is not None or named[healthy].find("error") is not None:
+              raise SystemExit("Kept-record healthy control failed")
+          failed = [case for case in cases if case.find("failure") is not None]
+          if (
+              counts != {"tests": 24, "failures": 1, "errors": 0, "skipped": 0}
+              or len(failed) != 1
+              or failed[0].get("name") != recordless
+          ):
+              raise SystemExit(f"Unexpected JUnit outcome: {counts}, failed={[c.get('name') for c in failed]}")
+          message = failed[0].find("failure").get("message", "")
+          if "Vector(4) was not empty" not in message:
+              raise SystemExit("Recordless arm failed at a different assertion")
+          sbt_exit = int((output / "sbt-exit.txt").read_text().strip())
+          if sbt_exit == 0:
+              raise SystemExit("Sbt reported success despite the expected failed assertion")
+          result = {
+              "kind": "expected-red-cutpoint-diagnostic",
+              "tests": counts["tests"],
+              "failures": counts["failures"],
+              "errors": counts["errors"],
+              "skipped": counts["skipped"],
+              "healthy_control": healthy,
+              "single_failed_case": recordless,
+              "sbt_exit": sbt_exit,
+          }
+          (output / "diagnostic.json").write_text(json.dumps(result, sort_keys=True) + "\n")
+          # The raw JUnit file stays on the runner: it includes JVM properties and test output.
+          print("Expected-red cutpoint confirmed: 24 tests, one named assertion failure")
+          PY
+          echo "Expected-red diagnostic only; this workflow does not validate a production fix." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain bounded evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr2845-prune-cutpoint-${{ github.sha }}
+          path: |
+            out/tree.txt
+            out/sbt-exit.txt
+            out/diagnostic.json
+          if-no-files-found: error
+          retention-days: 7
