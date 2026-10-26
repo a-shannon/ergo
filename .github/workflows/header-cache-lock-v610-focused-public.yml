@@ -1,0 +1,210 @@
+name: Header invalidation and cache lock v6.0.10 focused check
+
+on:
+  push:
+    branches:
+      - a-shannon/header-cache-lock-v610-current-20261026
+
+permissions:
+  contents: read
+
+jobs:
+  history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Confirm source, ancestry and path scope
+        env:
+          BASE_SHA: f2f932bd6a0f8b3516a39f45f9f33f41b6b6f47e
+          PORT_SHA: 8b910390e0de18b83ac3b2aa012b720a1043ec1c
+          LOCK_SHA: d4019b692ab86304612dc3f58421919b34057134
+          COMPOSE_SHA: bd9f1e21e7289c6041246d0d5f0dd06f2a674730
+          COMPOSE_TREE: 729e99706ef8f83222033b3b01dd388dc5692b56
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$COMPOSE_SHA"
+          test "$(git rev-parse "$COMPOSE_SHA^1")" = "$PORT_SHA"
+          test "$(git rev-parse "$COMPOSE_SHA^2")" = "$LOCK_SHA"
+          test "$(git rev-parse "$PORT_SHA^")" = "$BASE_SHA"
+          test "$(git show -s --format=%T "$COMPOSE_SHA")" = "$COMPOSE_TREE"
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          base = os.environ["BASE_SHA"]
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", f"{base}...HEAD"], text=True
+          ).splitlines()
+          expected = [
+              ".github/workflows/header-cache-lock-v610-focused-public.yml",
+              "src/main/resources/api/openapi.yaml",
+              "src/main/scala/org/ergoplatform/nodeView/history/ErgoHistory.scala",
+              "src/main/scala/org/ergoplatform/nodeView/history/ErgoHistoryReader.scala",
+              "src/main/scala/org/ergoplatform/nodeView/history/storage/HistoryStorage.scala",
+              "src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/HeadersProcessor.scala",
+              "src/test/scala/org/ergoplatform/nodeView/history/RepairCacheRaceSpecification.scala",
+              "src/test/scala/org/ergoplatform/nodeView/history/VerifyADHistorySpecification.scala",
+          ]
+          if sorted(changed) != sorted(expected):
+              raise SystemExit(f"Unexpected changed paths: {changed!r}")
+          PY
+          mkdir -p out
+          printf 'base=%s\nport=%s\nlock=%s\ncompose=%s\ncommit=%s\ntree=%s\n' \
+            "$BASE_SHA" "$PORT_SHA" "$LOCK_SHA" "$COMPOSE_SHA" "$GITHUB_SHA" \
+            "$(git rev-parse HEAD^{tree})" > out/tree.txt
+
+      - name: Set up Java 8 and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache Scala dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-header-invalidation-sbt-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
+
+      - name: Run affected History and cache-race suites
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.history.VerifyADHistorySpecification.xml
+          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.history.VerifyNonADHistorySpecification.xml
+          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.history.RepairCacheRaceSpecification.xml
+          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.history.BlockSectionValidationSpecification.xml
+          rc=0
+          sbt -batch \
+            "testOnly org.ergoplatform.nodeView.history.VerifyADHistorySpecification" \
+            "testOnly org.ergoplatform.nodeView.history.VerifyNonADHistorySpecification" \
+            "testOnly org.ergoplatform.nodeView.history.RepairCacheRaceSpecification" \
+            "testOnly org.ergoplatform.nodeView.history.BlockSectionValidationSpecification" \
+            > "$RUNNER_TEMP/header-cache-lock-sbt.log" 2>&1 || rc=$?
+          printf '%s\n' "$rc" > out/sbt-exit.txt
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          log_path = Path(os.environ["RUNNER_TEMP"]) / "header-cache-lock-sbt.log"
+          raw = log_path.read_bytes()
+          log = raw.decode("utf-8", errors="replace")
+          locations = re.findall(r"([A-Za-z0-9_]+\.scala):(\d+)", log)
+          categories = {
+              "compiler_error_lines": log.count("[error]"),
+              "java_exception_lines": sum("Exception" in line for line in log.splitlines()),
+              "dependency_resolution_lines": sum(
+                  "Error downloading" in line or "ResolveException" in line
+                  for line in log.splitlines()
+              ),
+          }
+          summary = {
+              "kind": "bounded-setup-observation",
+              "sbt_exit": int(Path("out/sbt-exit.txt").read_text().strip()),
+              "log_bytes": len(raw),
+              "log_lines": len(log.splitlines()),
+              "scala_locations": [
+                  {"file": name, "line": int(number)} for name, number in locations[:12]
+              ],
+              "categories": categories,
+          }
+          Path("out/setup.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
+          PY
+
+      - name: Check named History and cache-race results
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          suites = (
+              "VerifyADHistorySpecification",
+              "VerifyNonADHistorySpecification",
+              "RepairCacheRaceSpecification",
+              "BlockSectionValidationSpecification",
+          )
+          expected_required = {
+              "invalidating a header-only tip should select the other header at its height",
+              "invalidating a header-only best tip marks its semantic validity invalid",
+              "invalidating the only selected header clears its tip before an equal-score sibling",
+              "invalidating the only full genesis clears both selected tips",
+              "invalidating full genesis selects a previously received full sibling",
+              "invalidating a retained-floor full block clears its selected full tip",
+              "successive invalidations retain a third valid sibling at the same height",
+              "header whose parent is keepVersions or more below the best full block is rejected",
+              "a read racing repair cannot restore a removed height row",
+              "a cached hit stays available while an index removal finishes",
+              "a mixed index update cannot restore a removed row from a paused cache miss",
+              "ADProofs with right headerId but wrong digest are rejected and do not invalidate the header",
+          }
+          observed = {}
+          names = set()
+          failures = []
+          for suite in suites:
+              path = Path(
+                  "target/test-reports/TEST-org.ergoplatform.nodeView.history." + suite + ".xml"
+              )
+              if not path.is_file():
+                  raise SystemExit(f"No named JUnit report for {suite}; see bounded setup receipt")
+              root = ET.parse(path).getroot()
+              if root.tag != "testsuite":
+                  raise SystemExit(f"Unexpected JUnit root for {suite}")
+              counts = {
+                  key: int(root.get(key, "0"))
+                  for key in ("tests", "failures", "errors", "skipped")
+              }
+              cases = root.findall("testcase")
+              if counts["tests"] < 1 or len(cases) != counts["tests"]:
+                  raise SystemExit(f"JUnit count mismatch for {suite}")
+              names.update(case.get("name") for case in cases)
+              failures.extend(
+                  {"suite": suite, "name": case.get("name")}
+                  for case in cases
+                  if case.find("failure") is not None or case.find("error") is not None
+              )
+              observed[suite] = counts
+          missing_required = sorted(expected_required - names)
+          result = {
+              "kind": "focused-header-cache-lock-composition",
+              "suites": observed,
+              "required_cases_present": len(expected_required) - len(missing_required),
+              "missing_required_cases": missing_required,
+              "failed_case_names": failures[:12],
+              "sbt_exit": int(Path("out/sbt-exit.txt").read_text().strip()),
+          }
+          Path("out/diagnostic.json").write_text(json.dumps(result, sort_keys=True) + "\n")
+          if (
+              missing_required
+              or failures
+              or any(c["failures"] or c["errors"] or c["skipped"] for c in observed.values())
+              or result["sbt_exit"] != 0
+          ):
+              raise SystemExit("Focused History suites did not meet the exact-input oracle")
+          print("Focused History/cache-lock suites passed with all 12 named cases")
+          PY
+          echo "Focused source test only; no full release or network verdict." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain bounded receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: header-cache-lock-v610-${{ github.sha }}
+          path: |
+            out/tree.txt
+            out/sbt-exit.txt
+            out/setup.json
+            out/diagnostic.json
+          if-no-files-found: error
+          retention-days: 7
