@@ -1,0 +1,182 @@
+name: Cache eviction current v6.0.10 composition check
+
+on:
+  push:
+    branches:
+      - a-shannon/cache-eviction-v610-current-join-20261026
+
+permissions:
+  contents: read
+
+jobs:
+  cache-holder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Confirm source, ancestry and path scope
+        env:
+          BASE_SHA: f2f932bd6a0f8b3516a39f45f9f33f41b6b6f47e
+          PR_SHA: 0c8f73bb9a9c8cd5b37f0a96c28a0952ae83727b
+          MERGE_SHA: 18a38c25e8d4dc902a7df3344e4f36be0a857188
+          MERGE_TREE: 9621f58ce773c70487d330946741110065636d22
+          PRODUCT_BLOB: 3793345f637c3132eda02abbe6ddd8e9480b40d7
+          CACHE_TEST_BLOB: eabc76b31e8a68bb6768981496678c425f44e8d3
+          HOLDER_TEST_BLOB: 00bda290222ee80f591ca84ea2bacf9f0c16a2c3
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$MERGE_SHA"
+          test "$(git rev-parse "$MERGE_SHA^1")" = "$BASE_SHA"
+          test "$(git rev-parse "$MERGE_SHA^2")" = "$PR_SHA"
+          test "$(git show -s --format=%T "$MERGE_SHA")" = "$MERGE_TREE"
+          test "$(git rev-parse HEAD:src/main/scala/scorex/core/ModifiersCache.scala)" = "$PRODUCT_BLOB"
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/ErgoModifiersCacheSpec.scala)" = "$CACHE_TEST_BLOB"
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/viewholder/ErgoNodeViewHolderSpec.scala)" = "$HOLDER_TEST_BLOB"
+          git diff --check "$BASE_SHA"..HEAD
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          base = os.environ["BASE_SHA"]
+          merge = os.environ["MERGE_SHA"]
+          source_paths = subprocess.check_output(
+              ["git", "diff", "--name-only", f"{base}..{merge}"], text=True
+          ).splitlines()
+          expected_source_paths = [
+              "src/main/scala/scorex/core/ModifiersCache.scala",
+              "src/test/scala/org/ergoplatform/nodeView/ErgoModifiersCacheSpec.scala",
+              "src/test/scala/org/ergoplatform/nodeView/viewholder/ErgoNodeViewHolderSpec.scala",
+          ]
+          workflow_paths = subprocess.check_output(
+              ["git", "diff", "--name-only", f"{merge}..HEAD"], text=True
+          ).splitlines()
+          if sorted(source_paths) != sorted(expected_source_paths):
+              raise SystemExit(f"Unexpected source paths: {source_paths!r}")
+          if workflow_paths != [".github/workflows/cache-eviction-current-join-focused-20261026.yml"]:
+              raise SystemExit(f"Unexpected workflow paths: {workflow_paths!r}")
+          Path("out").mkdir(exist_ok=True)
+          record = {
+              "base": base,
+              "pr": os.environ["PR_SHA"],
+              "merge": merge,
+              "merge_tree": os.environ["MERGE_TREE"],
+              "product_blob": os.environ["PRODUCT_BLOB"],
+              "cache_test_blob": os.environ["CACHE_TEST_BLOB"],
+              "holder_test_blob": os.environ["HOLDER_TEST_BLOB"],
+              "workflow": os.environ["GITHUB_SHA"],
+              "workflow_tree": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD^{tree}"], text=True
+              ).strip(),
+          }
+          Path("out/tree.json").write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+      - name: Set up Java 8 and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache Scala dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-cache-eviction-sbt-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
+
+      - name: Run affected cache and Holder suites
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.ErgoModifiersCacheSpec.xml
+          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec.xml
+          rc=0
+          sbt -batch \
+            "testOnly org.ergoplatform.nodeView.ErgoModifiersCacheSpec" \
+            "testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec" \
+            > "$RUNNER_TEMP/cache-holder-focused-sbt.log" 2>&1 || rc=$?
+          printf '%s\n' "$rc" > out/sbt-exit.txt
+
+      - name: Check named cache and Holder results
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          suites = {
+              "ErgoModifiersCacheSpec": (
+                  "org.ergoplatform.nodeView.ErgoModifiersCacheSpec",
+                  5,
+                  "queue cleanup preserves the newest key for later eviction",
+              ),
+              "ErgoNodeViewHolderSpec": (
+                  "org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec",
+                  17,
+                  "remote section cache evicts the oldest pending section after queue cleanup",
+              ),
+          }
+          exit_path = Path("out/sbt-exit.txt")
+          sbt_exit = int(exit_path.read_text(encoding="utf-8").strip()) if exit_path.is_file() else None
+          observed = {}
+          passed = sbt_exit == 0
+          for label, (qualified, expected_count, required_name) in suites.items():
+              report = Path("target/test-reports/TEST-" + qualified + ".xml")
+              result = {"present": report.is_file(), "parsed": False,
+                        "tests": 0, "failures": 0, "errors": 0, "skipped": 0,
+                        "required_present": False, "required_passed": False}
+              if report.is_file():
+                  try:
+                      root = ET.parse(report).getroot()
+                      suite = root if root.tag.rsplit("}", 1)[-1] == "testsuite" else next(
+                          node for node in root.iter()
+                          if node.tag.rsplit("}", 1)[-1] == "testsuite"
+                      )
+                      for field in ("tests", "failures", "errors", "skipped"):
+                          result[field] = int(suite.attrib.get(field, "0"))
+                      cases = [node for node in suite.iter()
+                               if node.tag.rsplit("}", 1)[-1] == "testcase"]
+                      required = [case for case in cases
+                                  if case.attrib.get("name") == required_name]
+                      result["required_present"] = len(required) == 1
+                      result["required_passed"] = len(required) == 1 and not any(
+                          child.tag.rsplit("}", 1)[-1] in ("failure", "error", "skipped")
+                          for child in required[0]
+                      )
+                      result["parsed"] = True
+                  except (ET.ParseError, OSError, StopIteration, ValueError):
+                      result["parsed"] = False
+              observed[label] = result
+              passed = passed and result["parsed"] and result["tests"] == expected_count
+              passed = passed and result["failures"] == 0 and result["errors"] == 0
+              passed = passed and result["skipped"] == 0 and result["required_passed"]
+          summary = {"kind": "focused-current-cache-holder-composition",
+                     "sbt_exit": sbt_exit, "passed": bool(passed), "suites": observed}
+          Path("out/diagnostic.json").write_text(
+              json.dumps(summary, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          if not passed:
+              raise SystemExit("Named cache/Holder JUnit oracle failed")
+          print("Named cache/Holder suites passed on the pinned composition")
+          PY
+
+      - name: Retain bounded receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-holder-current-${{ github.sha }}
+          path: |
+            out/tree.json
+            out/sbt-exit.txt
+            out/diagnostic.json
+          if-no-files-found: error
