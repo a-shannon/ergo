@@ -1,0 +1,163 @@
+name: AVLD snapshot zero-retention #2813 composition
+
+on:
+  push:
+    branches:
+      - a-shannon/avld-snapshot-zero-retention-2813-20261026
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot-reopen-composed:
+    if: >-
+      github.repository == 'a-shannon/ergo' &&
+      github.event.repository.private == false &&
+      github.ref == 'refs/heads/a-shannon/avld-snapshot-zero-retention-2813-20261026'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Require the intended public fork
+        shell: bash
+        env:
+          TARGET_REPOSITORY: ${{ github.repository }}
+          TARGET_PRIVATE: ${{ github.event.repository.private }}
+          TARGET_API: ${{ github.api_url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$TARGET_REPOSITORY" = 'a-shannon/ergo'
+          test "$TARGET_PRIVATE" = 'false'
+          curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$TARGET_API/repos/$TARGET_REPOSITORY" |
+            python3 -c "import json,sys; r=json.load(sys.stdin); assert r.get('full_name') == 'a-shannon/ergo' and r.get('private') is False"
+
+      - name: Checkout the exact two-file composed control
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify source and test identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = 'b18eeaac91b1b47b5e3b83e0dd1204963ba06ef3'
+          workflow_path='.github/workflows/avld-snapshot-zero-retention-2813-v610.yml'
+          test_path='src/test/scala/org/ergoplatform/nodeView/history/UtxoSetSnapshotProcessorSpecification.scala'
+          diff -u \
+            <(printf '%s\n' "$workflow_path" "$test_path" | sort) \
+            <(git diff-tree --no-commit-id --name-only -r HEAD | sort)
+          test "$(git rev-parse "HEAD:$test_path")" = 'd63990447121c48f0f23a3ecd6b25a38b6fb3d15'
+          test "$(git rev-parse HEAD:avldb/src/main/scala/scorex/db/LDBVersionedStore.scala)" = '3ab3c3d6821d5d8cc4bda328002e91e3d198cbc0'
+          avld_path='avldb/src/main/scala/scorex/crypto/authds/avltree/batch/VersionedLDBAVLStorage.scala'
+          test "$(git rev-parse "HEAD:$avld_path")" = '731129f7bc35e7d08a6242f1e13db2896a754812'
+          processor_path='src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/UtxoSetSnapshotProcessor.scala'
+          test "$(git rev-parse "HEAD:$processor_path")" = '1d2972cfe9d0aad66901908f28c6ef4af9b055e5'
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/state/UtxoStateReader.scala)" = 'a2c10bd2480b99c58e8b463e3183d0fa1d2bc730'
+          test "$(git rev-parse HEAD:build.sbt)" = '8cea4589cbfa270c06ba6db02e3a36cd7ab4ae4b'
+          test -z "$(git status --porcelain)"
+          git diff --check HEAD^ HEAD
+
+      - name: Set up Java 8 and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Run only the snapshot reopen property
+        shell: bash
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          test ! -d target/test-reports
+          mkdir -p diagnostic
+          test_selector='snapshot restore into a reopened zero-retention store keeps its version'
+          if sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.history.UtxoSetSnapshotProcessorSpecification -- -z \"$test_selector\"" \
+            > diagnostic/runner.log 2>&1; then
+            printf 'pass\n' > diagnostic/test-exit
+          else
+            printf 'failure\n' > diagnostic/test-exit
+          fi
+
+      - name: Classify only the named composed success
+        id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          suite_name = 'org.ergoplatform.nodeView.history.UtxoSetSnapshotProcessorSpecification'
+          case_name = 'snapshot restore into a reopened zero-retention store keeps its version'
+          report_dir = Path('target/test-reports')
+          report = report_dir / f'TEST-{suite_name}.xml'
+          if sorted(report_dir.glob('*.xml')) != [report]:
+              raise SystemExit('Inconclusive: expected exactly one focused JUnit report')
+          suite = ET.parse(report).getroot()
+          if suite.tag != 'testsuite' or suite.attrib.get('name') != suite_name:
+              raise SystemExit('Inconclusive: unexpected test suite')
+          counts = {key: int(suite.attrib[key]) for key in ('tests', 'failures', 'errors', 'skipped')}
+          if counts != {'tests': 1, 'failures': 0, 'errors': 0, 'skipped': 0}:
+              raise SystemExit(f'Inconclusive: unexpected JUnit counts {counts}')
+          cases = suite.findall('testcase')
+          if len(cases) != 1 or cases[0].attrib.get('name') != case_name:
+              raise SystemExit('Inconclusive: selector did not isolate the property')
+          if cases[0].findall('failure') or cases[0].findall('error') or cases[0].findall('skipped'):
+              raise SystemExit('Inconclusive: named testcase was not green')
+          if Path('diagnostic/test-exit').read_text().strip() != 'pass':
+              raise SystemExit('Inconclusive: sbt and JUnit disagree')
+          verdict = {
+              'source_sha': 'b18eeaac91b1b47b5e3b83e0dd1204963ba06ef3',
+              'owner_head_sha': '8d654748a1132774c3004fa1c5a5277bcb0890c2',
+              'packet_sha': os.environ['GITHUB_SHA'],
+              'suite': suite_name,
+              'case': case_name,
+              'tests': 1,
+              'failures': 0,
+              'errors': 0,
+              'skipped': 0,
+              'oracle': 'composed_snapshot_zero_retention_reopen_version_green',
+          }
+          Path('diagnostic/verdict.json').write_text(json.dumps(verdict, sort_keys=True) + '\n')
+          print('Bounded composed verdict: one named snapshot reopen property passed')
+          PY
+
+      - name: Recheck public visibility before retaining bounded result
+        id: visibility_recheck
+        if: always()
+        shell: bash
+        env:
+          TARGET_REPOSITORY: ${{ github.repository }}
+          TARGET_API: ${{ github.api_url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$TARGET_REPOSITORY" = 'a-shannon/ergo'
+          curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$TARGET_API/repos/$TARGET_REPOSITORY" |
+            python3 -c "import json,sys; r=json.load(sys.stdin); assert r.get('full_name') == 'a-shannon/ergo' and r.get('private') is False"
+
+      - name: Retain only sanitized verdict and exit marker
+        if: always() && steps.classify.outcome == 'success' && steps.visibility_recheck.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: avld-snapshot-zero-retention-2813-v610
+          path: |
+            diagnostic/verdict.json
+            diagnostic/test-exit
+          if-no-files-found: error
+          retention-days: 7
