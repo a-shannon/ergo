@@ -1,15 +1,18 @@
 package org.ergoplatform.nodeView.history
 
+import org.ergoplatform.ErgoBox
 import org.ergoplatform.nodeView.history.storage.HistoryStorage
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils._
 import org.ergoplatform.nodeView.history.storage.modifierprocessors.UtxoSetSnapshotProcessor
-import org.ergoplatform.nodeView.state.{StateType, UtxoState}
-import org.ergoplatform.settings.{Algos, ErgoSettings}
+import org.ergoplatform.nodeView.state.{BoxHolder, StateType, UtxoState}
+import org.ergoplatform.settings.{Algos, Constants, ErgoSettings}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.core.VersionTag
 import org.ergoplatform.serialization.{ManifestSerializer, SubtreeSerializer}
+import scorex.crypto.authds.avltree.batch.VersionedLDBAVLStorage
 import scorex.db.LDBVersionedStore
-import scorex.util.ModifierId
+import scorex.util.{ModifierId, bytesToId}
+import sigma.Colls
 
 import scala.util.Random
 
@@ -95,6 +98,95 @@ class UtxoSetSnapshotProcessorSpecification extends ErgoCorePropertyTest {
     restoredState.stateContext.currentHeight shouldBe (epochLength - 1)
     bh.sortedBoxes.foreach { box =>
       restoredState.boxById(box.id).isDefined shouldBe true
+    }
+  }
+
+  property("snapshot restore into a reopened zero-retention store keeps its version") {
+    val txId = bytesToId(Array.fill[Byte](32)(17))
+    val boxes = (0 until 32 * 1024).map { index =>
+      new ErgoBox(
+        1000000L,
+        Constants.TrueTree,
+        Colls.emptyColl,
+        Map.empty,
+        txId,
+        index.toShort,
+        creationHeight = 0
+      )
+    }
+    val boxHolder = BoxHolder(boxes)
+    val sourceSettings = s.copy(directory = createTempDir.getAbsolutePath)
+    val sourceState = UtxoState.fromBoxHolder(
+      boxHolder, None, createTempDir, sourceSettings, parameters)
+    val snapshotHeight = epochLength - 1
+    val blockId = ModifierId @@ Algos.encode(Array.fill[Byte](32)(42))
+
+    val manifest = try {
+      sourceState.dumpSnapshot(snapshotHeight, sourceState.rootDigest.dropRight(1)).get
+      val manifestId = sourceState.snapshotsDb.readSnapshotsInfo
+        .availableManifests(snapshotHeight)
+      val bytes = sourceState.snapshotsDb.readManifestBytes(manifestId).get
+      val parsed = ManifestSerializer.defaultSerializer.parseBytes(bytes)
+      val subtreeIds = parsed.subtreesIds
+      withClue("SNAPSHOT_ZERO_RETENTION_SETUP: ") {
+        subtreeIds.nonEmpty shouldBe true
+      }
+      utxoSetSnapshotProcessor.registerManifestToDownload(
+        parsed, snapshotHeight, Seq.empty)
+      val requested = utxoSetSnapshotProcessor.getChunkIdsToDownload(subtreeIds.size)
+      requested.map(_.toSeq) shouldBe subtreeIds.map(_.toSeq)
+      subtreeIds.foreach { id =>
+        val chunk = sourceState.snapshotsDb.readSubtreeBytes(id).get
+        utxoSetSnapshotProcessor.registerDownloadedChunk(id, chunk)
+      }
+      parsed
+    } finally sourceState.closeStorage()
+
+    val digest = VersionedLDBAVLStorage.digest(manifest.id, manifest.rootHeight)
+    val oldVersion = Array.fill[Byte](32)(1)
+    val nextVersion = Array.fill[Byte](32)(2)
+    val seedKey = Array.fill[Byte](48)(17)
+
+    def restoredVersionAfterReopen(dir: java.io.File,
+                                   seedUndo: Boolean): Option[Seq[Byte]] = {
+      if (seedUndo) {
+        val seeded = new LDBVersionedStore(dir, initialKeepVersions = 2)
+        try {
+          seeded.update(oldVersion, Nil, Seq(seedKey -> Array[Byte](11))).get
+          seeded.update(nextVersion, Nil, Seq(seedKey -> Array[Byte](12))).get
+          seeded.versionIdExists(oldVersion) shouldBe true
+          seeded.lastVersionID.map(_.toSeq) shouldBe Some(nextVersion.toSeq)
+        } finally seeded.close()
+      }
+
+      val store = new LDBVersionedStore(dir, initialKeepVersions = 0)
+      try {
+        val before = store.lastVersionID.map(_.toSeq)
+        if (seedUndo) before shouldBe Some(nextVersion.toSeq)
+        else before shouldBe None
+
+        val prover = utxoSetSnapshotProcessor.createPersistentProver(
+          store, history, snapshotHeight, blockId).get
+        withClue("SNAPSHOT_ZERO_RETENTION_RESTORE_SETUP: ") {
+          prover.digest.toSeq shouldBe digest.toSeq
+          val firstBox = boxHolder.sortedBoxes.head
+          prover.unauthenticatedLookup(firstBox.id).isDefined shouldBe true
+          store.lastVersionID.map(_.toSeq) shouldBe Some(digest.toSeq)
+        }
+      } finally store.close()
+
+      val reopened = new LDBVersionedStore(dir, initialKeepVersions = 0)
+      try reopened.lastVersionID.map(_.toSeq)
+      finally reopened.close()
+    }
+
+    val cleanVersion = restoredVersionAfterReopen(createTempDir, seedUndo = false)
+    withClue("SNAPSHOT_ZERO_RETENTION_CLEAN_CONTROL: ") {
+      cleanVersion shouldBe Some(digest.toSeq)
+    }
+    val previouslyVersioned = restoredVersionAfterReopen(createTempDir, seedUndo = true)
+    withClue("SNAPSHOT_ZERO_RETENTION_REOPEN_VERSION: ") {
+      previouslyVersioned shouldBe Some(digest.toSeq)
     }
   }
 
