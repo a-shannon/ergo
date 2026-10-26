@@ -11,7 +11,7 @@ permissions:
 jobs:
   history:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout exact branch
         uses: actions/checkout@v7
@@ -25,10 +25,12 @@ jobs:
           LOCK_SHA: d4019b692ab86304612dc3f58421919b34057134
           COMPOSE_SHA: bd9f1e21e7289c6041246d0d5f0dd06f2a674730
           COMPOSE_TREE: 729e99706ef8f83222033b3b01dd388dc5692b56
+          WORKFLOW_PARENT_SHA: 606bca08c9ce1b3eda4589b5ba5f9d10ce1e5161
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git rev-parse HEAD^)" = "$COMPOSE_SHA"
+          test "$(git rev-parse HEAD^)" = "$WORKFLOW_PARENT_SHA"
+          test "$(git rev-parse "$WORKFLOW_PARENT_SHA^")" = "$COMPOSE_SHA"
           test "$(git rev-parse "$COMPOSE_SHA^1")" = "$PORT_SHA"
           test "$(git rev-parse "$COMPOSE_SHA^2")" = "$LOCK_SHA"
           test "$(git rev-parse "$PORT_SHA^")" = "$BASE_SHA"
@@ -55,8 +57,8 @@ jobs:
               raise SystemExit(f"Unexpected changed paths: {changed!r}")
           PY
           mkdir -p out
-          printf 'base=%s\nport=%s\nlock=%s\ncompose=%s\ncommit=%s\ntree=%s\n' \
-            "$BASE_SHA" "$PORT_SHA" "$LOCK_SHA" "$COMPOSE_SHA" "$GITHUB_SHA" \
+          printf 'base=%s\nport=%s\nlock=%s\ncompose=%s\nworkflow_parent=%s\ncommit=%s\ntree=%s\n' \
+            "$BASE_SHA" "$PORT_SHA" "$LOCK_SHA" "$COMPOSE_SHA" "$WORKFLOW_PARENT_SHA" "$GITHUB_SHA" \
             "$(git rev-parse HEAD^{tree})" > out/tree.txt
 
       - name: Set up Java 8 and sbt
@@ -74,51 +76,135 @@ jobs:
             ~/.cache/coursier/v1
           key: ${{ runner.os }}-header-invalidation-sbt-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
 
-      - name: Run affected History and cache-race suites
+      - name: Run phased History and cache-race suites
         run: |
-          set -uo pipefail
+          set -euo pipefail
           mkdir -p out
-          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.history.VerifyADHistorySpecification.xml
-          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.history.VerifyNonADHistorySpecification.xml
-          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.history.RepairCacheRaceSpecification.xml
-          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.history.BlockSectionValidationSpecification.xml
-          rc=0
-          sbt -batch \
-            "testOnly org.ergoplatform.nodeView.history.VerifyADHistorySpecification" \
-            "testOnly org.ergoplatform.nodeView.history.VerifyNonADHistorySpecification" \
-            "testOnly org.ergoplatform.nodeView.history.RepairCacheRaceSpecification" \
-            "testOnly org.ergoplatform.nodeView.history.BlockSectionValidationSpecification" \
-            > "$RUNNER_TEMP/header-cache-lock-sbt.log" 2>&1 || rc=$?
-          printf '%s\n' "$rc" > out/sbt-exit.txt
           python3 - <<'PY'
           import json
           import os
           import re
+          import subprocess
+          import time
           from pathlib import Path
 
-          log_path = Path(os.environ["RUNNER_TEMP"]) / "header-cache-lock-sbt.log"
-          raw = log_path.read_bytes()
-          log = raw.decode("utf-8", errors="replace")
-          locations = re.findall(r"([A-Za-z0-9_]+\.scala):(\d+)", log)
-          categories = {
-              "compiler_error_lines": log.count("[error]"),
-              "java_exception_lines": sum("Exception" in line for line in log.splitlines()),
-              "dependency_resolution_lines": sum(
-                  "Error downloading" in line or "ResolveException" in line
-                  for line in log.splitlines()
+          suites = (
+              "VerifyADHistorySpecification",
+              "VerifyNonADHistorySpecification",
+              "RepairCacheRaceSpecification",
+              "BlockSectionValidationSpecification",
+          )
+          reports = {
+              suite: Path(
+                  "target/test-reports/TEST-org.ergoplatform.nodeView.history."
+                  + suite + ".xml"
+              )
+              for suite in suites
+          }
+          for report in reports.values():
+              report.unlink(missing_ok=True)
+          commands = [
+              ("launcher", ["sbt", "-batch", "show sbtVersion"], ()),
+              ("compile", ["sbt", "-batch", "Test/compile"], ()),
+              (
+                  "combined",
+                  [
+                      "sbt",
+                      "-batch",
+                      *("testOnly org.ergoplatform.nodeView.history." + suite for suite in suites),
+                  ],
+                  suites,
               ),
-          }
-          summary = {
-              "kind": "bounded-setup-observation",
-              "sbt_exit": int(Path("out/sbt-exit.txt").read_text().strip()),
-              "log_bytes": len(raw),
-              "log_lines": len(log.splitlines()),
-              "scala_locations": [
-                  {"file": name, "line": int(number)} for name, number in locations[:12]
-              ],
-              "categories": categories,
-          }
-          Path("out/setup.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
+              *(
+                  (suite, ["sbt", "-batch", "testOnly org.ergoplatform.nodeView.history." + suite], (suite,))
+                  for suite in suites
+              ),
+          ]
+          allowed_exceptions = (
+              "OutOfMemoryError",
+              "NoClassDefFoundError",
+              "ClassNotFoundException",
+              "ExceptionInInitializerError",
+              "AssertionError",
+              "TestFailedException",
+              "LinkageError",
+          )
+          phase_results = []
+          for phase, command, required in commands:
+              for suite in required:
+                  reports[suite].unlink(missing_ok=True)
+              log_path = Path(os.environ["RUNNER_TEMP"]) / ("history-phase-" + phase + ".log")
+              timeout_seconds = {
+                  "launcher": 120,
+                  "compile": 600,
+                  "combined": 900,
+              }.get(phase, 300)
+              started = time.monotonic()
+              try:
+                  with log_path.open("wb") as log_file:
+                      exit_code = subprocess.run(
+                          command, stdout=log_file, stderr=subprocess.STDOUT,
+                          timeout=timeout_seconds,
+                      ).returncode
+              except subprocess.TimeoutExpired:
+                  exit_code = 124
+              except OSError:
+                  exit_code = 127
+              raw = log_path.read_bytes() if log_path.is_file() else b""
+              log = re.sub(r"\x1b\[[0-9;]*m", "", raw.decode("utf-8", errors="replace"))
+              lines = log.splitlines()
+              locations = re.findall(r"(?:^|[/\\])([A-Za-z0-9_]+\.scala):(\d+)", log)
+              present = [suite for suite, report in reports.items() if report.is_file()]
+              categories = {
+                  "error_markers": sum(
+                      "[error]" in line or re.search(r"\berror:", line, re.I) is not None
+                      for line in lines
+                  ),
+                  "dependency_resolution": sum(
+                      "Error downloading" in line or "ResolveException" in line
+                      or "Could not resolve" in line for line in lines
+                  ),
+                  "out_of_memory": sum("OutOfMemoryError" in line for line in lines),
+                  "launcher_missing": sum(
+                      "sbt: command not found" in line or "Unable to access jarfile" in line
+                      for line in lines
+                  ),
+              }
+              exceptions = {
+                  name: len(re.findall(r"\b" + name + r"\b", log))
+                  for name in allowed_exceptions
+                  if name in log
+              }
+              result = {
+                  "phase": phase,
+                  "exit": exit_code,
+                  "timeout_seconds": timeout_seconds,
+                  "elapsed_ms": int((time.monotonic() - started) * 1000),
+                  "log_bytes": len(raw),
+                  "log_lines": len(lines),
+                  "categories": categories,
+                  "exception_classes": exceptions,
+                  "scala_locations": [
+                      {"file": name, "line": int(number)} for name, number in locations[:12]
+                  ],
+                  "required_reports": list(required),
+                  "present_reports": present,
+              }
+              phase_results.append(result)
+              Path("out/phase.json").write_text(
+                  json.dumps({"kind": "bounded-phase-diagnostic", "phases": phase_results},
+                             sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+              if phase in ("launcher", "compile", "combined"):
+                  Path("out/sbt-exit.txt").write_text(str(exit_code) + "\n", encoding="utf-8")
+              print(f"Phase {phase}: exit={exit_code}, expected reports={len(required)}, present={len(present)}")
+              if phase in ("launcher", "compile") and exit_code != 0:
+                  break
+              if phase == "combined" and exit_code == 0 and all(
+                  suite in present for suite in required
+              ):
+                  break
           PY
 
       - name: Check named History and cache-race results
@@ -129,12 +215,26 @@ jobs:
           import xml.etree.ElementTree as ET
           from pathlib import Path
 
+          phase_path = Path("out/phase.json")
+          if not phase_path.is_file():
+              raise SystemExit("No bounded phase receipt: setup is inconclusive")
+          phase_results = json.loads(phase_path.read_text(encoding="utf-8"))["phases"]
           suites = (
               "VerifyADHistorySpecification",
               "VerifyNonADHistorySpecification",
               "RepairCacheRaceSpecification",
               "BlockSectionValidationSpecification",
           )
+          expected_success_phases = ["launcher", "compile", "combined"]
+          if [phase["phase"] for phase in phase_results[:3]] != expected_success_phases:
+              raise SystemExit("Pinned History setup stopped before the combined run")
+          combined = phase_results[2]
+          if any(phase["exit"] != 0 for phase in phase_results[:3]):
+              raise SystemExit("Launcher, compile or original combined phase failed")
+          if sorted(combined["present_reports"]) != sorted(suites):
+              raise SystemExit("Original combined phase omitted a named JUnit report")
+          if len(phase_results) != len(expected_success_phases):
+              raise SystemExit("Diagnostic phases ran despite a successful combined phase")
           expected_required = {
               "invalidating a header-only tip should select the other header at its height",
               "invalidating a header-only best tip marks its semantic validity invalid",
@@ -204,7 +304,7 @@ jobs:
           path: |
             out/tree.txt
             out/sbt-exit.txt
-            out/setup.json
+            out/phase.json
             out/diagnostic.json
           if-no-files-found: error
           retention-days: 7
