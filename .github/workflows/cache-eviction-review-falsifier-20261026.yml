@@ -1,0 +1,267 @@
+name: Cache eviction review falsifier
+
+on:
+  push:
+    branches:
+      - a-shannon/cache-eviction-review-falsifier-20261026
+
+permissions:
+  contents: read
+
+jobs:
+  cache-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Confirm source, ancestry and path scope
+        env:
+          BASE_SHA: ef0562d7743f63bf15ec0138c270bb80124abedd
+          PR_SHA: 356766ac2b00805282af0995276846e30a32508a
+          TEST_SHA: 0c8f73bb9a9c8cd5b37f0a96c28a0952ae83727b
+          TEST_TREE: 02ab55065c2a13b516edba52bf92e2ed9c4a6b05
+          PRODUCTION_BLOB: 3793345f637c3132eda02abbe6ddd8e9480b40d7
+          TEST_BLOB: eabc76b31e8a68bb6768981496678c425f44e8d3
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$TEST_SHA"
+          test "$(git rev-parse "$TEST_SHA^")" = "$PR_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" "$PR_SHA"
+          test "$(git show -s --format=%T "$TEST_SHA")" = "$TEST_TREE"
+          test "$(git rev-parse "HEAD:src/main/scala/scorex/core/ModifiersCache.scala")" = "$PRODUCTION_BLOB"
+          test "$(git rev-parse "HEAD:src/test/scala/org/ergoplatform/nodeView/ErgoModifiersCacheSpec.scala")" = "$TEST_BLOB"
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          pr = os.environ["PR_SHA"]
+          test = os.environ["TEST_SHA"]
+          test_delta = subprocess.check_output(
+              ["git", "diff", "--name-only", f"{pr}..{test}"], text=True
+          ).splitlines()
+          workflow_delta = subprocess.check_output(
+              ["git", "diff", "--name-only", f"{test}..HEAD"], text=True
+          ).splitlines()
+          if test_delta != ["src/test/scala/org/ergoplatform/nodeView/ErgoModifiersCacheSpec.scala"]:
+              raise SystemExit(f"Unexpected test commit paths: {test_delta!r}")
+          if workflow_delta != [".github/workflows/cache-eviction-review-falsifier-20261026.yml"]:
+              raise SystemExit(f"Unexpected workflow commit paths: {workflow_delta!r}")
+          record = {
+              "base": os.environ["BASE_SHA"],
+              "pr": pr,
+              "test": test,
+              "test_tree": os.environ["TEST_TREE"],
+              "production_blob": os.environ["PRODUCTION_BLOB"],
+              "test_blob": os.environ["TEST_BLOB"],
+              "workflow": os.environ["GITHUB_SHA"],
+              "workflow_tree": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD^{tree}"], text=True
+              ).strip(),
+          }
+          Path("out").mkdir(exist_ok=True)
+          Path("out/tree.json").write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+      - name: Set up Java 8 and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache Scala dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-cache-eviction-sbt-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
+
+      - name: Run candidate and old-order mutant
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          target = "queue cleanup preserves the newest key for later eviction"
+          production_path = Path("src/main/scala/scorex/core/ModifiersCache.scala")
+          report = Path(
+              "target/test-reports/TEST-org.ergoplatform.nodeView.ErgoModifiersCacheSpec.xml"
+          )
+          output = Path("out/phase.json")
+          command = ["sbt", "-batch", "testOnly org.ergoplatform.nodeView.ErgoModifiersCacheSpec"]
+          phase = {"kind": "bounded-cache-eviction-red-green", "target_case": target}
+
+          def report_result():
+              result = {"present": report.is_file(), "parsed": False, "tests": 0,
+                        "failures": 0, "errors": 0, "skipped": 0,
+                        "target_present": False, "target_failures": 0,
+                        "other_failed_cases": 0}
+              if not report.is_file():
+                  return result
+              try:
+                  root = ET.parse(report).getroot()
+                  suite = root if root.tag.rsplit("}", 1)[-1] == "testsuite" else next(
+                      node for node in root.iter()
+                      if node.tag.rsplit("}", 1)[-1] == "testsuite"
+                  )
+                  for field in ("tests", "failures", "errors", "skipped"):
+                      result[field] = int(suite.attrib.get(field, "0"))
+                  cases = [node for node in suite.iter()
+                           if node.tag.rsplit("}", 1)[-1] == "testcase"]
+                  result["target_present"] = any(
+                      case.attrib.get("name") == target for case in cases
+                  )
+                  for case in cases:
+                      failed = any(child.tag.rsplit("}", 1)[-1] in ("failure", "error")
+                                   for child in case)
+                      if failed and case.attrib.get("name") == target:
+                          result["target_failures"] += 1
+                      elif failed:
+                          result["other_failed_cases"] += 1
+                  result["parsed"] = True
+              except (ET.ParseError, OSError, StopIteration, ValueError):
+                  result["parsed"] = False
+              return result
+
+          def run_arm(name):
+              report.unlink(missing_ok=True)
+              log_path = Path(os.environ["RUNNER_TEMP"]) / ("cache-eviction-" + name + ".log")
+              exit_code = 127
+              try:
+                  with log_path.open("wb") as log_file:
+                      exit_code = subprocess.run(
+                          command, stdout=log_file, stderr=subprocess.STDOUT,
+                          timeout=1200,
+                      ).returncode
+              except subprocess.TimeoutExpired:
+                  exit_code = 124
+              except OSError:
+                  exit_code = 127
+              raw = log_path.read_bytes() if log_path.is_file() else b""
+              return {"exit": exit_code, "log_bytes": len(raw),
+                      "error_markers": raw.count(b"[error]"), "report": report_result()}
+
+          phase["candidate"] = run_arm("candidate")
+          output.write_text(json.dumps(phase, sort_keys=True) + "\n", encoding="utf-8")
+          candidate = phase["candidate"]
+          report_candidate = candidate["report"]
+          candidate_green = (
+              candidate["exit"] == 0 and report_candidate["parsed"]
+              and report_candidate["tests"] == 5
+              and report_candidate["failures"] == 0
+              and report_candidate["errors"] == 0
+              and report_candidate["skipped"] == 0
+              and report_candidate["target_present"]
+              and report_candidate["target_failures"] == 0
+              and report_candidate["other_failed_cases"] == 0
+          )
+          if not candidate_green:
+              phase["mutant_skipped"] = "candidate_not_green"
+              output.write_text(json.dumps(phase, sort_keys=True) + "\n", encoding="utf-8")
+              print("Candidate did not meet the bounded JUnit oracle; mutant skipped")
+              raise SystemExit(0)
+
+          original_bytes = production_path.read_bytes()
+          original = original_bytes.decode("utf-8")
+          old_order = (
+              "    if (evictionQueue.size >= maxSize + cleaningThreshold) {\n"
+              "      evictionQueue.dequeueAll(k => !cache.contains(k))\n"
+              "    }\n"
+              "    evictionQueue.enqueue(key)"
+          )
+          mutant_order = (
+              "    evictionQueue.enqueue(key)\n"
+              "    if (evictionQueue.size >= maxSize + cleaningThreshold) {\n"
+              "      evictionQueue.dequeueAll(k => !cache.contains(k))\n"
+              "    }"
+          )
+          if original.count(old_order) != 1:
+              phase["mutant_skipped"] = "source_snippet_mismatch"
+          else:
+              mutated = original.replace(old_order, mutant_order, 1).encode("utf-8")
+              production_path.write_bytes(mutated)
+              try:
+                  changed = subprocess.check_output(
+                      ["git", "diff", "--name-only"], text=True
+                  ).splitlines()
+                  subprocess.check_call(
+                      ["git", "diff", "--check"], stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                  )
+                  if changed != [str(production_path)]:
+                      phase["mutant_skipped"] = "unexpected_mutant_paths"
+                  else:
+                      phase["mutant_source_sha256"] = hashlib.sha256(mutated).hexdigest()
+                      phase["mutant"] = run_arm("old-order-plus-equal")
+              finally:
+                  production_path.write_bytes(original_bytes)
+          output.write_text(json.dumps(phase, sort_keys=True) + "\n", encoding="utf-8")
+          print("Candidate and mutant phases recorded in bounded receipt")
+          PY
+
+      - name: Check named red-green oracle
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          source = Path("out/phase.json")
+          if not source.is_file():
+              raise SystemExit("No bounded phase receipt")
+          phase = json.loads(source.read_text(encoding="utf-8"))
+          candidate = phase.get("candidate", {})
+          mutant = phase.get("mutant", {})
+          green = candidate.get("report", {})
+          red = mutant.get("report", {})
+          passed = (
+              candidate.get("exit") == 0 and green.get("parsed")
+              and green.get("tests") == 5 and green.get("failures") == 0
+              and green.get("errors") == 0 and green.get("skipped") == 0
+              and green.get("target_present") and green.get("target_failures") == 0
+              and green.get("other_failed_cases") == 0
+              and mutant.get("exit") not in (None, 0, 124, 127)
+              and red.get("parsed") and red.get("tests") == 5
+              and red.get("failures") == 1 and red.get("errors") == 0
+              and red.get("skipped") == 0 and red.get("target_present")
+              and red.get("target_failures") == 1
+              and red.get("other_failed_cases") == 0
+              and "mutant_skipped" not in phase
+          )
+          record = {"kind": "cache-eviction-review-falsifier", "passed": bool(passed),
+                    "candidate_exit": candidate.get("exit"),
+                    "candidate_report": green, "mutant_exit": mutant.get("exit"),
+                    "mutant_report": red,
+                    "mutant_source_sha256": phase.get("mutant_source_sha256"),
+                    "mutant_skipped": phase.get("mutant_skipped")}
+          Path("out/diagnostic.json").write_text(
+              json.dumps(record, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          if not passed:
+              raise SystemExit("Named cache eviction red-green oracle failed")
+          print("Named cache eviction property: candidate green, single-fault mutant red")
+          PY
+
+      - name: Retain bounded receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-eviction-review-${{ github.sha }}
+          path: |
+            out/tree.json
+            out/phase.json
+            out/diagnostic.json
+          if-no-files-found: error
