@@ -1,0 +1,147 @@
+name: Registered database close lifecycle comparison
+
+on:
+  push:
+    branches:
+      - a-shannon/store-registry-close-proof-v610-20261028
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: c4692c22835f2ae39da5c6cb124eaee63f57bf7e
+  FIX_SHA: 9fc699ef8172880600b269261ac0568f69275aaa
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact fix and test sources
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify the source and proof scope
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$FIX_SHA"
+          test "$(git rev-parse "$FIX_SHA^")" = "$BASE_SHA"
+          python3 - <<'PY'
+          import os
+          import subprocess
+          def changed(a, b):
+              return set(subprocess.check_output(["git", "diff", "--name-only", a, b], text=True).splitlines())
+          expected = {
+              "avldb/src/main/scala/scorex/db/LDBFactory.scala",
+              "src/test/scala/org/ergoplatform/db/StoreRegistryLifecycleSpec.scala",
+          }
+          if changed(os.environ["BASE_SHA"], os.environ["FIX_SHA"]) != expected:
+              raise SystemExit("Unexpected source scope")
+          if changed(os.environ["FIX_SHA"], "HEAD") != {".github/workflows/store-registry-close-proof.yml"}:
+              raise SystemExit("Unexpected proof scope")
+          print("Exact source parents and changed paths verified")
+          PY
+
+      - name: Set up Java 8 and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache Scala dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Compare old and fixed product with the same six tests
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import xml.etree.ElementTree as ET
+
+          product = "avldb/src/main/scala/scorex/db/LDBFactory.scala"
+          classes = {
+              "org.ergoplatform.db.StoreRegistryLifecycleSpec",
+          }
+          expected_names = {
+              "registry lifecycle reuses an open handle and reopens after normal close",
+              "registry lifecycle stale close preserves the replacement handle",
+              "registry lifecycle open waits for native close before creating a replacement",
+              "registry lifecycle overlapping close callers forward native close once",
+              "registry lifecycle failed close retains registration and rethrows the original failure",
+              "registry lifecycle failed close rejects reopen with the existing process exit policy",
+          }
+          expected_red = expected_names - {
+              "registry lifecycle reuses an open handle and reopens after normal close",
+          }
+          reports = Path("target/test-reports")
+          output = Path("registry-close-summary.json")
+          summary = {"base": os.environ["BASE_SHA"], "fix": os.environ["FIX_SHA"],
+                     "status": "incomplete", "phases": {}}
+
+          def read_cases():
+              cases = {}
+              seen_suites = set()
+              for path in reports.glob("*.xml"):
+                  suite = ET.parse(path).getroot()
+                  if suite.get("name") not in classes:
+                      continue
+                  seen_suites.add(suite.get("name"))
+                  if int(suite.get("errors", "0")) or int(suite.get("skipped", "0")):
+                      raise ValueError("suite error or skip")
+                  for case in suite.findall("testcase"):
+                      raw_name = case.get("name", "")
+                      matches = [name for name in expected_names if raw_name.endswith(name)]
+                      if len(matches) != 1 or matches[0] in cases:
+                          raise ValueError("unexpected or duplicate test")
+                      if case.find("error") is not None or case.find("skipped") is not None:
+                          raise ValueError("test error or skip")
+                      cases[matches[0]] = case.find("failure") is not None
+              if seen_suites != classes or set(cases) != expected_names:
+                  raise ValueError("missing exact suites or tests")
+              return {name for name, failed in cases.items() if failed}
+
+          try:
+              for phase, ref, failures in (
+                  ("old", os.environ["BASE_SHA"], expected_red),
+                  ("fixed", os.environ["FIX_SHA"], set()),
+              ):
+                  for path in reports.glob("*.xml"):
+                      path.unlink()
+                  Path(product).write_bytes(subprocess.check_output(["git", "show", f"{ref}:{product}"]))
+                  command = 'testOnly org.ergoplatform.db.StoreRegistryLifecycleSpec -- -z "registry lifecycle"'
+                  result = subprocess.run(["sbt", "-Denv=test", "++2.12.20", command])
+                  actual = read_cases()
+                  summary["phases"][phase] = {
+                      "exit": result.returncode, "tests": len(expected_names),
+                      "failures": len(actual), "failed_tests": sorted(actual),
+                  }
+                  if actual != failures or (phase == "old" and result.returncode == 0) or (
+                      phase == "fixed" and result.returncode != 0
+                  ):
+                      raise ValueError("unexpected old/fixed result")
+              summary["status"] = "expected_old_failure_and_fixed_success"
+          except (OSError, ValueError, ET.ParseError, subprocess.SubprocessError):
+              summary["status"] = "inconclusive_or_unexpected"
+              raise SystemExit(1)
+          finally:
+              Path(product).write_bytes(subprocess.check_output(["git", "show", f"{os.environ['FIX_SHA']}:{product}"]))
+              output.write_text(json.dumps(summary, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload bounded comparison summary
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: store-registry-lifecycle-comparison
+          path: registry-close-summary.json
+          if-no-files-found: ignore
+          retention-days: 7
