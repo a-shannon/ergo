@@ -22,11 +22,13 @@ jobs:
         env:
           BASE_SHA: f2f932bd6a0f8b3516a39f45f9f33f41b6b6f47e
           FIRST_SHA: 5d2b643c8a898aebb4346f74f29f9bf9a3243152
+          PREVIOUS_SHA: f734ad7459fb7cfe5f5838bfd1e195d8099911d0
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git rev-parse HEAD^)" = "$FIRST_SHA"
-          test "$(git rev-parse HEAD~2)" = "$BASE_SHA"
+          test "$(git rev-parse HEAD^)" = "$PREVIOUS_SHA"
+          test "$(git rev-parse HEAD~2)" = "$FIRST_SHA"
+          test "$(git rev-parse HEAD~3)" = "$BASE_SHA"
           python3 - <<'PY'
           import os
           import subprocess
@@ -60,13 +62,20 @@ jobs:
             ~/.cache/coursier/v1
           key: ${{ runner.os }}-snapshot-floor-sbt-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
 
-      - name: Run affected snapshot suite
+      - name: Separate compile and affected snapshot suite
         run: |
           set -uo pipefail
           mkdir -p out
           rm -f target/test-reports/TEST-org.ergoplatform.nodeView.history.UtxoSetSnapshotProcessorSpecification.xml
+          compile_rc=0
+          sbt -batch "Test/compile" > "$RUNNER_TEMP/snapshot-floor-compile.log" 2>&1 || compile_rc=$?
+          printf '%s\n' "$compile_rc" > out/compile-exit.txt
           rc=0
-          sbt -batch "testOnly org.ergoplatform.nodeView.history.UtxoSetSnapshotProcessorSpecification" > "$RUNNER_TEMP/snapshot-floor-sbt.log" 2>&1 || rc=$?
+          if [ "$compile_rc" -eq 0 ]; then
+            sbt -batch "testOnly org.ergoplatform.nodeView.history.UtxoSetSnapshotProcessorSpecification" > "$RUNNER_TEMP/snapshot-floor-sbt.log" 2>&1 || rc=$?
+          else
+            rc=$compile_rc
+          fi
           printf '%s\n' "$rc" > out/sbt-exit.txt
           if [ ! -f target/test-reports/TEST-org.ergoplatform.nodeView.history.UtxoSetSnapshotProcessorSpecification.xml ]; then
             python3 - <<'PY'
@@ -75,7 +84,10 @@ jobs:
           import re
           from pathlib import Path
 
-          lines = (Path(os.environ["RUNNER_TEMP"]) / "snapshot-floor-sbt.log").read_text(
+          compile_exit = int(Path("out/compile-exit.txt").read_text().strip())
+          phase = "compile" if compile_exit else "test"
+          log = "snapshot-floor-compile.log" if compile_exit else "snapshot-floor-sbt.log"
+          lines = (Path(os.environ["RUNNER_TEMP"]) / log).read_text(
               encoding="utf-8", errors="replace"
           ).splitlines()
           pattern = re.compile(
@@ -91,26 +103,28 @@ jobs:
                   path = "src/" + path.rsplit("/src/", 1)[1]
               if not path.startswith(("src/test/scala/", "src/main/scala/")):
                   continue
-              raw_message = match.group("message")
-              if re.search(r"(?i)\b[A-Z]:[/\\]|(?<!\w)/[A-Za-z_][A-Za-z0-9_.-]*(?:/|\b)", raw_message):
-                  message = "<path-containing diagnostic redacted>"
-              else:
-                  message = re.sub(r"https?://\S+", "<url>", raw_message)
-                  message = re.sub(r"[\w.+-]+@[\w.-]+", "<email>", message)
-                  message = re.sub(r"\b[0-9a-fA-F]{32,}\b", "<hex>", message)
-                  if re.search(r"mnemonic|secret|private.?key|password|token", message, re.I):
-                      message = "<redacted>"
               diagnostics.append({
                   "path": path[:140],
                   "line": int(match.group("line")),
                   "column": int(match.group("column") or 0),
-                  "message": message[:180],
               })
               if len(diagnostics) == 12:
                   break
           result = {
               "kind": "no-junit-bounded-diagnostic",
               "classification": "scala-compiler" if diagnostics else "no-scala-compiler-location",
+              "phase": phase,
+              "compile_exit": compile_exit,
+              "line_count": len(lines),
+              "project_load_seen": any("loading settings" in line.lower() for line in lines),
+              "compile_seen": any(re.search(r"\bcompiling \d+ scala sources?\b", line, re.I) for line in lines),
+              "test_suite_seen": any("UtxoSetSnapshotProcessorSpecification" in line and line.startswith("[info]") for line in lines),
+              "possible_oom_seen": any(re.search(r"OutOfMemoryError|Java heap space|Cannot allocate memory", line, re.I) for line in lines),
+              "report_locations": sorted(
+                  path.as_posix() for path in Path("target").rglob(
+                      "TEST-org.ergoplatform.nodeView.history.UtxoSetSnapshotProcessorSpecification.xml"
+                  )
+              )[:4],
               "compiler_locations": diagnostics,
               "error_line_count": sum(line.startswith("[error]") for line in lines),
               "sbt_exit": int(Path("out/sbt-exit.txt").read_text().strip()),
@@ -118,7 +132,7 @@ jobs:
           Path("out/compile-diagnostic.json").write_text(
               json.dumps(result, sort_keys=True) + "\n", encoding="utf-8"
           )
-          print(f"No JUnit report; {result['classification']}: {len(diagnostics)} compiler locations")
+          print(f"No JUnit report; phase={phase}; {result['classification']}: {len(diagnostics)} compiler locations")
           PY
           fi
 
@@ -192,6 +206,7 @@ jobs:
           name: snapshot-floor-finalizer-${{ github.sha }}
           path: |
             out/tree.txt
+            out/compile-exit.txt
             out/sbt-exit.txt
             out/diagnostic.json
             out/compile-diagnostic.json
