@@ -1,0 +1,62 @@
+name: Retained full-block window diagnostic
+
+on:
+  push:
+    branches:
+      - a-shannon/pr2845-kept-window-diagnostic-20261027
+
+permissions:
+  contents: read
+
+jobs:
+  retained-window:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact PR head and test
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify the owner code and changed paths
+        env:
+          OWNER_SHA: 9d3d78ffb8cee4ade2f8bbf1c595f5cfc51875c4
+          PROCESSOR_BLOB: f0393ef4dda8190e316d4fb6c8667e80c6d80226
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$OWNER_SHA"
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/FullBlockProcessor.scala)" = "$PROCESSOR_BLOB"
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          base = os.environ["OWNER_SHA"]
+          changed = set(subprocess.check_output(
+              ["git", "diff", "--name-only", base, "HEAD"], text=True
+          ).splitlines())
+          expected = {
+              ".github/workflows/retained-window-v609-diagnostic.yml",
+              "src/test/scala/org/ergoplatform/nodeView/history/VerifyADHistorySpecification.scala",
+          }
+          if changed != expected:
+              raise SystemExit(f"Unexpected changed paths: {sorted(changed)!r}")
+          print("Exact owner code and two-file diagnostic scope verified")
+          PY
+
+      - name: Set up Java 8 and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache Scala dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-retained-window-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
+
+      - name: Run the History unit suite
+        run: sbt -Denv=test ++2.12.20 "testOnly org.ergoplatform.nodeView.history.VerifyADHistorySpecification"
