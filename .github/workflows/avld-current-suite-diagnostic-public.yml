@@ -1,0 +1,75 @@
+name: AVLD current candidate suite diagnostic
+
+on:
+  push:
+    branches:
+      - a-shannon/avld-current-suite-v610-20261027
+
+permissions:
+  contents: read
+
+jobs:
+  avld-current:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact composition
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify the current candidate and owner test are preserved
+        env:
+          BASE_SHA: 6de877983ceba19eb990840953d1e4674d5ff288
+          OWNER_SHA: e0f95deef8990dfdc1abc7b286d85e93f5ccd380
+          MERGE_SHA: 22157f739fb93ede9f52603b41371612a8449056
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$MERGE_SHA"
+          test "$(git rev-parse "$MERGE_SHA^1")" = "$BASE_SHA"
+          test "$(git rev-parse "$MERGE_SHA^2")" = "$OWNER_SHA"
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          base = os.environ["BASE_SHA"]
+          owner = os.environ["OWNER_SHA"]
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", base, "HEAD"], text=True
+          ).splitlines()
+          expected = {
+              ".github/workflows/ci.yml",
+              ".github/workflows/avld-current-suite-diagnostic-public.yml",
+              "avldb/src/test/scala/org/ergoplatform/serialization/SubtreeSerializerDepthSpecification.scala",
+          }
+          if set(changed) != expected:
+              raise SystemExit(f"Unexpected changed paths: {changed!r}")
+          for path in expected - {".github/workflows/avld-current-suite-diagnostic-public.yml"}:
+              composed = subprocess.check_output(
+                  ["git", "rev-parse", f"HEAD:{path}"], text=True
+              ).strip()
+              original = subprocess.check_output(
+                  ["git", "rev-parse", f"{owner}:{path}"], text=True
+              ).strip()
+              if composed != original:
+                  raise SystemExit(f"Owner file was not preserved: {path}")
+          print("Exact candidate and owner test/workflow composition verified")
+          PY
+
+      - name: Set up Java 8 and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache Scala dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-avld-current-suite-${{ hashFiles('**/*.sbt', 'project/build.properties') }}
+
+      - name: Run the complete AVLD unit suite
+        run: sbt ++2.12.20 avldb/test
