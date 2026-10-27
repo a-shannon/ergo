@@ -1,0 +1,70 @@
+name: AVLD zero-retention cutpoint diagnostic
+
+on:
+  push:
+    branches:
+      - a-shannon/avldb-cleanstart-2853-diagnostic-20261027
+
+permissions:
+  contents: read
+
+jobs:
+  avldb-cleanstart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout diagnostic head
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Pin product and test blobs
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD:avldb/src/main/scala/scorex/db/LDBVersionedStore.scala)" = "add668f761b0c4de992952cd657d713513dcb2fd"
+          test "$(git rev-parse HEAD:avldb/src/test/scala/scorex/db/LDBVersionedStoreCleanStartSpec.scala)" = "41690ec76d6fe597ddd3b311ec7734fb8722ed31"
+          printf 'Pinned diagnostic commit: %s\n' "$GITHUB_SHA"
+
+      - name: Set up JDK 8 and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Run seven focused store cutpoints
+        run: |
+          set -euo pipefail
+          report_dir="$GITHUB_WORKSPACE/target/avldb-cleanstart-junit"
+          mkdir -p "$report_dir"
+          sbt -batch "avldb/testOnly scorex.db.LDBVersionedStoreCleanStartSpec -- -u $report_dir"
+
+      - name: Verify seven-test JUnit result
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          reports = list(Path('target/avldb-cleanstart-junit').rglob('*.xml'))
+          matched = []
+          for path in reports:
+              root = ET.parse(path).getroot()
+              suites = [root] if root.tag == 'testsuite' else root.findall('testsuite')
+              for suite in suites:
+                  if 'LDBVersionedStoreCleanStartSpec' in path.name + suite.attrib.get('name', ''):
+                      matched.append(suite)
+
+          if len(matched) != 1:
+              raise SystemExit(f'Expected one focused JUnit suite; found {len(matched)}')
+          suite = matched[0]
+          if suite.attrib.get('name') != 'scorex.db.LDBVersionedStoreCleanStartSpec':
+              raise SystemExit(f'Unexpected suite name: {suite.attrib.get("name")}')
+          required = ('tests', 'failures', 'errors')
+          if any(key not in suite.attrib for key in required):
+              raise SystemExit(f'Incomplete JUnit counts: {suite.attrib}')
+          cases = suite.findall('./testcase')
+          skipped = len(suite.findall('./testcase/skipped'))
+          actual = tuple(int(suite.attrib[key]) for key in required) + (skipped,)
+          if len(cases) != 7 or actual != (7, 0, 0, 0):
+              raise SystemExit(f'Unexpected focused JUnit result: {len(cases)} cases, {actual}')
+          print(f'Focused JUnit counts: {actual}')
+          PY
