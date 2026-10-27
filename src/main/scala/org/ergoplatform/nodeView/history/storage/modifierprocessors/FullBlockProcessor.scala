@@ -117,8 +117,14 @@ trait FullBlockProcessor extends HeadersProcessor {
           // Use the received block, not the new best one: from the new best block,
           // a step that fills a gap could prune blocks the state has not applied yet.
           val newMinHeight = updateBestFullBlock(fullBlock.header)
+          // A stored floor can be ahead of the received block after restart; preserve its retained window.
+          val retainedFrom = if (nodeSettings.blocksToKeep > 0) {
+            fullBlock.header.height - nodeSettings.blocksToKeep + 1
+          } else {
+            newBestBlockHeader.height
+          }
           // never the new best block, should a stored floor be above it (an earlier version's restart could store one)
-          val pruneUntil = Math.min(newMinHeight, newBestBlockHeader.height)
+          val pruneUntil = Math.min(newMinHeight, Math.min(newBestBlockHeader.height, retainedFrom))
           if (pruneFrom < pruneUntil) {
             pruneBlockDataAt(pruneFrom until pruneUntil)
               .flatMap(_ => writePrunedBelowHeight(pruneUntil))

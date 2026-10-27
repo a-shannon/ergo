@@ -13,34 +13,38 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Checkout exact PR head and test
+      - name: Checkout exact diagnostic branch
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Verify the owner code and changed paths
+      - name: Verify the red test and bounded product change
         env:
           OWNER_SHA: 9d3d78ffb8cee4ade2f8bbf1c595f5cfc51875c4
-          PROCESSOR_BLOB: f0393ef4dda8190e316d4fb6c8667e80c6d80226
+          RED_SHA: f6d488e214cb97bdab0a0b26fa838cb3a41584c0
+          TEST_BLOB: e0d681a00a00dc58e24b0b487b033ac9db2ad2ed
+          PROCESSOR_BLOB: 2866589409af309026a9dec1536dd88678b049d8
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "$OWNER_SHA"
+          test "$(git rev-parse HEAD^)" = "$RED_SHA"
+          test "$(git rev-parse "$RED_SHA^")" = "$OWNER_SHA"
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/VerifyADHistorySpecification.scala)" = "$TEST_BLOB"
           test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/FullBlockProcessor.scala)" = "$PROCESSOR_BLOB"
           python3 - <<'PY'
           import os
           import subprocess
 
-          base = os.environ["OWNER_SHA"]
+          base = os.environ["RED_SHA"]
           changed = set(subprocess.check_output(
               ["git", "diff", "--name-only", base, "HEAD"], text=True
           ).splitlines())
           expected = {
               ".github/workflows/retained-window-v609-diagnostic.yml",
-              "src/test/scala/org/ergoplatform/nodeView/history/VerifyADHistorySpecification.scala",
+              "src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/FullBlockProcessor.scala",
           }
           if changed != expected:
               raise SystemExit(f"Unexpected changed paths: {sorted(changed)!r}")
-          print("Exact owner code and two-file diagnostic scope verified")
+          print("Exact red test and two-file mitigation scope verified")
           PY
 
       - name: Set up Java 8 and sbt
