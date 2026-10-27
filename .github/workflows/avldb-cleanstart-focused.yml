@@ -22,7 +22,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD:avldb/src/main/scala/scorex/db/LDBVersionedStore.scala)" = "add668f761b0c4de992952cd657d713513dcb2fd"
-          test "$(git rev-parse HEAD:avldb/src/test/scala/scorex/db/LDBVersionedStoreCleanStartSpec.scala)" = "41690ec76d6fe597ddd3b311ec7734fb8722ed31"
+          test "$(git rev-parse HEAD:avldb/src/test/scala/scorex/db/LDBVersionedStoreCleanStartSpec.scala)" = "dfdcd3e14d05643bd59751fca2d8ef148c014f18"
           printf 'Pinned diagnostic commit: %s\n' "$GITHUB_SHA"
 
       - name: Set up JDK 8 and sbt
