@@ -1,0 +1,125 @@
+name: Snapshot 2847 join diagnostic
+
+on:
+  push:
+    branches:
+      - a-shannon/snapshot-2847-join-v610-20261028
+
+permissions:
+  contents: read
+
+jobs:
+  join-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify candidate scope
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = '20d26f467acf42b576aae36cfe4640b3e82febcf c25c3cb452aa9ce4b32666b4e872be3cefc850cb'
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/ToDownloadProcessor.scala)" = '6a4fdc644684791df01cfcf1e800c9a7231f843d'
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/PrunedHistoryRestartSpecification.scala)" = '60309dc9d29ddd4d4887fff9296838bfb3926829'
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/viewholder/ErgoNodeViewHolderSpec.scala)" = 'f98630282ea8678e29d3306a78fa07af3df5b104'
+          python3 - <<'PY'
+          import subprocess
+          expected = sorted([
+              '.github/workflows/snapshot-2847-join-diagnostic-public.yml',
+              '.github/workflows/snapshot-restart-floor-diagnostic-public.yml',
+              'src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/ToDownloadProcessor.scala',
+              'src/test/scala/org/ergoplatform/nodeView/history/PrunedHistoryRestartSpecification.scala',
+              'src/test/scala/org/ergoplatform/nodeView/viewholder/ErgoNodeViewHolderSpec.scala',
+          ])
+          actual = subprocess.check_output(['git', 'diff', '--name-only', 'c4692c22835f2ae39da5c6cb124eaee63f57bf7e', 'HEAD'], text=True).splitlines()
+          if sorted(actual) != expected:
+              raise SystemExit('Unexpected changed paths')
+          PY
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Run join properties and controls
+        run: |
+          set -euo pipefail
+          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec.xml \
+            target/test-reports/TEST-org.ergoplatform.nodeView.history.PrunedHistoryRestartSpecification.xml \
+            target/test-reports/TEST-org.ergoplatform.nodeView.history.UtxoBootstrapNoNipopowSyncSpecification.xml \
+            target/test-reports/TEST-org.ergoplatform.nodeView.history.storage.modifierprocessors.UtxoBootstrapToDownloadSpecification.xml \
+            target/test-reports/TEST-org.ergoplatform.nodeView.history.PopowProcessorSpecification.xml
+          rc=0
+          sbt -batch 'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "preserve a prepared snapshot floor after restart"' 'testOnly org.ergoplatform.nodeView.history.PrunedHistoryRestartSpecification' 'testOnly org.ergoplatform.nodeView.history.UtxoBootstrapNoNipopowSyncSpecification' 'testOnly org.ergoplatform.nodeView.history.storage.modifierprocessors.UtxoBootstrapToDownloadSpecification' 'testOnly org.ergoplatform.nodeView.history.PopowProcessorSpecification -- -z "after a restart"' > "$RUNNER_TEMP/snapshot-2847-sbt.log" 2>&1 || rc=$?
+          printf '%s\n' "$rc" > "$RUNNER_TEMP/snapshot-2847-exit"
+      - name: Classify bounded JUnit result
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          suites = {
+              'org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec': [
+                  'preserve a prepared snapshot floor after restart with all blocks retained',
+                  'preserve a prepared snapshot floor after restart with finite retention',
+              ],
+              'org.ergoplatform.nodeView.history.PrunedHistoryRestartSpecification': [
+                  'continue from the best full block after a restart, when the network tip is past the kept window',
+                  'continue from the best full block after a restart, when an earlier start stored a floor above it',
+                  'continue from the best full block after a restart, when an earlier start stored a floor above it, with voting epochs of 8 blocks',
+              ],
+              'org.ergoplatform.nodeView.history.UtxoBootstrapNoNipopowSyncSpecification': [
+                  'utxo bootstrap without nipopow detects headers sync and requests snapshot info',
+                  'headers sync transition must not poison isUtxoSnapshotApplied for pruned configs (blocksToKeep >= 0)',
+              ],
+              'org.ergoplatform.nodeView.history.storage.modifierprocessors.UtxoBootstrapToDownloadSpecification': [
+                  'snapshot request is issued when headers chain synced and no full blocks applied',
+                  'no repeated snapshot request once download plan is registered',
+                  'toDownload returns no block sections before snapshot, and sections after snapshot',
+                  'without utxoBootstrap no snapshot request and block sections downloaded as usual',
+                  'near the tip, block sections are downloaded after snapshot applied on NiPoPoW-bootstrapped history',
+              ],
+              'org.ergoplatform.nodeView.history.PopowProcessorSpecification': [
+                  'after a restart, a full block floor stored inside a popow headers gap moves past the gap, if no full block was applied',
+                  'after a restart, a node which applied a full block inside a popow headers gap is not repaired',
+              ],
+          }
+          result = {'classification': 'inconclusive'}
+          try:
+              rc = int((Path(os.environ['RUNNER_TEMP']) / 'snapshot-2847-exit').read_text().strip())
+              result.update(sbt_exit=rc, suites={})
+              if rc != 0:
+                  raise ValueError('sbt failed')
+              for suite, expected_names in suites.items():
+                  root = ET.parse(Path('target/test-reports') / ('TEST-' + suite + '.xml')).getroot()
+                  counts = {key: int(root.attrib[key]) for key in ('tests', 'failures', 'errors', 'skipped')}
+                  cases = root.findall('testcase')
+                  names = [case.get('name') for case in cases]
+                  result['suites'][suite] = counts
+                  if root.tag != 'testsuite' or root.get('name') != suite or counts != {'tests': len(expected_names), 'failures': 0, 'errors': 0, 'skipped': 0}:
+                      raise ValueError('unexpected suite counts')
+                  if len(cases) != len(expected_names) or sorted(names) != sorted(expected_names):
+                      raise ValueError('unexpected test cases')
+                  if any(case.findall(tag) for case in cases for tag in ('failure', 'error', 'skipped')):
+                      raise ValueError('non-passing test case')
+              result['classification'] = 'expected-green'
+          except (OSError, ET.ParseError, KeyError, TypeError, ValueError) as exc:
+              result['reason'] = type(exc).__name__
+          Path('diagnostic.json').write_text(json.dumps(result, sort_keys=True) + '\n', encoding='utf-8')
+          summary = 'Snapshot 2847 join: ' + result['classification']
+          print(summary)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as stream:
+              stream.write(summary + '\n')
+          if result['classification'] != 'expected-green':
+              raise SystemExit(1)
+          PY
+      - name: Retain bounded evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-2847-join-${{ github.sha }}
+          path: diagnostic.json
+          if-no-files-found: warn
+          retention-days: 7
