@@ -1,0 +1,146 @@
+name: History extra-store close overlap baseline diagnostic
+
+on:
+  push:
+    branches:
+      - a-shannon/history-extra-close-red-20261028
+
+permissions:
+  contents: read
+
+jobs:
+  close-overlap-baseline:
+    if: github.repository == 'a-shannon/ergo' && github.event.repository.private == false && github.ref == 'refs/heads/a-shannon/history-extra-close-red-20261028'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TEST_COMMIT: 38af08497838cd27b5621b4ef3354f2ac221e692
+      TEST_BLOB: bdc5808d6c5a19370be3bdd6c91e011503119dc6
+      BASE_COMMIT: c4692c22835f2ae39da5c6cb124eaee63f57bf7e
+      TEST_PATH: src/test/scala/org/ergoplatform/nodeView/history/storage/HistoryStorageCloseOverlapSpec.scala
+      WORKFLOW_PATH: .github/workflows/history-extra-close-red-diagnostic.yml
+    steps:
+      - name: Check out the diagnostic commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 3
+          persist-credentials: false
+
+      - name: Verify public fork and exact source composition
+        shell: bash
+        env:
+          TARGET_API: ${{ github.api_url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$TARGET_API/repos/a-shannon/ergo" |
+            python3 -c "import json,sys; r=json.load(sys.stdin); assert r.get('full_name') == 'a-shannon/ergo' and r.get('private') is False"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$TEST_COMMIT"
+          test "$(git rev-parse "$TEST_COMMIT^")" = "$BASE_COMMIT"
+          test "$(git rev-parse "HEAD:$TEST_PATH")" = "$TEST_BLOB"
+          test "$(git rev-parse "$TEST_COMMIT:$TEST_PATH")" = "$TEST_BLOB"
+          diff -u <(printf '%s\n' "$TEST_PATH") <(git diff-tree --no-commit-id --name-only -r "$TEST_COMMIT")
+          diff -u <(printf '%s\n' "$WORKFLOW_PATH") <(git diff-tree --no-commit-id --name-only -r HEAD)
+          test -z "$(git status --porcelain)"
+          git diff --check "$BASE_COMMIT" HEAD
+
+      - name: Set up Java 8 and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Run the focused baseline suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e target/test-reports
+          mkdir -p target "$RUNNER_TEMP/history-close-reports"
+          ln -s "$RUNNER_TEMP/history-close-reports" target/test-reports
+          if sbt -batch -Denv=test ++2.12.20 \
+            'testOnly org.ergoplatform.nodeView.history.storage.HistoryStorageCloseOverlapSpec' \
+            > "$RUNNER_TEMP/history-close-runner.log" 2>&1; then
+            printf '0\n' > "$RUNNER_TEMP/history-close-exit"
+          else
+            printf '%s\n' "$?" > "$RUNNER_TEMP/history-close-exit"
+          fi
+
+      - name: Classify the exact baseline assertion
+        id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          temp = Path(os.environ['RUNNER_TEMP'])
+          suite_name = 'org.ergoplatform.nodeView.history.storage.HistoryStorageCloseOverlapSpec'
+          control = 'extra batch completes and storage closes without a paused update'
+          overlap = 'close must not enter the extra store while an extra batch is in flight'
+          marker = 'extraStore.close entered before the in-flight batch was released: '
+          reports = temp / 'history-close-reports'
+          report = reports / f'TEST-{suite_name}.xml'
+          if sorted(reports.glob('*.xml')) != [report]:
+              raise SystemExit('Inconclusive: expected exactly one focused report')
+          suite = ET.parse(report).getroot()
+          if suite.tag != 'testsuite' or suite.attrib.get('name') != suite_name:
+              raise SystemExit('Inconclusive: unexpected suite')
+          counts = {key: int(suite.attrib[key]) for key in ('tests', 'failures', 'errors', 'skipped')}
+          if counts != {'tests': 2, 'failures': 1, 'errors': 0, 'skipped': 0}:
+              raise SystemExit('Inconclusive: unexpected test counts')
+          cases = suite.findall('testcase')
+          if len(cases) != 2 or {case.attrib.get('name') for case in cases} != {control, overlap}:
+              raise SystemExit('Inconclusive: unexpected test cases')
+          by_name = {case.attrib['name']: case for case in cases}
+          if any(by_name[control].findall(tag) for tag in ('failure', 'error', 'skipped')):
+              raise SystemExit('Inconclusive: healthy control did not pass')
+          case = by_name[overlap]
+          failures = case.findall('failure')
+          if len(failures) != 1 or case.findall('error') or case.findall('skipped'):
+              raise SystemExit('Inconclusive: overlap outcome mismatch')
+          failure = failures[0]
+          kind = failure.attrib.get('type', '')
+          message = failure.attrib.get('message', '')
+          if kind == 'org.scalatest.exceptions.TestFailedException':
+              expected = marker
+          elif kind == 'sbt.ForkMain$ForkError':
+              expected = 'org.scalatest.exceptions.TestFailedException: ' + marker
+          else:
+              raise SystemExit('Inconclusive: unrelated failure type')
+          if not message.startswith(expected) or 'true was not equal to false' not in message:
+              raise SystemExit('Inconclusive: named assertion mismatch')
+          if int((temp / 'history-close-exit').read_text().strip()) != 1:
+              raise SystemExit('Inconclusive: unexpected sbt exit')
+          log = (temp / 'history-close-runner.log').read_text(errors='replace')
+          summaries = ('[info] Total number of tests run: 2', '[info] Suites: completed 1, aborted 0',
+                       '[info] Tests: succeeded 1, failed 1, canceled 0, ignored 0, pending 0')
+          if any(log.count(line) != 1 for line in summaries):
+              raise SystemExit('Inconclusive: runner summary mismatch')
+          errors = [line.strip() for line in log.splitlines() if line.startswith('[error]')]
+          if (len(errors) != 4 or errors[0] != '[error] Failed tests:' or
+                  errors[1] != '[error] \t' + suite_name or
+                  not re.fullmatch(r'\[error\] \(Test / testOnly\) sbt\.TestsFailedException: Tests unsuccessful', errors[2]) or
+                  not errors[3].startswith('[error] Total time: ')):
+              raise SystemExit('Inconclusive: unexpected sbt error output')
+          verdict = {'base_commit': os.environ['BASE_COMMIT'], 'test_commit': os.environ['TEST_COMMIT'],
+                     'diagnostic_commit': os.environ['GITHUB_SHA'], 'test_blob': os.environ['TEST_BLOB'],
+                     'tests': 2, 'failures': 1, 'errors': 0, 'skipped': 0, 'sbt_exit': 1,
+                     'control': 'passed', 'oracle': 'named_close_overlap_assertion'}
+          (temp / 'history-close-verdict.json').write_text(json.dumps(verdict, sort_keys=True) + '\n')
+          print('Expected baseline assertion observed with healthy control')
+          PY
+
+      - name: Retain the bounded verdict
+        if: steps.classify.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: history-extra-close-baseline-verdict
+          path: ${{ runner.temp }}/history-close-verdict.json
+          if-no-files-found: error
+          retention-days: 7
