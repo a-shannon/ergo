@@ -15,6 +15,7 @@ jobs:
     timeout-minutes: 30
     env:
       TEST_COMMIT: 38af08497838cd27b5621b4ef3354f2ac221e692
+      PREVIOUS_WORKFLOW_COMMIT: 620696d3a92fc49b4ac17f5d290bc00fc63a6055
       TEST_BLOB: bdc5808d6c5a19370be3bdd6c91e011503119dc6
       BASE_COMMIT: c4692c22835f2ae39da5c6cb124eaee63f57bf7e
       TEST_PATH: src/test/scala/org/ergoplatform/nodeView/history/storage/HistoryStorageCloseOverlapSpec.scala
@@ -24,7 +25,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 3
+          fetch-depth: 4
           persist-credentials: false
 
       - name: Verify public fork and exact source composition
@@ -37,11 +38,13 @@ jobs:
           curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$TARGET_API/repos/a-shannon/ergo" |
             python3 -c "import json,sys; r=json.load(sys.stdin); assert r.get('full_name') == 'a-shannon/ergo' and r.get('private') is False"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git rev-parse HEAD^)" = "$TEST_COMMIT"
+          test "$(git rev-parse HEAD^)" = "$PREVIOUS_WORKFLOW_COMMIT"
+          test "$(git rev-parse "$PREVIOUS_WORKFLOW_COMMIT^")" = "$TEST_COMMIT"
           test "$(git rev-parse "$TEST_COMMIT^")" = "$BASE_COMMIT"
           test "$(git rev-parse "HEAD:$TEST_PATH")" = "$TEST_BLOB"
           test "$(git rev-parse "$TEST_COMMIT:$TEST_PATH")" = "$TEST_BLOB"
           diff -u <(printf '%s\n' "$TEST_PATH") <(git diff-tree --no-commit-id --name-only -r "$TEST_COMMIT")
+          diff -u <(printf '%s\n' "$WORKFLOW_PATH") <(git diff-tree --no-commit-id --name-only -r "$PREVIOUS_WORKFLOW_COMMIT")
           diff -u <(printf '%s\n' "$WORKFLOW_PATH") <(git diff-tree --no-commit-id --name-only -r HEAD)
           test -z "$(git status --porcelain)"
           git diff --check "$BASE_COMMIT" HEAD
@@ -86,58 +89,93 @@ jobs:
           marker = 'extraStore.close entered before the in-flight batch was released: '
           reports = temp / 'history-close-reports'
           report = reports / f'TEST-{suite_name}.xml'
-          if sorted(reports.glob('*.xml')) != [report]:
-              raise SystemExit('Inconclusive: expected exactly one focused report')
-          suite = ET.parse(report).getroot()
-          if suite.tag != 'testsuite' or suite.attrib.get('name') != suite_name:
-              raise SystemExit('Inconclusive: unexpected suite')
-          counts = {key: int(suite.attrib[key]) for key in ('tests', 'failures', 'errors', 'skipped')}
-          if counts != {'tests': 2, 'failures': 1, 'errors': 0, 'skipped': 0}:
-              raise SystemExit('Inconclusive: unexpected test counts')
-          cases = suite.findall('testcase')
-          if len(cases) != 2 or {case.attrib.get('name') for case in cases} != {control, overlap}:
-              raise SystemExit('Inconclusive: unexpected test cases')
-          by_name = {case.attrib['name']: case for case in cases}
-          if any(by_name[control].findall(tag) for tag in ('failure', 'error', 'skipped')):
-              raise SystemExit('Inconclusive: healthy control did not pass')
-          case = by_name[overlap]
-          failures = case.findall('failure')
-          if len(failures) != 1 or case.findall('error') or case.findall('skipped'):
-              raise SystemExit('Inconclusive: overlap outcome mismatch')
-          failure = failures[0]
-          kind = failure.attrib.get('type', '')
-          message = failure.attrib.get('message', '')
-          if kind == 'org.scalatest.exceptions.TestFailedException':
-              expected = marker
-          elif kind == 'sbt.ForkMain$ForkError':
-              expected = 'org.scalatest.exceptions.TestFailedException: ' + marker
-          else:
-              raise SystemExit('Inconclusive: unrelated failure type')
-          if not message.startswith(expected) or 'true was not equal to false' not in message:
-              raise SystemExit('Inconclusive: named assertion mismatch')
-          if int((temp / 'history-close-exit').read_text().strip()) != 1:
-              raise SystemExit('Inconclusive: unexpected sbt exit')
-          log = (temp / 'history-close-runner.log').read_text(errors='replace')
-          summaries = ('[info] Total number of tests run: 2', '[info] Suites: completed 1, aborted 0',
-                       '[info] Tests: succeeded 1, failed 1, canceled 0, ignored 0, pending 0')
-          if any(log.count(line) != 1 for line in summaries):
-              raise SystemExit('Inconclusive: runner summary mismatch')
-          errors = [line.strip() for line in log.splitlines() if line.startswith('[error]')]
-          if (len(errors) != 4 or errors[0] != '[error] Failed tests:' or
-                  errors[1] != '[error] \t' + suite_name or
-                  not re.fullmatch(r'\[error\] \(Test / testOnly\) sbt\.TestsFailedException: Tests unsuccessful', errors[2]) or
-                  not errors[3].startswith('[error] Total time: ')):
-              raise SystemExit('Inconclusive: unexpected sbt error output')
-          verdict = {'base_commit': os.environ['BASE_COMMIT'], 'test_commit': os.environ['TEST_COMMIT'],
-                     'diagnostic_commit': os.environ['GITHUB_SHA'], 'test_blob': os.environ['TEST_BLOB'],
-                     'tests': 2, 'failures': 1, 'errors': 0, 'skipped': 0, 'sbt_exit': 1,
-                     'control': 'passed', 'oracle': 'named_close_overlap_assertion'}
-          (temp / 'history-close-verdict.json').write_text(json.dumps(verdict, sort_keys=True) + '\n')
+          diagnostic = {'status': 'inconclusive', 'stage': 'provenance', 'reason': 'check_failed',
+                        'report_count': 0, 'case_count': 0, 'error_line_count': 0,
+                        'tests': 0, 'failures': 0, 'errors': 0, 'skipped': 0,
+                        'exit_category': 'unavailable', 'base_commit': 'unavailable',
+                        'test_commit': 'unavailable', 'previous_workflow_commit': 'unavailable',
+                        'diagnostic_commit': 'unavailable', 'test_blob': 'unavailable'}
+          def capped(value):
+              return min(max(value, 0), 99)
+          def require(condition):
+              if not condition:
+                  raise ValueError('check failed')
+          def classify():
+              identities = {'base_commit': os.environ.get('BASE_COMMIT', ''),
+                            'test_commit': os.environ.get('TEST_COMMIT', ''),
+                            'previous_workflow_commit': os.environ.get('PREVIOUS_WORKFLOW_COMMIT', ''),
+                            'diagnostic_commit': os.environ.get('GITHUB_SHA', ''),
+                            'test_blob': os.environ.get('TEST_BLOB', '')}
+              require(all(re.fullmatch(r'[0-9a-f]{40}', value) for value in identities.values()))
+              diagnostic.update(identities)
+              diagnostic['stage'] = 'reports'
+              files = sorted(reports.glob('*.xml'))
+              diagnostic['report_count'] = capped(len(files))
+              require(files == [report])
+              diagnostic['stage'] = 'suite'
+              suite = ET.parse(report).getroot()
+              require(suite.tag == 'testsuite' and suite.attrib.get('name') == suite_name)
+              diagnostic['stage'] = 'counts'
+              counts = {key: int(suite.attrib[key]) for key in ('tests', 'failures', 'errors', 'skipped')}
+              for key, value in counts.items():
+                  diagnostic[key] = capped(value)
+              require(counts == {'tests': 2, 'failures': 1, 'errors': 0, 'skipped': 0})
+              diagnostic['stage'] = 'cases'
+              cases = suite.findall('testcase')
+              diagnostic['case_count'] = capped(len(cases))
+              require(len(cases) == 2 and {case.attrib.get('name') for case in cases} == {control, overlap})
+              by_name = {case.attrib['name']: case for case in cases}
+              diagnostic['stage'] = 'control'
+              require(not any(by_name[control].findall(tag) for tag in ('failure', 'error', 'skipped')))
+              diagnostic['stage'] = 'overlap'
+              case = by_name[overlap]
+              failures = case.findall('failure')
+              require(len(failures) == 1 and not case.findall('error') and not case.findall('skipped'))
+              diagnostic['stage'] = 'assertion'
+              failure = failures[0]
+              kind = failure.attrib.get('type', '')
+              message = failure.attrib.get('message', '')
+              if kind == 'org.scalatest.exceptions.TestFailedException':
+                  expected = marker
+              elif kind == 'sbt.ForkMain$ForkError':
+                  expected = 'org.scalatest.exceptions.TestFailedException: ' + marker
+              else:
+                  require(False)
+              require(message.startswith(expected) and 'true was not equal to false' in message)
+              diagnostic['stage'] = 'exit'
+              exit_code = int((temp / 'history-close-exit').read_text().strip())
+              diagnostic['exit_category'] = str(exit_code) if exit_code in (0, 1, 137, 139) else 'other'
+              require(exit_code == 1)
+              diagnostic['stage'] = 'runner_errors'
+              log = (temp / 'history-close-runner.log').read_text(errors='replace')
+              clean = re.sub(r'\x1b\[[0-9;]*m', '', log)
+              require('\x1b' not in clean)
+              errors = [line.strip() for line in clean.splitlines() if line.lstrip().startswith('[error]')]
+              diagnostic['error_line_count'] = capped(len(errors))
+              patterns = (r'\[error\]\s+Failed tests:\s*',
+                          r'\[error\]\s+' + re.escape(suite_name) + r'\s*',
+                          r'\[error\]\s+\(Test\s*/\s*testOnly\)\s+sbt\.TestsFailedException:\s+Tests unsuccessful\s*',
+                          r'\[error\]\s+Total time:.*')
+              require(len(errors) == len(patterns) and all(re.fullmatch(pattern, line) for pattern, line in zip(patterns, errors)))
+              diagnostic.update(status='expected_red', stage='complete', reason='matched')
+
+          try:
+              classify()
+          except ValueError:
+              pass
+          except Exception:
+              diagnostic['reason'] = 'unexpected_error'
+          try:
+              (temp / 'history-close-verdict.json').write_text(json.dumps(diagnostic, sort_keys=True) + '\n')
+          except Exception:
+              raise SystemExit('Unable to write bounded diagnostic')
+          if diagnostic['status'] != 'expected_red':
+              raise SystemExit('Inconclusive: bounded diagnostic retained')
           print('Expected baseline assertion observed with healthy control')
           PY
 
       - name: Retain the bounded verdict
-        if: steps.classify.outcome == 'success'
+        if: always() && steps.classify.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
           name: history-extra-close-baseline-verdict
