@@ -54,6 +54,22 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
 
   private val extraCacheLock = new ReentrantReadWriteLock()
 
+  // All store and cache access takes this object's monitor before extraCacheLock.
+  private var closed = false
+  private var closeFailure: Throwable = null
+
+  private def withOpen[A](body: => A): A = synchronized {
+    if (closed) throw new IllegalStateException("History storage is closed", closeFailure)
+    body
+  }
+
+  private def withOpenTry[A](body: => Try[A]): Try[A] = synchronized {
+    Try {
+      if (closed) throw new IllegalStateException("History storage is closed", closeFailure)
+      body
+    }.flatten
+  }
+
   private def withExtraCacheReadLock[A](body: => A): A = {
     extraCacheLock.readLock().lock()
     try body
@@ -80,19 +96,19 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     extraCache.invalidate(id)
   }
 
-  def modifierBytesById(id: ModifierId): Option[Array[Byte]] = {
+  def modifierBytesById(id: ModifierId): Option[Array[Byte]] = withOpen {
     objectsStore.get(idToBytes(id)).map(_.tail).orElse(extraStore.get(idToBytes(id))) // removing modifier type byte with .tail (only in objectsStore)
   }
 
   /**
     * @return bytes and type of a network object stored in the database with identifier `id`
     */
-  def modifierTypeAndBytesById(id: ModifierId): Option[(NetworkObjectTypeId.Value, Array[Byte])] = {
+  def modifierTypeAndBytesById(id: ModifierId): Option[(NetworkObjectTypeId.Value, Array[Byte])] = withOpen {
     objectsStore.get(idToBytes(id)).map(bs => (NetworkObjectTypeId.fromByte(bs.head), bs.tail)) // first byte is type id, tail is modifier bytes
   }
 
   def modifierById(id: ModifierId): Option[BlockSection] =
-    lookupModifier(id) orElse objectsStore.get(idToBytes(id)).flatMap { bytes =>
+    withOpen { lookupModifier(id) orElse objectsStore.get(idToBytes(id)).flatMap { bytes =>
       HistoryModifierSerializer.parseBytesTry(bytes) match {
         case Success(pm) =>
           log.trace(s"Cache miss for existing modifier $id")
@@ -102,9 +118,9 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
           log.warn(s"Failed to parse modifier ${encoder.encode(id)} from db (bytes are: ${Algos.encode(bytes)})", e)
           None
       }
-    }
+    } }
 
-  def getExtraIndex(id: ModifierId): Option[ExtraIndex] = withExtraCacheReadLock {
+  def getExtraIndex(id: ModifierId): Option[ExtraIndex] = withOpen { withExtraCacheReadLock {
     Option(extraCache.getIfPresent(id)) orElse extraStore.get(idToBytes(id)).flatMap { bytes =>
       ExtraIndexSerializer.parseBytesTry(bytes) match {
         case Success(pm) =>
@@ -118,15 +134,15 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
           None
       }
     }
-  }
+  } }
 
   def getIndex(id: ByteArrayWrapper): Option[Array[Byte]] =
-    Option(indexCache.getIfPresent(id)).orElse {
+    withOpen { Option(indexCache.getIfPresent(id)).orElse {
       indexStore.get(id.data).map { value =>
         indexCache.put(id, value)
         value
       }
-    }
+    } }
 
   /**
     * Remove storage-rent eligibility entries of the given boxes, e.g. when a miner self-claim
@@ -134,7 +150,7 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     * is futile. An entry whose [[IndexedErgoBox]] is not in the extra index can not be
     * located and is left in place.
     */
-  def removeStorageRentBoxes(boxIds: Seq[ModifierId]): Unit = {
+  def removeStorageRentBoxes(boxIds: Seq[ModifierId]): Unit = withOpen {
     val keys = boxIds.flatMap { boxId =>
       getExtraIndex(boxId) match {
         case Some(iEb: IndexedErgoBox) => Some(StorageRentBox(iEb).id)
@@ -151,7 +167,7 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     * at or before `creationHeight`, in ascending (creationHeight, globalIndex) order.
     * Returns an empty array when the extra index is disabled or does not cover the height.
     */
-  def storageRentBoxesAtOrBefore(creationHeight: Int, limit: Int): Array[StorageRentBox] = {
+  def storageRentBoxesAtOrBefore(creationHeight: Int, limit: Int): Array[StorageRentBox] = withOpen {
     val start = StorageRentBox.key(0, 0L)
     extraStore.scanFrom(
       start,
@@ -175,11 +191,11 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
   /**
     * @return object with `id` if it is in the objects database
     */
-  def get(id: ModifierId): Option[Array[Byte]] = {
+  def get(id: ModifierId): Option[Array[Byte]] = withOpen {
     val idBytes = idToBytes(id)
     objectsStore.get(idBytes).orElse(extraStore.get(idBytes))
   }
-  def get(id: Array[Byte]): Option[Array[Byte]] = objectsStore.get(id).orElse(extraStore.get(id))
+  def get(id: Array[Byte]): Option[Array[Byte]] = withOpen { objectsStore.get(id).orElse(extraStore.get(id)) }
 
   /**
     * @return if object with `id` is in the objects database
@@ -189,7 +205,7 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
 
   def insert(indexesToInsert: Array[(ByteArrayWrapper, Array[Byte])],
              objectsToInsert: Array[BlockSection],
-             indexesToRemove: Array[ByteArrayWrapper] = Array.empty): Try[Unit] = {
+             indexesToRemove: Array[ByteArrayWrapper] = Array.empty): Try[Unit] = withOpenTry {
     objectsStore.insert(
       objectsToInsert.map(mod => mod.serializedId),
       objectsToInsert.map(mod => HistoryModifierSerializer.toBytes(mod))
@@ -222,9 +238,9 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     }
   }
 
-  private[history] def invalidateExtraCache(ids: Iterable[ModifierId]): Unit = withExtraCacheWriteLock {
+  private[history] def invalidateExtraCache(ids: Iterable[ModifierId]): Unit = withOpen { withExtraCacheWriteLock {
     ids.foreach(extraCache.invalidate)
-  }
+  } }
 
   def insertExtraTry(indexesToInsert: Array[(Array[Byte], Array[Byte])],
                      objectsToInsert: Array[ExtraIndex]): Try[Unit] =
@@ -237,7 +253,7 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     */
   def insertExtraTry(indexesToInsert: Array[(Array[Byte], Array[Byte])],
                      objectsToInsert: Array[ExtraIndex],
-                     indexesToRemove: Array[ModifierId]): Try[Unit] = {
+                     indexesToRemove: Array[ModifierId]): Try[Unit] = withOpenTry {
     val objectIds = objectsToInsert.iterator.flatMap(obj => Try(obj.id).toOption).toArray
     Try {
       val keys = objectsToInsert.map(_.serializedId) ++ indexesToInsert.map(_._1)
@@ -262,7 +278,7 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     }
   }
 
-  def removeExtraTry(indexesToRemove: Array[ModifierId]): Try[Unit] = {
+  def removeExtraTry(indexesToRemove: Array[ModifierId]): Try[Unit] = withOpenTry {
     withExtraCacheWriteLock {
       extraStore.remove(indexesToRemove.map(idToBytes)).map { _ =>
         cfor(0)(_ < indexesToRemove.length, _ + 1) { i => removeModifier(indexesToRemove(i)) }
@@ -279,7 +295,7 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     * @return - Success if insertion was successful, Failure otherwise
     */
   def insert(objectIdToInsert: Array[Byte],
-             objectToInsert: Array[Byte]): Try[Unit] = {
+             objectToInsert: Array[Byte]): Try[Unit] = withOpenTry {
     objectsStore.insert(objectIdToInsert, objectToInsert)
   }
 
@@ -291,7 +307,7 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     * @return
     */
   def remove(indicesToRemove: Array[ByteArrayWrapper],
-             idsToRemove: Array[ModifierId]): Try[Unit] = {
+             idsToRemove: Array[ModifierId]): Try[Unit] = withOpenTry {
 
       objectsStore.remove(idsToRemove.map(idToBytes)).flatMap { _ =>
         cfor(0)(_ < idsToRemove.length, _ + 1) { i => removeModifier(idsToRemove(i))}
@@ -302,11 +318,19 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
       }
   }
 
-  override def close(): Unit = {
-    log.warn("Closing history storage...")
-    extraStore.close()
-    indexStore.close()
-    objectsStore.close()
+  override def close(): Unit = synchronized {
+    if (!closed) {
+      closed = true
+      log.warn("Closing history storage...")
+      Seq(extraStore, indexStore, objectsStore).foreach { store =>
+        try store.close() catch {
+          case error: Throwable =>
+            if (closeFailure == null) closeFailure = error
+            else if (closeFailure ne error) closeFailure.addSuppressed(error)
+        }
+      }
+    }
+    if (closeFailure != null) throw closeFailure
   }
 
   /**
@@ -321,7 +345,7 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
   /**
     * Delete the extra index database and reopen it, preserving deletion failures.
     */
-  def deleteExtraDBTry(ergoSettings: ErgoSettings): Try[HistoryStorage] = {
+  def deleteExtraDBTry(ergoSettings: ErgoSettings): Try[HistoryStorage] = withOpenTry {
     log.warn("Removing extra index database after an invalid checkpoint.")
     val root = new File(s"${ergoSettings.directory}/history/extra")
     Try(close()).flatMap { _ =>
