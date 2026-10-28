@@ -1,0 +1,81 @@
+name: Snapshot 2867 crash probe
+
+on:
+  push:
+    branches:
+      - a-shannon/snapshot-2867-crash-probe-v610-20261028
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify probe inputs
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$REPOSITORY" = 'a-shannon/ergo'
+          test "$EVENT_NAME" = push
+          test "$REF" = 'refs/heads/a-shannon/snapshot-2867-crash-probe-v610-20261028'
+          test "$(git rev-parse HEAD)" = "$EVENT_SHA"
+          test "$(git show -s --format=%P HEAD)" = '21c47e5e507525da85cf572343bf89d526ccd29a 0a30d5986f3d2da8fcc4e52dfe1c95d44a5d9fea'
+          python3 - <<'PY'
+          import subprocess
+
+          expected = {
+              '.github/scripts/jvm_crash_summary.py': '5a5c15b128ef047b3a4adff52f34c917bba5a40e',
+              '.github/scripts/test_jvm_crash_summary.py': '7a7e9aa97bfb52c6badbe264563cd16457f7c30d',
+              '.github/workflows/ci.yml': 'd577f9c70a99b73241b851fa2aa2f2acfb65ebf5',
+              'src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/HeadersProcessor.scala': '32da3614ad139d50edb178f46c67d1a16a1e361c',
+              'src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/UtxoSetSnapshotProcessor.scala': 'edfffb43bd88f4e44470b1573c910b83711d1010',
+              'src/test/scala/org/ergoplatform/nodeView/history/UtxoSetSnapshotProcessorSpecification.scala': 'f5e04e2297618eb9d93c132d2587f691130a34bf',
+          }
+          workflow = '.github/workflows/snapshot-2867-crash-probe-public.yml'
+          paths = subprocess.check_output(['git', 'diff', '--name-only', '-z', 'c4692c22835f2ae39da5c6cb124eaee63f57bf7e', 'HEAD']).decode().split('\0')
+          assert set(paths[:-1]) == set(expected) | {workflow} and paths[-1] == '', 'unexpected changed paths'
+          for path, blob in expected.items():
+              actual = subprocess.check_output(['git', 'rev-parse', 'HEAD:' + path], text=True).strip()
+              assert actual == blob, f'unexpected blob for {path}'
+          PY
+      - name: Test crash summary collector
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import unittest
+          suite = unittest.defaultTestLoader.discover('.github/scripts', pattern='test_jvm_crash_summary.py')
+          assert suite.countTestCases() == 15, 'unexpected collector test count'
+          assert unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
+          PY
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Run node tests
+        id: node_tests
+        shell: bash
+        run: sbt -Denv=test clean ++2.12.20 test > "$RUNNER_TEMP/snapshot-2867-sbt.log" 2>&1
+      - name: Summarize retained JVM crash reports
+        id: crash_summary
+        if: failure() && steps.node_tests.outcome == 'failure'
+        shell: bash
+        run: python3 -B .github/scripts/jvm_crash_summary.py --root . --output "$RUNNER_TEMP/snapshot-2867-crash-summary.json"
+      - name: Upload filtered JVM crash summary
+        if: failure() && steps.crash_summary.outcome == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          name: snapshot-2867-jvm-crash-summary
+          path: ${{ runner.temp }}/snapshot-2867-crash-summary.json
+          if-no-files-found: error
+          retention-days: 7
