@@ -1,0 +1,145 @@
+name: Holder indexer restart join diagnostic
+
+on:
+  push:
+    branches:
+      - a-shannon/holder-indexer-restart-join-v610-20261028
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    if: github.repository == 'a-shannon/ergo' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/a-shannon/holder-indexer-restart-join-v610-20261028'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout candidate
+        id: checkout
+        timeout-minutes: 4
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 7
+          persist-credentials: false
+
+      - name: Verify candidate and ancestry
+        id: candidate
+        timeout-minutes: 3
+        shell: bash
+        env:
+          EVENT_SHA: ${{ github.event.after }}
+          TEST_COMMIT: bcc897958e7c0f68ab4cce9ada91684a01aaa3b7
+        run: |
+          set -euo pipefail
+          test "$EVENT_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$EVENT_SHA"
+          test "$(git show -s --format=%P HEAD)" = "$TEST_COMMIT"
+          test "$(git show -s --format=%P "$TEST_COMMIT")" = c2648f960753d6812a6014b48437a226e23c49d5
+          test "$(git show -s --format=%P c2648f960753d6812a6014b48437a226e23c49d5)" = e67b5f9f2b2abda9032bf0e6f188ded953d4355b
+          test "$(git show -s --format=%P e67b5f9f2b2abda9032bf0e6f188ded953d4355b)" = 65704703845d04600813c27123bb634086a98928
+          test "$(git show -s --format=%P 65704703845d04600813c27123bb634086a98928)" = 38af08497838cd27b5621b4ef3354f2ac221e692
+          test "$(git show -s --format=%P 38af08497838cd27b5621b4ef3354f2ac221e692)" = c4692c22835f2ae39da5c6cb124eaee63f57bf7e
+          test "$(git diff --name-only "$TEST_COMMIT" HEAD)" = .github/workflows/holder-indexer-restart-join-diagnostic.yml
+          test "$(git diff --name-only c2648f960753d6812a6014b48437a226e23c49d5 "$TEST_COMMIT")" = src/test/scala/org/ergoplatform/nodeView/history/extra/HolderIndexerRestartJoinSpec.scala
+          test "$(git diff --name-only e67b5f9f2b2abda9032bf0e6f188ded953d4355b c2648f960753d6812a6014b48437a226e23c49d5)" = "$(printf '%s\n' src/main/scala/org/ergoplatform/nodeView/history/storage/HistoryStorage.scala src/test/scala/org/ergoplatform/nodeView/history/storage/HistoryStorageLifecycleSpec.scala)"
+          test "$(git diff --name-only 65704703845d04600813c27123bb634086a98928 e67b5f9f2b2abda9032bf0e6f188ded953d4355b)" = .github/workflows/history-storage-lifecycle-green-diagnostic.yml
+          test "$(git diff --name-only 38af08497838cd27b5621b4ef3354f2ac221e692 65704703845d04600813c27123bb634086a98928)" = "$(printf '%s\n' src/main/scala/org/ergoplatform/nodeView/history/storage/HistoryStorage.scala src/test/scala/org/ergoplatform/nodeView/history/storage/HistoryStorageLifecycleSpec.scala)"
+          test "$(git diff --name-only c4692c22835f2ae39da5c6cb124eaee63f57bf7e 38af08497838cd27b5621b4ef3354f2ac221e692)" = src/test/scala/org/ergoplatform/nodeView/history/storage/HistoryStorageCloseOverlapSpec.scala
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/extra/HolderIndexerRestartJoinSpec.scala)" = ffc8c01712a7ac268620f6a8f868f7b38574d95f
+          test "$(git rev-parse HEAD:.github/workflows/history-storage-lifecycle-green-diagnostic.yml)" = 4b995135124b31ae4cd0022f6ef08c4bd6383c8f
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/history/storage/HistoryStorage.scala)" = bde7621e6a3b070c7003a8550116700bcd2c331f
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/history/storage/HistoryStorageLifecycleSpec.scala)" = df68d0ed4f816fdcf194771c03b1004d1bf94950
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/history/extra/ExtraIndexer.scala)" = c3d71ad72d6c3e4edb259058b687a8c8b62a53c2
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/ErgoNodeViewHolder.scala)" = 20462ac51cfecec0877998200671bae2832e2017
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/history/ErgoHistory.scala)" = fe58d9a0e2bc5efd822f1dc9d9c476b4b67f5e2f
+          git diff --check c4692c22835f2ae39da5c6cb124eaee63f57bf7e HEAD
+
+      - name: Set up Java 8 and sbt
+        id: setup
+        timeout-minutes: 7
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Run the two restart join properties
+        id: tests
+        timeout-minutes: 22
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target "$RUNNER_TEMP/holder-reports"
+          test ! -e target/test-reports
+          ln -s "$RUNNER_TEMP/holder-reports" target/test-reports
+          rc=0
+          timeout --signal=TERM --kill-after=30s 20m sbt -batch -Denv=test '++2.12.20' 'testOnly org.ergoplatform.nodeView.history.extra.HolderIndexerRestartJoinSpec -- -z "indexer joins applied blocks after holder restart="' > "$RUNNER_TEMP/holder-sbt.log" 2>&1 || rc=$?
+          printf '%s\n' "$rc" > "$RUNNER_TEMP/holder-exit"
+          exit "$rc"
+
+      - name: Produce bounded result
+        id: summary
+        timeout-minutes: 2
+        if: always()
+        shell: bash
+        env:
+          CHECKOUT: ${{ steps.checkout.outcome }}
+          CANDIDATE: ${{ steps.candidate.outcome }}
+          SETUP: ${{ steps.setup.outcome }}
+          TESTS: ${{ steps.tests.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          temp = Path(os.environ['RUNNER_TEMP'])
+          expected = {'indexer joins applied blocks after holder restart=false',
+                      'indexer joins applied blocks after holder restart=true'}
+          status = 'inconclusive'
+          exit_code = None
+          named = 0
+          try:
+              exit_code = int((temp / 'holder-exit').read_text().strip())
+              reports = list((temp / 'holder-reports').rglob('*.xml'))
+              expected_report = (temp / 'holder-reports' /
+                                 'TEST-org.ergoplatform.nodeView.history.extra.HolderIndexerRestartJoinSpec.xml')
+              if reports != [expected_report]:
+                  raise ValueError('Expected one report')
+              root = ET.parse(expected_report).getroot()
+              if (root.tag != 'testsuite' or root.get('name') !=
+                  'org.ergoplatform.nodeView.history.extra.HolderIndexerRestartJoinSpec' or
+                  any(root.get(k) != v for k, v in
+                      {'tests': '2', 'failures': '0', 'errors': '0', 'skipped': '0'}.items())):
+                  raise ValueError('Unexpected suite')
+              cases = list(root.findall('testcase'))
+              names = [n.get('name') for n in cases]
+              named = sum(name in expected for name in names)
+              bad = any(c.tag.rsplit('}', 1)[-1] in {'failure', 'error', 'skipped'}
+                        for n in cases for c in n)
+              if exit_code != 0 or bad:
+                  status = 'fail'
+              elif (len(cases) == 2 and set(names) == expected and
+                    len(list(root.iter('testcase'))) == 2):
+                  status = 'pass'
+          except (OSError, ValueError, ET.ParseError):
+              if exit_code not in (None, 0):
+                  status = 'fail'
+          if any(os.environ[k] != 'success' for k in ('CHECKOUT', 'CANDIDATE', 'SETUP', 'TESTS')):
+              status = 'fail' if os.environ['TESTS'] == 'failure' else 'inconclusive'
+          summary = {'result': status, 'named_cases': named,
+                     'sbt_exit': exit_code if exit_code in (0, 1, 124, 137) else None}
+          (temp / 'holder-summary.json').write_text(json.dumps(summary, sort_keys=True) + '\n')
+          if status != 'pass':
+              raise SystemExit('Diagnostic did not establish both named properties')
+          PY
+
+      - name: Upload bounded result
+        timeout-minutes: 2
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: holder-indexer-restart-join-result
+          path: ${{ runner.temp }}/holder-summary.json
+          if-no-files-found: error
+          retention-days: 7
