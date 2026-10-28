@@ -1,0 +1,113 @@
+name: Snapshot restart floor diagnostic
+
+on:
+  push:
+    branches:
+      - a-shannon/snapshot-restart-floor-v610-20261028
+
+permissions:
+  contents: read
+
+jobs:
+  restart-floor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify candidate scope
+        env:
+          BASE_SHA: c4692c22835f2ae39da5c6cb124eaee63f57bf7e
+          TEST_BLOB: f98630282ea8678e29d3306a78fa07af3df5b104
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/viewholder/ErgoNodeViewHolderSpec.scala)" = "$TEST_BLOB"
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          changed = subprocess.check_output(
+              ['git', 'diff', '--name-only', os.environ['BASE_SHA'], 'HEAD'], text=True
+          ).splitlines()
+          expected = [
+              '.github/workflows/snapshot-restart-floor-diagnostic-public.yml',
+              'src/test/scala/org/ergoplatform/nodeView/viewholder/ErgoNodeViewHolderSpec.scala',
+          ]
+          if sorted(changed) != expected:
+              raise SystemExit('Unexpected changed paths')
+          PY
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Run only restart-floor properties
+        run: |
+          set -uo pipefail
+          report=target/test-reports/TEST-org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec.xml
+          rm -f "$report"
+          rc=0
+          sbt -batch 'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "preserve a prepared snapshot floor after restart"' > "$RUNNER_TEMP/snapshot-restart-sbt.log" 2>&1 || rc=$?
+          printf '%s\n' "$rc" > "$RUNNER_TEMP/snapshot-restart-exit"
+      - name: Classify bounded JUnit result
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = Path('target/test-reports/TEST-org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec.xml')
+          result = {'classification': 'inconclusive'}
+          healthy = 'preserve a prepared snapshot floor after restart with all blocks retained'
+          faulted = 'preserve a prepared snapshot floor after restart with finite retention'
+          try:
+              rc = int((Path(os.environ['RUNNER_TEMP']) / 'snapshot-restart-exit').read_text().strip())
+              root = ET.parse(report).getroot()
+              counts = {key: int(root.get(key, '0')) for key in ('tests', 'failures', 'errors', 'skipped')}
+              cases = root.findall('testcase')
+              names = [case.get('name') for case in cases]
+              result.update(counts=counts, sbt_exit=rc)
+              if (root.tag != 'testsuite' or root.get('name') != 'org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec' or counts != {'tests': 2, 'failures': 1, 'errors': 0, 'skipped': 0}):
+                  raise ValueError('unexpected suite counts')
+              if len(cases) != 2 or sorted(names) != sorted([healthy, faulted]):
+                  raise ValueError('unexpected test cases')
+              control = cases[names.index(healthy)]
+              failed = cases[names.index(faulted)]
+              if any(control.findall(tag) for tag in ('failure', 'error', 'skipped')):
+                  raise ValueError('control did not pass')
+              failures = failed.findall('failure')
+              if len(failures) != 1 or failed.findall('error') or failed.findall('skipped'):
+                  raise ValueError('unexpected finite-retention result')
+              failure = failures[0]
+              if failure.get('type') not in ('sbt.ForkMain$ForkError', 'org.scalatest.exceptions.TestFailedException'):
+                  raise ValueError('unexpected failure type')
+              detail = (failure.get('message') or '') + '\n' + (failure.text or '')[:512]
+              if 'org.scalatest.exceptions.TestFailedException' not in detail:
+                  raise ValueError('unexpected assertion class')
+              if 'snapshot floor after a fresh later-epoch header' not in detail:
+                  raise ValueError('unexpected failure location')
+              if rc == 0:
+                  raise ValueError('sbt exit disagrees with failure')
+              result['classification'] = 'expected-red'
+          except (OSError, ET.ParseError, KeyError, TypeError, ValueError) as exc:
+              result['reason'] = type(exc).__name__
+          output = Path('diagnostic.json')
+          output.write_text(json.dumps(result, sort_keys=True) + '\n', encoding='utf-8')
+          summary = 'Snapshot restart floor: ' + result['classification']
+          print(summary)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as stream:
+              stream.write(summary + '\n')
+          if result['classification'] != 'expected-red':
+              raise SystemExit(1)
+          PY
+      - name: Retain bounded evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-restart-floor-${{ github.sha }}
+          path: diagnostic.json
+          if-no-files-found: warn
+          retention-days: 7
