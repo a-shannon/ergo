@@ -64,10 +64,8 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
   }
 
   private def withOpenTry[A](body: => Try[A]): Try[A] = synchronized {
-    Try {
-      if (closed) throw new IllegalStateException("History storage is closed", closeFailure)
-      body
-    }.flatten
+    if (closed) Failure(new IllegalStateException("History storage is closed", closeFailure))
+    else body
   }
 
   private def withExtraCacheReadLock[A](body: => A): A = {

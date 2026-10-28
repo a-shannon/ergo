@@ -3,7 +3,9 @@ package org.ergoplatform.nodeView.history.storage
 import org.ergoplatform.nodeView.history.extra.ExtraIndex
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import scorex.db.{ByteArrayWrapper, LDBKVStore}
+import scorex.util.bytesToId
 
+import java.io.IOException
 import java.lang.management.ManagementFactory
 import java.nio.file.Files
 import java.util.concurrent.{CountDownLatch, TimeUnit}
@@ -17,6 +19,7 @@ class HistoryStorageLifecycleSpec extends ErgoCorePropertyTest {
     val closes = new AtomicInteger(0)
     val updates = new AtomicInteger(0)
     var closeError: Throwable = null
+    var updateError: Throwable = null
     var updateEntered = new CountDownLatch(0)
     var releaseUpdate = new CountDownLatch(0)
     var closeEntered = new CountDownLatch(0)
@@ -24,16 +27,38 @@ class HistoryStorageLifecycleSpec extends ErgoCorePropertyTest {
 
     override def get(key: Array[Byte]): Option[Array[Byte]] = Some(Array[Byte](7))
     override def update(keys: Array[Array[Byte]], values: Array[Array[Byte]],
-                        remove: Array[Array[Byte]]): Try[Unit] = Try {
-      updates.incrementAndGet()
-      updateEntered.countDown()
-      require(releaseUpdate.await(5, TimeUnit.SECONDS))
+                        remove: Array[Array[Byte]]): Try[Unit] = {
+      if (updateError != null) throw updateError
+      Try {
+        updates.incrementAndGet()
+        updateEntered.countDown()
+        require(releaseUpdate.await(5, TimeUnit.SECONDS))
+      }
     }
     override def close(): Unit = {
       closes.incrementAndGet()
       closeEntered.countDown()
       require(releaseClose.await(5, TimeUnit.SECONDS))
       if (closeError != null) throw closeError
+    }
+  }
+
+  property("remove propagates an exception thrown before the store returns a Try") {
+    val extra = new Store
+    val index = new Store
+    val objects = new Store
+    val storage = new HistoryStorage(index, objects, extra, settings.cacheSettings)
+    val id = bytesToId(Array.fill[Byte](32)(1))
+    val error = new IOException("update failed before returning")
+    try {
+      storage.remove(Array.empty[ByteArrayWrapper], Array(id)).get
+      objects.updateError = error
+      intercept[IOException] {
+        storage.remove(Array.empty[ByteArrayWrapper], Array(id))
+      } shouldBe error
+    } finally {
+      storage.close()
+      Seq(extra, index, objects).map(_.closes.get()) shouldBe Seq(1, 1, 1)
     }
   }
 
