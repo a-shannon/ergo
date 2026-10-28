@@ -19,12 +19,15 @@ jobs:
       - name: Verify candidate scope
         env:
           BASE_SHA: c4692c22835f2ae39da5c6cb124eaee63f57bf7e
+          PARENT_SHA: e2a35eef52245af97f5933b8f9aaf70a7f2b3cb7
           TEST_BLOB: f98630282ea8678e29d3306a78fa07af3df5b104
+          PRODUCT_BLOB: 2b2361793e5947d144f2e08fbc691caf572af568
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          test "$(git rev-parse HEAD^)" = "$PARENT_SHA"
           test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/viewholder/ErgoNodeViewHolderSpec.scala)" = "$TEST_BLOB"
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/ToDownloadProcessor.scala)" = "$PRODUCT_BLOB"
           python3 - <<'PY'
           import os
           import subprocess
@@ -34,6 +37,7 @@ jobs:
           ).splitlines()
           expected = [
               '.github/workflows/snapshot-restart-floor-diagnostic-public.yml',
+              'src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/ToDownloadProcessor.scala',
               'src/test/scala/org/ergoplatform/nodeView/viewholder/ErgoNodeViewHolderSpec.scala',
           ]
           if sorted(changed) != expected:
@@ -43,13 +47,14 @@ jobs:
         with:
           jvm: temurin:8
           apps: sbt
-      - name: Run only restart-floor properties
+      - name: Run restart-floor properties and bootstrap controls
         run: |
           set -uo pipefail
-          report=target/test-reports/TEST-org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec.xml
-          rm -f "$report"
+          rm -f target/test-reports/TEST-org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec.xml \
+            target/test-reports/TEST-org.ergoplatform.nodeView.history.UtxoBootstrapNoNipopowSyncSpecification.xml \
+            target/test-reports/TEST-org.ergoplatform.nodeView.history.storage.modifierprocessors.UtxoBootstrapToDownloadSpecification.xml
           rc=0
-          sbt -batch 'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "preserve a prepared snapshot floor after restart"' > "$RUNNER_TEMP/snapshot-restart-sbt.log" 2>&1 || rc=$?
+          sbt -batch 'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "preserve a prepared snapshot floor after restart"' 'testOnly org.ergoplatform.nodeView.history.UtxoBootstrapNoNipopowSyncSpecification' 'testOnly org.ergoplatform.nodeView.history.storage.modifierprocessors.UtxoBootstrapToDownloadSpecification' > "$RUNNER_TEMP/snapshot-restart-sbt.log" 2>&1 || rc=$?
           printf '%s\n' "$rc" > "$RUNNER_TEMP/snapshot-restart-exit"
       - name: Classify bounded JUnit result
         run: |
@@ -59,39 +64,43 @@ jobs:
           import xml.etree.ElementTree as ET
           from pathlib import Path
 
-          report = Path('target/test-reports/TEST-org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec.xml')
           result = {'classification': 'inconclusive'}
-          healthy = 'preserve a prepared snapshot floor after restart with all blocks retained'
-          faulted = 'preserve a prepared snapshot floor after restart with finite retention'
+          suites = {
+              'org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec': [
+                  'preserve a prepared snapshot floor after restart with all blocks retained',
+                  'preserve a prepared snapshot floor after restart with finite retention',
+              ],
+              'org.ergoplatform.nodeView.history.UtxoBootstrapNoNipopowSyncSpecification': [
+                  'utxo bootstrap without nipopow detects headers sync and requests snapshot info',
+                  'headers sync transition must not poison isUtxoSnapshotApplied for pruned configs (blocksToKeep >= 0)',
+              ],
+              'org.ergoplatform.nodeView.history.storage.modifierprocessors.UtxoBootstrapToDownloadSpecification': [
+                  'snapshot request is issued when headers chain synced and no full blocks applied',
+                  'no repeated snapshot request once download plan is registered',
+                  'toDownload returns no block sections before snapshot, and sections after snapshot',
+                  'without utxoBootstrap no snapshot request and block sections downloaded as usual',
+                  'near the tip, block sections are downloaded after snapshot applied on NiPoPoW-bootstrapped history',
+              ],
+          }
           try:
               rc = int((Path(os.environ['RUNNER_TEMP']) / 'snapshot-restart-exit').read_text().strip())
-              root = ET.parse(report).getroot()
-              counts = {key: int(root.get(key, '0')) for key in ('tests', 'failures', 'errors', 'skipped')}
-              cases = root.findall('testcase')
-              names = [case.get('name') for case in cases]
-              result.update(counts=counts, sbt_exit=rc)
-              if (root.tag != 'testsuite' or root.get('name') != 'org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec' or counts != {'tests': 2, 'failures': 1, 'errors': 0, 'skipped': 0}):
-                  raise ValueError('unexpected suite counts')
-              if len(cases) != 2 or sorted(names) != sorted([healthy, faulted]):
-                  raise ValueError('unexpected test cases')
-              control = cases[names.index(healthy)]
-              failed = cases[names.index(faulted)]
-              if any(control.findall(tag) for tag in ('failure', 'error', 'skipped')):
-                  raise ValueError('control did not pass')
-              failures = failed.findall('failure')
-              if len(failures) != 1 or failed.findall('error') or failed.findall('skipped'):
-                  raise ValueError('unexpected finite-retention result')
-              failure = failures[0]
-              if failure.get('type') not in ('sbt.ForkMain$ForkError', 'org.scalatest.exceptions.TestFailedException'):
-                  raise ValueError('unexpected failure type')
-              detail = (failure.get('message') or '') + '\n' + (failure.text or '')[:512]
-              if 'org.scalatest.exceptions.TestFailedException' not in detail:
-                  raise ValueError('unexpected assertion class')
-              if 'snapshot floor after a fresh later-epoch header' not in detail:
-                  raise ValueError('unexpected failure location')
-              if rc == 0:
-                  raise ValueError('sbt exit disagrees with failure')
-              result['classification'] = 'expected-red'
+              result.update(sbt_exit=rc, suites={})
+              if rc != 0:
+                  raise ValueError('sbt failed')
+              for suite, expected_names in suites.items():
+                  report = Path('target/test-reports') / ('TEST-' + suite + '.xml')
+                  root = ET.parse(report).getroot()
+                  counts = {key: int(root.attrib[key]) for key in ('tests', 'failures', 'errors', 'skipped')}
+                  cases = root.findall('testcase')
+                  names = [case.get('name') for case in cases]
+                  result['suites'][suite] = counts
+                  if root.tag != 'testsuite' or root.get('name') != suite or counts != {'tests': len(expected_names), 'failures': 0, 'errors': 0, 'skipped': 0}:
+                      raise ValueError('unexpected suite counts')
+                  if len(cases) != len(expected_names) or sorted(names) != sorted(expected_names):
+                      raise ValueError('unexpected test cases')
+                  if any(case.findall(tag) for case in cases for tag in ('failure', 'error', 'skipped')):
+                      raise ValueError('non-passing test case')
+              result['classification'] = 'expected-green'
           except (OSError, ET.ParseError, KeyError, TypeError, ValueError) as exc:
               result['reason'] = type(exc).__name__
           output = Path('diagnostic.json')
@@ -100,7 +109,7 @@ jobs:
           print(summary)
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as stream:
               stream.write(summary + '\n')
-          if result['classification'] != 'expected-red':
+          if result['classification'] != 'expected-green':
               raise SystemExit(1)
           PY
       - name: Retain bounded evidence

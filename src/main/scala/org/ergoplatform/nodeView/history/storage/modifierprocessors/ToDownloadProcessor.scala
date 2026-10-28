@@ -166,7 +166,10 @@ trait ToDownloadProcessor
     */
   private def markHeadersSyncedIfFresh(header: Header, updateBestBlock: Boolean = false): Unit = {
     if (!isHeadersChainSynced && header.isNew(chainSettings.blockInterval * headerChainDiff)) {
-      if (updateBestBlock) {
+      // A restored snapshot has no full block yet; keep its first download height until one is applied.
+      val keepSnapshotFloor = updateBestBlock && nodeSettings.utxoSettings.utxoBootstrap &&
+        isUtxoSnapshotApplied && bestFullBlockOpt.isEmpty
+      if (updateBestBlock && !keepSnapshotFloor) {
         val lowestHeight = lowestApplicableHeight(header)
         updateBestFullBlock(header, lowestHeight)
         if (lowestHeight > GenesisHeight) warnIfBestFullBlockBelowGap(header)
