@@ -15,14 +15,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 4
+          fetch-depth: 6
           persist-credentials: false
 
       - name: Verify candidate identity
         env:
-          SOURCE_COMMIT: 65704703845d04600813c27123bb634086a98928
-          SOURCE_BLOB: 18fad60a0713fb3deb40eea64c43131c8db488ea
-          LIFECYCLE_BLOB: 3e1dcf61619d8c055055be8596f570f57a96b589
+          SOURCE_COMMIT: c2648f960753d6812a6014b48437a226e23c49d5
+          SOURCE_BLOB: bde7621e6a3b070c7003a8550116700bcd2c331f
+          LIFECYCLE_BLOB: df68d0ed4f816fdcf194771c03b1004d1bf94950
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -31,7 +31,6 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD^)" = "$SOURCE_COMMIT"
-          test "$(git rev-parse "$SOURCE_COMMIT^")" = 38af08497838cd27b5621b4ef3354f2ac221e692
           python3 - <<'PY'
           import json, os, subprocess, urllib.request
           request = urllib.request.Request('https://api.github.com/repos/a-shannon/ergo', headers={
@@ -53,11 +52,24 @@ jobs:
           workflow = '.github/workflows/history-storage-lifecycle-green-diagnostic.yml'
           def delta(a, b):
               return set(subprocess.check_output(['git', 'diff', '--name-only', a, b], text=True).splitlines())
-          assert delta('38af08497838cd27b5621b4ef3354f2ac221e692', os.environ['SOURCE_COMMIT']) == {
+          chain = [
+              'HEAD', os.environ['SOURCE_COMMIT'],
+              'e67b5f9f2b2abda9032bf0e6f188ded953d4355b',
+              '65704703845d04600813c27123bb634086a98928',
+              '38af08497838cd27b5621b4ef3354f2ac221e692', base,
+          ]
+          for child, parent in zip(chain, chain[1:]):
+              parents = subprocess.check_output(['git', 'show', '-s', '--format=%P', child], text=True).split()
+              assert parents == [parent], child
+          source_paths = {
               'src/main/scala/org/ergoplatform/nodeView/history/storage/HistoryStorage.scala',
               prefix + 'HistoryStorageLifecycleSpec.scala',
           }
-          assert delta(os.environ['SOURCE_COMMIT'], 'HEAD') == {workflow}
+          for child, parent, paths in zip(chain, chain[1:], [
+              {workflow}, source_paths, {workflow}, source_paths,
+              {prefix + 'HistoryStorageCloseOverlapSpec.scala'},
+          ]):
+              assert delta(parent, child) == paths, child
           changed = set(subprocess.check_output(['git', 'diff', '--name-only', base, 'HEAD'], text=True).splitlines())
           assert changed == set(files) - {prefix + 'HistoryStorageSpec.scala'} | {workflow}, changed
           for path, blob in files.items():
@@ -92,6 +104,7 @@ jobs:
           import json, os, pathlib, sys, xml.etree.ElementTree as ET
           expected = {
               'HistoryStorageLifecycleSpec': {
+                  'remove propagates an exception thrown before the store returns a Try',
                   'an in-flight operation completes before close enters a store',
                   'close-first blocks an operation and post-close reads reject cached data',
                   'close attempts every store once and failed close prevents deletion',
