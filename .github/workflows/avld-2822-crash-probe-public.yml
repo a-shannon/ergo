@@ -1,0 +1,73 @@
+name: AVLD 2822 crash probe
+
+on:
+  push:
+    branches:
+      - a-shannon/avld-2822-crash-probe-v610-20261028
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    if: github.repository == 'a-shannon/ergo' && github.event_name == 'push' && github.ref == 'refs/heads/a-shannon/avld-2822-crash-probe-v610-20261028'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify candidate
+        shell: bash
+        env:
+          EVENT_SHA: ${{ github.event.after }}
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$EVENT_SHA" = "$GITHUB_SHA_VALUE"
+          test "$(git rev-parse HEAD)" = "$EVENT_SHA"
+          test "$(git show -s --format=%P HEAD)" = 'dca4e9409f29a8353bbc8667b48f340089f3fd68 0a30d5986f3d2da8fcc4e52dfe1c95d44a5d9fea'
+          base=c4692c22835f2ae39da5c6cb124eaee63f57bf7e
+          test "$(git merge-base HEAD^1 HEAD^2)" = "$base"
+          expected=$(printf '%s\n' \
+            .github/scripts/jvm_crash_summary.py \
+            .github/scripts/test_jvm_crash_summary.py \
+            .github/workflows/avld-2822-crash-probe-public.yml \
+            .github/workflows/ci.yml \
+            avldb/src/test/scala/org/ergoplatform/serialization/SubtreeSerializerDepthSpecification.scala | LC_ALL=C sort)
+          actual=$(git diff --name-only "$base" HEAD | LC_ALL=C sort)
+          test "$actual" = "$expected"
+          test "$(git rev-parse HEAD:.github/workflows/ci.yml)" = 5b4020981f9bdf149ff50e7d5a28832f6d2d5768
+          test "$(git rev-parse HEAD:avldb/src/test/scala/org/ergoplatform/serialization/SubtreeSerializerDepthSpecification.scala)" = e7162854b24d3f32d897ec7b6323384648d6886f
+          test "$(git rev-parse HEAD:.github/scripts/jvm_crash_summary.py)" = 5a5c15b128ef047b3a4adff52f34c917bba5a40e
+          test "$(git rev-parse HEAD:.github/scripts/test_jvm_crash_summary.py)" = 7a7e9aa97bfb52c6badbe264563cd16457f7c30d
+
+      - name: Check crash summary filtering
+        run: python3 -B -m unittest discover -s .github/scripts -p 'test_jvm_crash_summary.py'
+
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Run node tests
+        id: node_tests
+        shell: bash
+        run: sbt -Denv=test clean ++2.12.20 test > "$RUNNER_TEMP/node-test.stdout" 2> "$RUNNER_TEMP/node-test.stderr"
+
+      - name: Summarize retained JVM crash reports
+        id: crash_summary
+        if: failure() && steps.node_tests.outcome == 'failure'
+        run: python3 -B .github/scripts/jvm_crash_summary.py --root . --output "$RUNNER_TEMP/jvm-crash-summary.json"
+
+      - name: Upload filtered JVM crash summary
+        if: failure() && steps.crash_summary.outcome == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          name: node-jvm-crash-summary
+          path: ${{ runner.temp }}/jvm-crash-summary.json
+          if-no-files-found: error
+          retention-days: 7
