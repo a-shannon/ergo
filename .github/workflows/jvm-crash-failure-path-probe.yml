@@ -1,0 +1,117 @@
+name: Synthetic JVM crash summary failure path
+
+on:
+  push:
+    branches:
+      - a-shannon/jvm-crash-failure-plumbing-v610-20261028
+
+permissions:
+  contents: read
+
+jobs:
+  failure_path:
+    name: Exercise filtered failure artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact diagnostic commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Pin collector source and workflow scope
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD^)" = "0a30d5986f3d2da8fcc4e52dfe1c95d44a5d9fea"
+          test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/jvm-crash-failure-path-probe.yml"
+
+      - name: Create synthetic crash report from collector fixture
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import importlib.util
+          from pathlib import Path
+
+          fixture = Path('.github/scripts/test_jvm_crash_summary.py')
+          spec = importlib.util.spec_from_file_location('crash_summary_fixture', fixture)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          Path('hs_err_pid2514.log').write_text(module.REPORT, encoding='utf-8')
+          PY
+
+      - name: Fail node test step synthetically
+        id: node_tests
+        shell: bash
+        run: exit 1
+
+      - name: Summarize retained JVM crash reports
+        id: crash_summary
+        if: failure() && steps.node_tests.outcome == 'failure'
+        run: python3 -B .github/scripts/jvm_crash_summary.py --root . --output target/jvm-crash-summary.json
+
+      - name: Upload filtered JVM crash summary
+        id: crash_upload
+        if: failure() && steps.crash_summary.outcome == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          name: node-jvm-crash-summary
+          path: target/jvm-crash-summary.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Verify failure-path step outcomes
+        if: always()
+        shell: bash
+        run: |
+          test "${{ steps.node_tests.outcome }}" = "failure"
+          test "${{ steps.crash_summary.outcome }}" = "success"
+          test "${{ steps.crash_upload.outcome }}" = "success"
+
+  verify_artifact:
+    name: Verify uploaded allowlisted JSON
+    needs: failure_path
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm source job remains failed
+        shell: bash
+        run: test "${{ needs.failure_path.result }}" = "failure"
+
+      - name: Download filtered summary
+        uses: actions/download-artifact@v8
+        with:
+          name: node-jvm-crash-summary
+          path: artifact-check
+
+      - name: Check exact schema, values, and filtering
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path('artifact-check')
+          files = sorted(str(path.relative_to(root)) for path in root.rglob('*') if path.is_file())
+          assert files == ['jvm-crash-summary.json'], files
+          raw = (root / files[0]).read_text(encoding='utf-8')
+          expected = {
+              'schema_version': 1,
+              'scan_scope': ['checkout-root', 'target-root'],
+              'attribution': 'hints_only',
+              'status': 'reports_found',
+              'reports': [{
+                  'status': 'parsed',
+                  'signal': 'SIGSEGV',
+                  'pid': 2514,
+                  'java_major': 8,
+                  'native_component': 'leveldbjni',
+                  'native_operation': 'NativeDB.delete',
+                  'suite_hint': None,
+                  'group_hint': 2,
+              }],
+              'report_limit_reached': False,
+              'unavailable_scopes': [],
+          }
+          assert json.loads(raw) == expected
+          for forbidden in ('PRIVATE_SENTINEL', '/checkout', 'hs_err_pid2514', 'jvm_args', 'IGNORED_VALUE'):
+              assert forbidden not in raw
+          PY
