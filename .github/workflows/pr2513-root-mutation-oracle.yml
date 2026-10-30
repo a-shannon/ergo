@@ -1,0 +1,36 @@
+name: Recovered root mutation oracle
+
+on:
+  push:
+    branches: [a-shannon/pr2513-root-mutation-oracle-20261030]
+
+permissions:
+  contents: read
+
+env:
+  GIT_NO_LAZY_FETCH: "1"
+
+jobs:
+  mutation-oracle:
+    if: github.repository == 'a-shannon/ergo' && github.ref == 'refs/heads/a-shannon/pr2513-root-mutation-oracle-20261030'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: coursier/setup-action@648df969f41ef15fda2baba8b37f9fa3d16390a3 # v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Check both fixed source mutants
+        run: python3 -I -B .github/scripts/pr2513-root-mutation-oracle.py
+      - name: Retain sanitized counts only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: recovered-root-mutation-counts
+          path: ${{ runner.temp }}/pr2513-root-mutation-oracle.json
+          if-no-files-found: error
+          retention-days: 7
