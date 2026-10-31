@@ -1,0 +1,213 @@
+name: Public wallet parent-child refresh diagnostic
+
+on:
+  push:
+    branches:
+      - a-shannon/pr2771-parent-child-public-diagnostic-20261031
+
+permissions:
+  contents: read
+
+env:
+  EXPECTED_REPOSITORY: a-shannon/ergo
+  EXPECTED_BRANCH: a-shannon/pr2771-parent-child-public-diagnostic-20261031
+  BASE_SHA: e503b7bbc4e25d7d5eebe698b68079a9e05e7848
+  TEST_BLOB: 340c8858e50bbd736f191dc38e45c704dcc6f167
+  ACTOR_BLOB: df2ba586bf85f326b35f6874794f4ece48ad0ba6
+  PROJECT_BLOB: 61c9b1cb115daf7244c8bdf5afb23d24ff85d987
+  WORKFLOW_CANONICAL_SHA256: b703c35c0346ae08fafcbdb5f9d424957846bae7210a35866df891817c88627d
+
+jobs:
+  wallet_refresh:
+    if: github.repository == 'a-shannon/ergo' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact diagnostic branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify public fork and source closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$GITHUB_REF" = "refs/heads/$EXPECTED_BRANCH"
+          test "$GITHUB_EVENT_NAME" = push
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/wallet/ErgoWalletServiceSpec.scala)" = "$TEST_BLOB"
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/wallet/ErgoWalletActor.scala)" = "$ACTOR_BLOB"
+          test "$(git rev-parse HEAD:project/build.properties)" = "$PROJECT_BLOB"
+          test "$(cat project/build.properties)" = 'sbt.version=1.11.1'
+          test -z "$(git status --porcelain)"
+          test ! -e target/test-reports
+          python3 - <<'PY'
+          import json
+          import hashlib
+          import os
+          from pathlib import Path
+          import subprocess
+
+          event = json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8"))
+          if event["repository"]["private"] is not False:
+              raise SystemExit("Repository is not public")
+          workflow_path = ".github/workflows/pr2771-parent-child-refresh-public.yml"
+          workflow_bytes = Path(workflow_path).read_bytes()
+          digest = os.environ["WORKFLOW_CANONICAL_SHA256"].encode("ascii")
+          marker = b"WORKFLOW_CANONICAL_SHA256: " + digest
+          if workflow_bytes.count(marker) != 1:
+              raise SystemExit("Workflow pin marker mismatch")
+          canonical = workflow_bytes.replace(
+              marker,
+              b"WORKFLOW_CANONICAL_SHA256: " + b"0" * 64,
+              1,
+          )
+          if hashlib.sha256(canonical).hexdigest().encode("ascii") != digest:
+              raise SystemExit("Workflow canonical checksum mismatch")
+          changed = set(subprocess.check_output(
+              ["git", "diff", "--name-only", os.environ["BASE_SHA"], "HEAD"],
+              text=True,
+          ).splitlines())
+          expected = {
+              "src/test/scala/org/ergoplatform/nodeView/wallet/ErgoWalletServiceSpec.scala",
+              workflow_path,
+          }
+          if changed != expected:
+              raise SystemExit("Diagnostic path scope mismatch")
+          print("Public fork and exact source scope verified")
+          PY
+
+      - name: Set up Java 8 and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Run only the wallet parent-child refresh property
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/pr2771-wallet-service.log"
+          result=0
+          sbt -batch -Denv=test ++2.12.20 \
+            'testOnly org.ergoplatform.nodeView.wallet.ErgoWalletServiceSpec -- -z "refreshOffChainState retains an unstored child when its stored parent confirms"' > "$log" 2>&1 || result=$?
+          python3 - "$result" "$log" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          import xml.etree.ElementTree as ET
+
+          sbt_result = int(sys.argv[1])
+          log = Path(sys.argv[2])
+          out = Path(os.environ["RUNNER_TEMP"]) / "pr2771-wallet-refresh"
+          out.mkdir(parents=True, exist_ok=True)
+          facts = {
+              "schema": "pr2771-parent-child-refresh-v2",
+              "candidate": os.environ["GITHUB_SHA"],
+              "base": os.environ["BASE_SHA"],
+              "tree": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD^{tree}"], text=True,
+              ).strip(),
+              "test_blob": os.environ["TEST_BLOB"],
+              "actor_blob": os.environ["ACTOR_BLOB"],
+              "workflow_blob": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD:.github/workflows/pr2771-parent-child-refresh-public.yml"],
+                  text=True,
+              ).strip(),
+              "sbt_exit": sbt_result,
+              "status": "inconclusive",
+              "reason": "not_classified",
+          }
+          if log.exists():
+              data = log.read_bytes()
+              facts["log_bytes"] = len(data)
+              facts["log_sha256"] = hashlib.sha256(data).hexdigest()
+          else:
+              facts["log_bytes"] = 0
+              facts["reason"] = "log_missing"
+
+          def finish(status, reason, successful):
+              facts["status"] = status
+              facts["reason"] = reason
+              (out / "facts.json").write_text(
+                  json.dumps(facts, sort_keys=True, separators=(",", ":")) + "\n",
+                  encoding="utf-8",
+              )
+              print("Wallet refresh diagnostic: " + status + "/" + reason)
+              raise SystemExit(0 if successful else 1)
+
+          if not log.exists():
+              finish("inconclusive", "log_missing", False)
+
+          report_dir = Path("target/test-reports")
+          reports = sorted(report_dir.glob("TEST-*.xml"))
+          report = report_dir / "TEST-org.ergoplatform.nodeView.wallet.ErgoWalletServiceSpec.xml"
+          if reports != [report]:
+              build_text = log.read_text(encoding="utf-8", errors="replace")
+              hints = set()
+              if "Error downloading" in build_text or "ResolutionException" in build_text:
+                  hints.add("dependency_resolution")
+              if "Not a valid command" in build_text or "No such setting" in build_text:
+                  hints.add("sbt_command")
+              if re.search(r"(?m)^\[error\].*\.scala:\d+:", build_text):
+                  hints.add("scala_compile")
+              facts["build_hint"] = (
+                  next(iter(hints)) if len(hints) == 1 else
+                  "ambiguous" if hints else "unknown"
+              )
+              finish("inconclusive", "xml_scope", False)
+          try:
+              suite = ET.parse(report).getroot()
+              cases = list(suite.iter("testcase"))
+              counts = {
+                  key: int(suite.attrib.get(key, -1))
+                  for key in ("tests", "failures", "errors", "skipped")
+              }
+          except (ET.ParseError, OSError, ValueError):
+              finish("inconclusive", "xml_parse", False)
+          facts.update(counts)
+          target = "refreshOffChainState retains an unstored child when its stored parent confirms"
+          names = [case.attrib.get("name", "") for case in cases]
+          failures = [case for case in cases if case.find("failure") is not None]
+          errors = [case for case in cases if case.find("error") is not None]
+          skipped = [case for case in cases if case.find("skipped") is not None]
+          if (suite.tag != "testsuite"
+                  or suite.attrib.get("name") != "org.ergoplatform.nodeView.wallet.ErgoWalletServiceSpec"
+                  or counts["tests"] != 1
+                  or len(cases) != 1
+                  or names != [target]
+                  or any(case.attrib.get("classname") != suite.attrib["name"] for case in cases)
+                  or counts["failures"] != len(failures)
+                  or counts["errors"] != 0
+                  or errors
+                  or counts["skipped"] != 0
+                  or skipped):
+              finish("inconclusive", "xml_oracle_scope", False)
+          if sbt_result == 0 and counts["failures"] == 0:
+              finish("not_reproduced", "target_passed", True)
+          if sbt_result != 1 or counts["failures"] != 1 or failures != cases:
+              finish("inconclusive", "unexpected_failure", False)
+          failure = cases[0].find("failure")
+          failure_type = failure.attrib.get("type", "") if failure is not None else ""
+          message = ((failure.attrib.get("message", "") if failure is not None else "")
+                     + (failure.text or "" if failure is not None else ""))
+          if not failure_type.endswith("TestFailedException") or "stale-reader:" not in message:
+              finish("inconclusive", "wrong_failure_marker", False)
+          finish("reproduced_fixture_failure", "stale_reader_final_assertion", True)
+          PY
+
+      - name: Upload bounded facts only
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr2771-wallet-refresh-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pr2771-wallet-refresh/facts.json
+          if-no-files-found: error
+          retention-days: 7

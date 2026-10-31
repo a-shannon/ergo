@@ -7,6 +7,7 @@ import org.ergoplatform.ErgoBox.{NonMandatoryRegisterId, R1}
 import org.ergoplatform._
 import org.ergoplatform.db.DBSpec
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
+import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.ChangedMempool
 import org.ergoplatform.nodeView.mempool.ErgoMemPoolReader
 import org.ergoplatform.nodeView.wallet.ErgoWalletService.{
   ChangeAddressNotOwned,
@@ -1330,5 +1331,188 @@ class ErgoWalletServiceSpec
       }
     }
   }
-}
 
+  property("refreshOffChainState retains an unstored child " +
+    "when its stored parent confirms") {
+    def runCase(caseName: String, staleReaderAtBlock: Boolean): Unit = {
+      withVersionedStore(2) { versionedStore =>
+        withStore { rawStore =>
+          val actorSystem = akka.actor.ActorSystem(
+            s"wallet-child-$caseName-" + java.util.UUID.randomUUID().toString
+          )
+          val timeoutDuration = scala.concurrent.duration.Duration(10, "seconds")
+          try {
+            val inputBox = TrackedBox(
+              creationTxId = modifierIdGen.sample.get,
+              creationOutIndex = 0,
+              inclusionHeightOpt = Some(1),
+              spendingTxIdOpt = None,
+              spendingHeightOpt = None,
+              box = testBox(1000000000L, pks.head.script, 1),
+              scans = Set(PaymentsScanId)
+            )
+            val parentTx = ErgoTransaction(
+              IndexedSeq(Input(inputBox.box.id, emptyProverResult)),
+              IndexedSeq(
+                new ErgoBoxCandidate(700000000L, pks.head.script, creationHeight = 1),
+                new ErgoBoxCandidate(300000000L, TrueTree, creationHeight = 1)
+              )
+            )
+            val childTx = ErgoTransaction(
+              IndexedSeq(Input(parentTx.outputs.head.id, emptyProverResult)),
+              IndexedSeq(
+                new ErgoBoxCandidate(400000000L, pks.head.script, creationHeight = 1),
+                new ErgoBoxCandidate(300000000L, TrueTree, creationHeight = 1)
+              )
+            )
+            val childKey = WalletStorage.unconfirmedTxKey(childTx.id)
+            val faultStore = new LDBKVStore(null) {
+              override def insert(id: K, value: V): scala.util.Try[Unit] =
+                if (java.util.Arrays.equals(id, childKey)) {
+                  scala.util.Failure(
+                    new java.io.IOException("injected pre-write child failure")
+                  )
+                } else rawStore.insert(id, value)
+              override def insert(
+                  keys: Array[K],
+                  values: Array[V]
+              ): scala.util.Try[Unit] =
+                rawStore.insert(keys, values)
+              override def update(toInsertKeys: Array[K], toInsertValues: Array[V],
+                  toRemove: Array[K]): scala.util.Try[Unit] =
+                rawStore.update(toInsertKeys, toInsertValues, toRemove)
+              override def remove(keys: Array[K]): scala.util.Try[Unit] =
+                rawStore.remove(keys)
+              override def get(key: K): Option[V] = rawStore.get(key)
+              override def getRange(start: K, end: K, limit: Int): Array[(K, V)] =
+                rawStore.getRange(start, end, limit)
+              override def close(): Unit = ()
+            }
+
+            val base = initialState(faultStore, versionedStore)
+            base.registry.updateOnBlock(
+              ScanResults(Seq(inputBox), ArraySeq.empty, ArraySeq.empty),
+              modifierIdGen.sample.get,
+              blockHeight = 1
+            ).get
+            val state0 = base.copy(
+              offChainRegistry = OffChainRegistry.init(base.registry)
+            )
+            val header = defaultHeaderGen.sample.get.copy(height = 2)
+            val extension = org.ergoplatform.modifiers.history.extension.Extension(
+              header.id, Seq.empty
+            )
+            val block = org.ergoplatform.modifiers.ErgoFullBlock(
+              header,
+              org.ergoplatform.modifiers.history.BlockTransactions(
+                header.id, header.version, Seq(parentTx)
+              ),
+              extension,
+              None
+            )
+            val parentOutput = TrackedBox(
+              creationTxId = parentTx.id,
+              creationOutIndex = 0,
+              inclusionHeightOpt = Some(2),
+              spendingTxIdOpt = None,
+              spendingHeightOpt = None,
+              box = parentTx.outputs.head,
+              scans = Set(PaymentsScanId)
+            )
+            val service = new ErgoWalletServiceImpl(settings) {
+              override def readWallet(
+                  state: ErgoWalletState,
+                  mnemonic: Option[SecretString],
+                  keys: Option[Int],
+                  secretSettings: org.ergoplatform.wallet.settings.SecretStorageSettings
+              ): ErgoWalletState = state
+
+              override def scanBlockUpdate(
+                  state: ErgoWalletState,
+                  b: org.ergoplatform.modifiers.ErgoFullBlock,
+                  dustLimit: Option[Long]
+              ): scala.util.Try[ErgoWalletState] =
+                state.registry.updateOnBlock(
+                  ScanResults(
+                    Seq(parentOutput),
+                    Seq(WalletScanLogic.SpentInputData(parentTx.id, inputBox)),
+                    ArraySeq.empty
+                  ),
+                  b.id,
+                  b.height
+                ).map(_ => state)
+            }
+            val ref = actorSystem.actorOf(akka.actor.Props(new ErgoWalletActor(
+              settings, parameters, service, null, null
+            ) {
+              override def preStart(): Unit =
+                self ! ErgoWalletActorMessages.ReadWallet(state0)
+            }))
+            val probe = akka.testkit.TestProbe()(actorSystem)
+            probe.send(ref, ErgoWalletActorMessages.GetWalletStatus)
+            val readyStatus =
+              probe.expectMsgType[ErgoWalletActorMessages.WalletStatus](timeoutDuration)
+            readyStatus.error shouldBe None
+
+            probe.send(ref, ErgoWalletActorMessages.ScanOffChain(parentTx))
+            probe.send(ref, ErgoWalletActorMessages.ScanOffChain(childTx))
+            probe.send(ref, ErgoWalletActorMessages.GetWalletStatus)
+            probe.expectMsgType[ErgoWalletActorMessages.WalletStatus](timeoutDuration)
+              .error.value should include("injected pre-write child failure")
+            state0.storage.unconfirmedTransactionHeights.keySet shouldBe Set(parentTx.id)
+
+            val oldReader = new FakeMempool(Seq(
+              UnconfirmedTransaction(parentTx, None),
+              UnconfirmedTransaction(childTx, None)
+            ))
+            val newReader = new FakeMempool(Seq(UnconfirmedTransaction(childTx, None)))
+            val readerAtBlock = if (staleReaderAtBlock) oldReader else newReader
+            probe.send(ref, ChangedMempool(readerAtBlock))
+            val childOutputId = Base16.encode(childTx.outputs.head.id)
+            probe.send(
+              ref,
+              ErgoWalletActorMessages.GetWalletBoxes(
+                unspentOnly = true, considerUnconfirmed = true
+              )
+            )
+            val beforeBlockIds = probe.expectMsgType[Seq[WalletBox]](timeoutDuration)
+              .map(wb => Base16.encode(wb.trackedBox.box.id)).toSet
+            beforeBlockIds shouldBe Set(childOutputId)
+
+            probe.send(ref, ErgoWalletActorMessages.ScanOnChain(block))
+            if (staleReaderAtBlock) {
+              probe.send(ref, ChangedMempool(newReader))
+            }
+            probe.send(
+              ref,
+              ErgoWalletActorMessages.GetWalletBoxes(
+                unspentOnly = true, considerUnconfirmed = true
+              )
+            )
+            val afterBlockIds = probe.expectMsgType[Seq[WalletBox]](timeoutDuration)
+              .map(wb => Base16.encode(wb.trackedBox.box.id)).toSet
+            state0.registry.getBox(parentTx.outputs.head.id).isDefined shouldBe true
+            state0.registry.walletUnspentBoxes().exists { wb =>
+              wb.box.id.sameElements(inputBox.box.id)
+            } shouldBe false
+            state0.storage.unconfirmedTransactionHeights shouldBe empty
+            withClue(s"$caseName: ") {
+              afterBlockIds shouldBe Set(childOutputId)
+            }
+
+            probe.watch(ref)
+            actorSystem.stop(ref)
+            probe.expectTerminated(ref, timeoutDuration)
+          } finally {
+            scala.concurrent.Await.result(
+              actorSystem.terminate(), scala.concurrent.duration.Duration(15, "seconds")
+            )
+          }
+        }
+      }
+    }
+
+    runCase("updated-reader-control", staleReaderAtBlock = false)
+    runCase("stale-reader", staleReaderAtBlock = true)
+  }
+}
