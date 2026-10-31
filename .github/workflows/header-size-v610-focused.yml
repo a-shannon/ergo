@@ -1,0 +1,54 @@
+name: Header size on pinned v6.0.10
+
+on:
+  push:
+    branches: [a-shannon/header-size-v610-validation-20261031]
+
+permissions:
+  contents: read
+
+env:
+  GIT_NO_LAZY_FETCH: "1"
+
+jobs:
+  header-size:
+    if: >-
+      github.repository == 'a-shannon/ergo' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/a-shannon/header-size-v610-validation-20261031'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        scala: ['2.12.20', '2.13.18']
+    env:
+      FACTS_DIR: ${{ runner.temp }}/header-size-v610-${{ matrix.scala }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Verify the exact source and diagnostic child
+        run: python3 -I .github/scripts/header-size-v610-focused.py --check-source
+      - uses: coursier/setup-action@648df969f41ef15fda2baba8b37f9fa3d16390a3 # v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Execute the fixed commands and check fresh reports
+        run: python3 -I .github/scripts/header-size-v610-focused.py --scala '${{ matrix.scala }}'
+      - name: Retain sanitized facts only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: header-size-v610-${{ matrix.scala }}-facts
+          path: ${{ env.FACTS_DIR }}/facts.json
+          if-no-files-found: error
+          retention-days: 30
