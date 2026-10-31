@@ -11,11 +11,11 @@ permissions:
 env:
   EXPECTED_REPOSITORY: a-shannon/ergo
   EXPECTED_BRANCH: a-shannon/pr2771-parent-child-public-diagnostic-20261031
-  BASE_SHA: e503b7bbc4e25d7d5eebe698b68079a9e05e7848
+  BASE_SHA: 7889820eaef4cdd50d514206c33c9fab16284fab
   TEST_BLOB: 340c8858e50bbd736f191dc38e45c704dcc6f167
   ACTOR_BLOB: df2ba586bf85f326b35f6874794f4ece48ad0ba6
   PROJECT_BLOB: 61c9b1cb115daf7244c8bdf5afb23d24ff85d987
-  WORKFLOW_CANONICAL_SHA256: b703c35c0346ae08fafcbdb5f9d424957846bae7210a35866df891817c88627d
+  WORKFLOW_CANONICAL_SHA256: 2587a863f67c7144ca736d0fdec6609fd4bbf1b053d19d61315c982410ecc5e5
 
 jobs:
   wallet_refresh:
@@ -72,7 +72,6 @@ jobs:
               text=True,
           ).splitlines())
           expected = {
-              "src/test/scala/org/ergoplatform/nodeView/wallet/ErgoWalletServiceSpec.scala",
               workflow_path,
           }
           if changed != expected:
@@ -196,9 +195,29 @@ jobs:
               finish("inconclusive", "unexpected_failure", False)
           failure = cases[0].find("failure")
           failure_type = failure.attrib.get("type", "") if failure is not None else ""
-          message = ((failure.attrib.get("message", "") if failure is not None else "")
-                     + (failure.text or "" if failure is not None else ""))
-          if not failure_type.endswith("TestFailedException") or "stale-reader:" not in message:
+          failure_message = failure.attrib.get("message", "") if failure is not None else ""
+          scalatest_failure = "org.scalatest.exceptions.TestFailedException"
+          direct = failure_type == scalatest_failure
+          fork_error = failure_type == "sbt.ForkMain$ForkError"
+          wrapped_original = fork_error and failure_message.startswith(
+              scalatest_failure + ": "
+          )
+          facts["failure_type_kind"] = (
+              "direct_scalatest" if direct else
+              "sbt_fork_error" if fork_error else "other"
+          )
+          facts["leading_original_is_scalatest"] = (
+              wrapped_original if fork_error else None
+          )
+          control_count = failure_message.count("updated-reader-control:")
+          stale_count = failure_message.count("stale-reader:")
+          facts["failure_clue"] = (
+              "stale_reader_unique" if stale_count == 1 and control_count == 0 else
+              "updated_reader_control_unique" if control_count == 1 and stale_count == 0 else
+              "neither" if stale_count == 0 and control_count == 0 else
+              "both" if stale_count and control_count else "non_unique"
+          )
+          if not (direct or wrapped_original) or facts["failure_clue"] != "stale_reader_unique":
               finish("inconclusive", "wrong_failure_marker", False)
           finish("reproduced_fixture_failure", "stale_reader_final_assertion", True)
           PY
