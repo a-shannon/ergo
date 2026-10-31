@@ -203,6 +203,7 @@ def classify_build_lines(lines: Iterable[str], checkout_root: Path,
     root = checkout_root.resolve()
     locations: list[dict[str, object]] = []
     seen: set[tuple[str, int, int | None]] = set()
+    line_counts: dict[str, int] = {}
     signals: set[str] = set()
     last_phase = "unknown"
     error_lines = 0
@@ -270,7 +271,18 @@ def classify_build_lines(lines: Iterable[str], checkout_root: Path,
             if not allowed or relative not in tracked_paths or not is_file:
                 continue
             line_number = int(match.group("line"))
-            column = int(match.group("column")) if match.group("column") else None
+            if relative not in line_counts:
+                try:
+                    if resolved.stat().st_size > 2 * 1024 * 1024:
+                        continue
+                    with resolved.open("r", encoding="utf-8", errors="replace") as source:
+                        line_counts[relative] = sum(1 for _ in source)
+                except OSError:
+                    continue
+            if line_number > line_counts[relative]:
+                continue
+            # The compiler may count tabs or Unicode columns differently.
+            column = None
             key = relative, line_number, column
             if key not in seen:
                 locations.append({"file": relative, "line": line_number,
@@ -318,6 +330,28 @@ def build_failure_details(log: Path, exit_code: int, arm: str,
         "log_sha256": digest(log),
         **classified,
     }
+
+
+def safe_build_failure_details(log: Path, exit_code: int, arm: str,
+                               checkout_root: Path,
+                               tracked_paths: set[str]) -> dict[str, object]:
+    """Keep the known build failure even if its optional log read fails."""
+    try:
+        return build_failure_details(log, exit_code, arm, checkout_root, tracked_paths)
+    except Exception:
+        return {
+            "arm": arm,
+            "exit": exit_code,
+            "log_bytes": None,
+            "log_sha256": None,
+            "log_state": "unavailable",
+            "category": "unknown",
+            "observed_markers": [],
+            "last_phase": "diagnostic_unavailable",
+            "error_line_count_capped": 0,
+            "sbt_welcome_version": "unobserved",
+            "compile_locations": [],
+        }
 
 
 def image_jar_digest(image_id: str, scratch: Path) -> str:
@@ -477,9 +511,9 @@ def run_arm(name: str, worktree: Path, minutes: int) -> dict[str, object]:
         worktree, build_log, deadline, env,
     )
     if build_timeout or build_rc:
+        reason = "build_timeout" if build_timeout else "build_failed"
         raise Inconclusive(
-            "build_timeout" if build_timeout else "build_failed",
-            {"build_diagnostic": build_failure_details(
+            reason, {"build_diagnostic": safe_build_failure_details(
                 build_log, build_rc, name, worktree, tracked_paths)},
         )
     pin = (worktree / "project/build.properties").read_text(encoding="utf-8")
