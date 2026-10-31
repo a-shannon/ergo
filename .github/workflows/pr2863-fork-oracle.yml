@@ -1,0 +1,57 @@
+name: PR 2863 fork oracle
+run-name: PR 2863 fork oracle ${{ github.sha }}
+
+on:
+  push:
+    branches:
+      - a-shannon/pr2863-fork-oracle-prep-20261031
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr2863-fork-oracle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    if: ${{ github.repository == 'a-shannon/ergo' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 85
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v7
+        with:
+          path: ergo
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Compare pinned product variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ergo
+          python3 .github/scripts/pr2863-fork-oracle.py \
+            --repo . \
+            --out "$RUNNER_TEMP/pr2863-fork-oracle" \
+            --pr-head 0310e87c12bae1a849a84d799c037c4f4711422e \
+            --base 4837b01419d08b279c9a4fd920b4260dc7873b15 \
+            --test-blob e3dc63ab57e0e7c234366213b083a31b293f0d3d \
+            --arm-minutes 35
+
+      - name: Upload bounded facts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr2863-fork-oracle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pr2863-fork-oracle/facts.json
+            ${{ runner.temp }}/pr2863-fork-oracle/summary.txt
+          if-no-files-found: warn
+          retention-days: 30

@@ -53,18 +53,27 @@ class ForkResolutionSpec extends AnyFlatSpec with Matchers with IntegrationSuite
 
   def localVolume(n: Int): String = s"$localDataDir/fork-resolution-spec/node-$n/data"
 
-  def clearPeerDatabases(): Unit = {
-    volumesMapping.foreach { case (localVolume, remoteVolume) =>
+  def selectedHeadersScore(node: Node): Future[BigInt] = node.status.map { response =>
+    withClue(s"${node.nodeName} /info headersScore: ") {
+      val info = io.circe.parser.parse(response.status).toOption.value
+      info.hcursor.downField("headersScore").focus.value.asNumber.flatMap(_.toBigInt).value
+    }
+  }
+
+  def clearPeerDatabases(mapping: Seq[(String, String)] = volumesMapping): Unit = {
+    mapping.foreach { case (localVolume, remoteVolume) =>
       docker.removeFromMountedVolume(localVolume, remoteVolume, "peers")
     }
   }
 
   def startNodesWithBinds(nodeConfigs: List[Config],
-                          configEnrich: ExtraConfig = noExtraConfig): List[Node] = {
+                          configEnrich: ExtraConfig = noExtraConfig,
+                          mapping: Seq[(String, String)] = volumesMapping): List[Node] = {
+    require(nodeConfigs.size == mapping.size, "each node needs its own data volume")
     log.trace(s"Starting ${nodeConfigs.size} containers")
     val nodes: Try[List[Node]] = nodeConfigs
       .map(_.withFallback(specialDataDirConfig(remoteVolume)))
-      .zip(volumesMapping)
+      .zip(mapping)
       .map { case (cfg, vol) => docker.startDevNetNode(cfg, configEnrich, Some(vol)) }
       .sequence
     implicit val patienceConfig: PatienceConfig = PatienceConfig((nodeConfigs.size * 2).seconds, 3.second)
@@ -141,6 +150,127 @@ class ForkResolutionSpec extends AnyFlatSpec with Matchers with IntegrationSuite
       log.debug(s"Headers at height $forkHeight: ${headers.mkString(",")}")
       val headerIdsAtSameHeight = headers.map(_.headOption.value)
       headerIdsAtSameHeight should contain only sample
+    }
+
+    Await.result(result, 15.minutes)
+  }
+
+  it should "switch a V2 fork with no selected-chain header in its locator" in {
+    // The earlier case leaves its final nodes running until the suite closes.
+    docker.nodes.foreach(node => docker.stopNode(node.containerId))
+    val oracleVolumes = (1 to 2).map(n => s"$localDataDir/v2-no-common-locator/node-$n/data")
+    oracleVolumes.foreach(v => new File(v).mkdirs())
+    val oracleMapping = oracleVolumes.map(_ -> remoteVolume)
+    val nonGeneratingConfigs = nodeConfigs.take(2).map(nonGeneratingPeerConfig.withFallback)
+    val online = startNodesWithBinds(
+      List(commonChainMinerConfig, nonGeneratingConfigs(1)), mapping = oracleMapping)
+
+    val result = Async.async {
+      val initialHeight = Async.await(Future.traverse(online)(_.fullHeight).map(_.max))
+      val commonTarget = initialHeight + 16
+      Async.await(online.head.waitForHeight(commonTarget, 100.millis))
+      // Keep the producer available for sections while its follower catches up,
+      // without letting the common tip advance between the check and isolation.
+      val quiescedLeader = Async.await {
+        docker.stopNode(online.head.containerId)
+        Future.successful(startNodesWithBinds(
+          List(nonGeneratingConfigs.head), mapping = oracleMapping.take(1)).head)
+      }
+      Async.await(quiescedLeader.waitForPeers(1))
+      Async.await(online(1).waitForPeers(1))
+      val commonLeaderInfo = Async.await(quiescedLeader.info)
+      commonLeaderInfo.bestBlockIdOpt should not be empty
+      Async.await(online(1).waitForProgress[NodeInfo, String](
+        "follower caught up to the quiesced common producer",
+        _.info,
+        info => info.bestHeaderIdOpt == commonLeaderInfo.bestHeaderIdOpt &&
+          info.bestBlockIdOpt == commonLeaderInfo.bestBlockIdOpt &&
+          info.bestHeaderHeightOpt.getOrElse(0) - info.bestBlockHeightOpt.getOrElse(0) < 3,
+        100.millis
+      )(_.bestBlockIdOpt, info =>
+        s"headers=${info.bestHeaderHeightOpt.getOrElse(0)} " +
+          s"full=${info.bestBlockHeightOpt.getOrElse(0)}"))
+
+      val isolated = Async.await {
+        docker.stopNode(quiescedLeader.containerId)
+        docker.stopNode(online(1).containerId)
+        clearPeerDatabases(oracleMapping)
+        Future.successful(startNodesWithBinds(
+          List(minerConfig, nodeConfigs(1)), noConnectionsConfig, oracleMapping))
+      }
+      val followerStart = Async.await(isolated(1).info).bestHeaderHeightOpt.value
+      Async.await(isolated(1).waitForHeight(followerStart + 24, 100.millis))
+      val followerOfflineTip = Async.await(isolated(1).info).bestHeaderHeightOpt.value
+      docker.stopNode(isolated(1).containerId)
+      Async.await(isolated.head.waitForHeight(followerOfflineTip + 5, 100.millis))
+
+      val frozen = Async.await {
+        docker.stopNode(isolated.head.containerId)
+        clearPeerDatabases(oracleMapping)
+        Future.successful(startNodesWithBinds(
+          nonGeneratingConfigs, noConnectionsConfig, oracleMapping))
+      }
+      Async.await(Future.traverse(frozen)(_.connectedPeers)).flatten shouldBe empty
+      val leaderInfo = Async.await(frozen.head.info)
+      val followerInfo = Async.await(frozen(1).info)
+      val leaderTip = leaderInfo.bestHeaderHeightOpt.value
+      val followerTip = followerInfo.bestHeaderHeightOpt.value
+      withClue("responding node must classify the forked peer as Younger: ") {
+        leaderTip should be > followerTip
+      }
+      val leaderScore = Async.await(selectedHeadersScore(frozen.head))
+      val followerScore = Async.await(selectedHeadersScore(frozen(1)))
+      withClue("responding selected header chain must be heavier: ") {
+        leaderScore should be > followerScore
+      }
+      val locatorHeights = Seq(0, 16, 128, 512)
+        .map(followerTip - _).filter(_ >= 1)
+      locatorHeights.size should be >= 2
+      locatorHeights.last should be <= 400
+      val followerRows = Async.await(Future.traverse(locatorHeights)(frozen(1).headerIdsByHeight))
+      val leaderRows = Async.await(Future.traverse(locatorHeights)(frozen.head.headerIdsByHeight))
+      locatorHeights.zip(followerRows).foreach { case (height, ids) =>
+        withClue(s"forked peer header at $height: ") { ids should not be empty }
+      }
+      locatorHeights.zip(leaderRows).foreach { case (height, ids) =>
+        withClue(s"responding peer header at $height: ") { ids should not be empty }
+      }
+      val followerLocator = followerRows.map(_.head)
+      val leaderSelected = leaderRows.map(_.head)
+      locatorHeights.indices.foreach { i =>
+        withClue(s"V2 locator at height ${locatorHeights(i)}: ") {
+          followerLocator(i) should not be (leaderSelected(i))
+        }
+      }
+      Async.await(frozen.head.headerIdsByHeight(1)).headOption.value shouldBe
+        Async.await(frozen(1).headerIdsByHeight(1)).headOption.value
+      val selectedHeight = locatorHeights.last
+      val selectedId = leaderSelected.last
+      val leaderBestId = leaderInfo.bestHeaderIdOpt.value
+
+      val reconnected = Async.await {
+        frozen.foreach(node => docker.stopNode(node.containerId))
+        clearPeerDatabases(oracleMapping)
+        Future.successful(startNodesWithBinds(
+          nonGeneratingConfigs, noExtraConfig, oracleMapping))
+      }
+      val leaderPeers = Async.await(reconnected.head.waitForPeers(1)).map(_.name)
+      val followerPeers = Async.await(reconnected(1).waitForPeers(1)).map(_.name)
+      leaderPeers should contain only (reconnected(1).nodeName)
+      followerPeers should contain only (reconnected.head.nodeName)
+      // The frozen locator and two non-generating peers bound the possible sync paths.
+      // An old-product run on this same fixture must still fail before attributing
+      // convergence to the new from-genesis V2 response.
+      Async.await(reconnected(1).waitForProgress[NodeInfo, String](
+        "forked peer's selected tip after V2 continuation",
+        _.info,
+        _.bestHeaderIdOpt.contains(leaderBestId),
+        100.millis
+      )(_.bestHeaderIdOpt, info => s"selected ${info.bestHeaderIdOpt.getOrElse("none")}"))
+      val followerSelectedAfter = Async.await(reconnected(1).headerIdsByHeight(selectedHeight))
+      val leaderSelectedAfter = Async.await(reconnected.head.headerIdsByHeight(selectedHeight))
+      followerSelectedAfter.headOption.value shouldBe selectedId
+      leaderSelectedAfter.headOption.value shouldBe selectedId
     }
 
     Await.result(result, 15.minutes)
