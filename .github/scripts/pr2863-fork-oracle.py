@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
 import hashlib
 import json
 import os
@@ -36,8 +37,9 @@ IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 class Inconclusive(Exception):
-    def __init__(self, code: str):
+    def __init__(self, code: str, details: dict[str, object] | None = None):
         self.code = code
+        self.details = details or {}
         super().__init__(code)
 
 
@@ -195,6 +197,129 @@ def sbt_version(log: Path, expected: str) -> str:
     raise Inconclusive("sbt_version_unobserved")
 
 
+def classify_build_lines(lines: Iterable[str], checkout_root: Path,
+                         tracked_paths: set[str]) -> dict[str, object]:
+    """Classify build text into closed hints and public tracked positions only."""
+    root = checkout_root.resolve()
+    locations: list[dict[str, object]] = []
+    seen: set[tuple[str, int, int | None]] = set()
+    signals: set[str] = set()
+    last_phase = "unknown"
+    error_lines = 0
+    welcome_version = "unobserved"
+    welcome = re.compile(r"welcome to sbt ([0-9]+\.[0-9]+\.[0-9]+)(?![A-Za-z0-9.+-])", re.I)
+    scala_location = re.compile(r"\.scala:\d+")
+    location = re.compile(
+        r"^\[error\]\s+(?P<path>(?:/|[A-Za-z]:[\\/]|[A-Za-z0-9_.-])[^:\s]*?\.(?:scala|sbt)):"
+        r"(?P<line>[1-9]\d{0,6})(?::(?P<column>[1-9]\d{0,4}))?:(?!\d)",
+        re.I,
+    )
+    for raw in lines:
+        line = raw[:8192]
+        lower = line.lower()
+        if "[error]" in lower:
+            error_lines = min(error_lines + 1, 10000)
+        version = welcome.search(lower)
+        if version:
+            welcome_version = "1.11.1" if version.group(1) == "1.11.1" else "mismatch"
+            if last_phase == "unknown":
+                last_phase = "sbt_bootstrap"
+        if "resolving" in lower or "downloading" in lower:
+            if last_phase in ("unknown", "sbt_bootstrap"):
+                last_phase = "dependency_resolution"
+        if "compiling " in lower and " sources" in lower:
+            last_phase = "source_compile"
+        if "assembly" in lower and "[info]" in lower:
+            last_phase = "assembly"
+        if "docker build" in lower or "building image" in lower:
+            last_phase = "docker_build"
+        if any(word in lower for word in (
+            "resolveexception", "error downloading", "could not resolve",
+            "resolution failed",
+        )):
+            signals.add("dependency_resolution")
+        if "compilation failed" in lower or (
+            "[error]" in lower and scala_location.search(lower)
+        ):
+            signals.add("scala_compile")
+        if any(word in lower for word in (
+            "cannot connect to the docker daemon", "docker daemon is not running",
+            "error response from daemon",
+        )):
+            signals.add("docker_daemon")
+        if "failed to build" in lower or "error building image" in lower:
+            signals.add("docker_build")
+        if any(word in lower for word in (
+            "not a valid command", "not a valid key", "not a valid project id",
+        )):
+            signals.add("sbt_command")
+        if "[error]" not in lower or len(locations) >= 8:
+            continue
+        for match in location.finditer(line):
+            try:
+                path = Path(match.group("path"))
+                resolved = (path if path.is_absolute() else root / path).resolve()
+                relative = resolved.relative_to(root).as_posix()
+                is_file = resolved.is_file()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            allowed = relative.endswith(".scala") or relative == "build.sbt" or (
+                relative.startswith("project/") and
+                relative.endswith((".scala", ".sbt", ".properties"))
+            )
+            if not allowed or relative not in tracked_paths or not is_file:
+                continue
+            line_number = int(match.group("line"))
+            column = int(match.group("column")) if match.group("column") else None
+            key = relative, line_number, column
+            if key not in seen:
+                locations.append({"file": relative, "line": line_number,
+                                  "column": column, "category": "scala_compile"})
+                seen.add(key)
+            if len(locations) >= 8:
+                break
+    category = next(iter(signals)) if len(signals) == 1 else (
+        "ambiguous" if signals else "unknown"
+    )
+    return {
+        "category": category,
+        "observed_markers": sorted(signals),
+        "last_phase": last_phase,
+        "error_line_count_capped": error_lines,
+        "sbt_welcome_version": welcome_version,
+        "compile_locations": locations,
+    }
+
+
+def build_failure_details(log: Path, exit_code: int, arm: str,
+                          checkout_root: Path,
+                          tracked_paths: set[str]) -> dict[str, object]:
+    """Return closed routing hints; never copy a build-log line to an artifact."""
+    if not log.is_file():
+        return {
+            "arm": arm,
+            "exit": exit_code,
+            "log_bytes": 0,
+            "log_sha256": None,
+            "log_state": "missing",
+            "category": "unknown",
+            "observed_markers": [],
+            "last_phase": "not_started",
+            "error_line_count_capped": 0,
+            "sbt_welcome_version": "unobserved",
+            "compile_locations": [],
+        }
+    with log.open("r", encoding="utf-8", errors="replace") as src:
+        classified = classify_build_lines(src, checkout_root, tracked_paths)
+    return {
+        "arm": arm,
+        "exit": exit_code,
+        "log_bytes": log.stat().st_size,
+        "log_sha256": digest(log),
+        **classified,
+    }
+
+
 def image_jar_digest(image_id: str, scratch: Path) -> str:
     container = command(["docker", "create", image_id, "true"], timeout=30)
     if not re.fullmatch(r"[0-9a-f]{64}", container):
@@ -341,6 +466,7 @@ def run_arm(name: str, worktree: Path, minutes: int) -> dict[str, object]:
     pre_arm_ids = set(docker_ids())
     if pre_arm_ids:
         raise Inconclusive("preexisting_node_container")
+    tracked_paths = set(git(worktree, "ls-files", "-z").split("\0")) - {""}
     temp = worktree / "tmp"
     temp.mkdir()
     env = dict(os.environ, TMPDIR=str(temp))
@@ -351,7 +477,11 @@ def run_arm(name: str, worktree: Path, minutes: int) -> dict[str, object]:
         worktree, build_log, deadline, env,
     )
     if build_timeout or build_rc:
-        raise Inconclusive("build_timeout" if build_timeout else "build_failed")
+        raise Inconclusive(
+            "build_timeout" if build_timeout else "build_failed",
+            {"build_diagnostic": build_failure_details(
+                build_log, build_rc, name, worktree, tracked_paths)},
+        )
     pin = (worktree / "project/build.properties").read_text(encoding="utf-8")
     expected_sbt = pin.strip().split("=", 1)[-1]
     actual_sbt = sbt_version(build_log, expected_sbt)
@@ -452,6 +582,14 @@ def write_result(out: Path, facts: dict[str, object]) -> None:
         f"fixed: {facts.get('fixed_status', 'unverified')}",
         f"old: {facts.get('old_status', 'unverified')}",
     ]
+    build = facts.get("build_diagnostic")
+    if isinstance(build, dict):
+        lines.extend((
+            f"build_arm: {build['arm']}",
+            f"build_category: {build['category']}",
+            f"build_last_phase: {build['last_phase']}",
+            f"build_exit: {build['exit']}",
+        ))
     summary = "\n".join(lines) + "\n"
     with (out / "summary.txt").open("x", encoding="utf-8", newline="\n") as target:
         target.write(summary[:4096])
@@ -512,6 +650,7 @@ def main() -> int:
         facts["status"], facts["reason"] = "decisive", "fixed_green_old_adoption_red"
     except Inconclusive as exc:
         facts["status"], facts["reason"] = "inconclusive", exc.code
+        facts.update(exc.details)
     except Exception:
         facts["status"], facts["reason"] = "inconclusive", "internal_error"
     write_result(out, facts)
