@@ -22,12 +22,14 @@ jobs:
       fail-fast: false
       matrix:
         scala: ['2.12.20', '2.13.18']
-    env:
-      FACTS_DIR: ${{ runner.temp }}/header-size-v610-${{ matrix.scala }}
     steps:
+      - name: Initialize evidence directory
+        env:
+          SCALA_VERSION: ${{ matrix.scala }}
+        run: printf 'FACTS_DIR=%s/header-size-v610-%s\n' "$RUNNER_TEMP" "$SCALA_VERSION" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 3
+          fetch-depth: 4
           persist-credentials: false
       - name: Verify the exact source and diagnostic child
         run: python3 -I .github/scripts/header-size-v610-focused.py --check-source

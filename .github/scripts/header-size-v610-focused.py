@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 BASE = "c4692c22835f2ae39da5c6cb124eaee63f57bf7e"
 SOURCE = "4562758fcf85a085cf777a7537c540f6e283e288"
 SOURCE_TREE = "794e4f0d4b01d30df5f31312a05f55df8c5d88cd"
+DIAGNOSTIC_PARENT = "4420e06cce55354a10c6ab3b6f6717f74c046222"
 PRODUCT = "ergo-core/src/main/scala/org/ergoplatform/modifiers/history/header/HeaderSerializer.scala"
 TEST = "ergo-core/src/test/scala/org/ergoplatform/serialization/HeaderSizeSerializationSpec.scala"
 PRODUCT_FIXED = "a36301c54af5bad75a939a0b669f0a4e27ab6660"
@@ -53,7 +54,8 @@ def verify_source():
     require(os.environ.get("GITHUB_REF") == "refs/heads/a-shannon/header-size-v610-validation-20261031", "ref mismatch")
     head = git("rev-parse", "HEAD").decode().strip()
     require(head == os.environ.get("GITHUB_SHA"), "checkout mismatch")
-    require(git("show", "-s", "--format=%P", head).decode().split() == [SOURCE], "diagnostic parent mismatch")
+    require(git("show", "-s", "--format=%P", head).decode().split() == [DIAGNOSTIC_PARENT], "diagnostic parent mismatch")
+    require(git("show", "-s", "--format=%P", DIAGNOSTIC_PARENT).decode().split() == [SOURCE], "original diagnostic parent mismatch")
     require(git("show", "-s", "--format=%P", SOURCE).decode().split() == [BASE], "source parent mismatch")
     require(git("rev-parse", SOURCE + "^{tree}").decode().strip() == SOURCE_TREE, "source tree mismatch")
     require(set(git("diff", "--name-status", SOURCE, head).decode().splitlines()) ==
@@ -68,7 +70,8 @@ def verify_source():
             "parsed.sizeOpt shouldBe Some(encoded.length)", "assertion ordinal mismatch")
     git("diff", "--exit-code")
     git("diff", "--cached", "--exit-code")
-    return {"diagnostic_commit": head, "source_commit": SOURCE, "source_tree": SOURCE_TREE,
+    return {"diagnostic_commit": head, "diagnostic_parent": DIAGNOSTIC_PARENT,
+            "source_commit": SOURCE, "source_tree": SOURCE_TREE,
             "source_parent": BASE, "product_blob": PRODUCT_FIXED, "test_blob": TEST_BLOB}
 
 
