@@ -96,6 +96,51 @@ class ErgoMemPoolSpec extends AnyFlatSpec
     poolCost.pool.orderedTransactions.firstKey.weight shouldBe OrderedTxPool.weighted(tx, cost).weight
   }
 
+  it should "refresh a transaction's fee-per-cost weight after input cost changes" in {
+    implicit val monetarySettings = settings.chainSettings.monetary
+    val (us, bh) = createUtxoState(settings)
+    val genesis = validFullBlock(None, us, bh)
+    val state = WrappedUtxoState(us, bh, settings).applyModifier(genesis)(_ => ()).get
+    val inputBox = state.takeBoxes(100).find(_.ergoTree == TrueTree).get
+    val tx = ErgoTransaction(
+      IndexedSeq(new Input(inputBox.id, emptyProverResult)),
+      IndexedSeq(new ErgoBoxCandidate(inputBox.value, feeProp, creationHeight = 0))
+    )
+
+    val context = state.stateContext.simplifiedUpcoming()
+    context.currentParameters.inputCost shouldBe Parameters.InputCostDefault
+    val increasedParameters = Parameters(
+      context.currentParameters.height,
+      context.currentParameters.parametersTable.updated(
+        Parameters.InputCostIncrease, Parameters.InputCostDefault + 20),
+      context.currentParameters.proposedUpdate
+    )
+    val increasedContext = context.copy(currentParameters = increasedParameters)(settings.chainSettings)
+    val originalCost = state.validateWithCost(tx, context, Int.MaxValue, None).get
+    val increasedCost = state.validateWithCost(tx, increasedContext, Int.MaxValue, None).get
+    increasedCost shouldBe originalCost + 20
+
+    val costSettings = settings.copy(
+      nodeSettings = settings.nodeSettings.copy(mempoolSorting = SortingOption.FeePerCycle)
+    )
+    val (pool, outcome) = ErgoMemPool.empty(costSettings)
+      .process(UnconfirmedTransaction(tx, None), state)
+    outcome.isInstanceOf[ProcessingOutcome.Accepted] shouldBe true
+    val pooledTx = pool.unconfirmedById(tx.id).get
+    pooledTx.lastCost shouldBe Some(originalCost)
+    val originalWeight = pool.pool.transactionsRegistry(tx.id).weight
+    originalWeight shouldBe OrderedTxPool.weighted(tx, originalCost).weight
+    val freshWeight = OrderedTxPool.weighted(tx, increasedCost).weight
+    originalWeight should not be freshWeight
+
+    val rechecked = pool.put(pooledTx.withCost(increasedCost))
+    rechecked.size shouldBe 1
+    rechecked.unconfirmedById(tx.id).get.lastCost shouldBe Some(increasedCost)
+    withClue("same-ID FeePerCycle recheck must refresh priority weight: ") {
+      rechecked.pool.transactionsRegistry(tx.id).weight shouldBe freshWeight
+    }
+  }
+
   it should "decline already contained transaction" in {
     val (us, bh) = createUtxoState(settings)
     val genesis = validFullBlock(None, us, bh)
