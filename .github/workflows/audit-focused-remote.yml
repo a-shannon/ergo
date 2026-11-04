@@ -1,0 +1,208 @@
+name: Focused wallet parent recovery diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact full source commit on this fork
+        required: true
+        type: string
+      suite:
+        description: Diagnostic suite
+        required: true
+        type: choice
+        options:
+          - wallet-parent-recovery
+
+permissions:
+  contents: read
+
+jobs:
+  wallet-parent-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate source identity
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SUITE: ${{ inputs.suite }}
+        run: |
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$SUITE" = wallet-parent-recovery
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Confirm tested commit and fixture
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          test "$GITHUB_SHA" = "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -f src/test/scala/org/ergoplatform/nodeView/wallet/OffchainParentRecoverySpec.scala
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/wallet/OffchainParentRecoverySpec.scala)" = \
+            "3ccd61e11f519f28ad270dba8220903bd021e112"
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Setup Scala and Java
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Compile node tests
+        id: compile
+        shell: bash
+        run: |
+          set +e
+          sbt -batch -Denv=test ++2.12.20 "Test/compile" > "$RUNNER_TEMP/wallet-parent-compile.log" 2>&1
+          result=$?
+          set -e
+          printf 'exit_code=%s\n' "$result" >> "$GITHUB_OUTPUT"
+      - name: Run one wallet actor property
+        id: target
+        if: steps.compile.outputs.exit_code == '0'
+        shell: bash
+        run: |
+          set +e
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.wallet.OffchainParentRecoverySpec" \
+            > "$RUNNER_TEMP/wallet-parent-test.log" 2>&1
+          result=$?
+          set -e
+          printf 'exit_code=%s\n' "$result" >> "$GITHUB_OUTPUT"
+      - name: Classify named JUnit result without publishing raw logs
+        if: always()
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          COMPILE_EXIT: ${{ steps.compile.outputs.exit_code }}
+          TEST_EXIT: ${{ steps.target.outputs.exit_code }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          name = "a retained unconfirmed parent output returns to wallet and Payments scan after child removal"
+          report = Path("target/test-reports/TEST-org.ergoplatform.nodeView.wallet.OffchainParentRecoverySpec.xml")
+          category = "INCONCLUSIVE"
+          safe_shape = {
+              "envelope": "none",
+              "tupleInMessage": "false",
+              "tupleInTrace": "false",
+              "lastFailureMarker": "false",
+              "finalCallFrame": "false",
+              "finalMatcherFrame": "false",
+              "earlierPhaseFrame": "false",
+              "askTimeoutMarker": "false",
+          }
+          compile_exit = os.environ.get("COMPILE_EXIT", "")
+          test_exit = os.environ.get("TEST_EXIT", "")
+          if compile_exit and compile_exit != "0":
+              category = "COMPILE_OR_BUILD_FAILURE"
+          elif compile_exit != "0":
+              category = "PRECHECK_FAILURE"
+          elif not test_exit:
+              category = "TEST_NOT_RUN"
+          elif not report.is_file():
+              category = "NO_NAMED_REPORT"
+          elif report.stat().st_size > 262144:
+              category = "REPORT_TOO_LARGE"
+          else:
+              try:
+                  root = ET.parse(report).getroot()
+                  cases = root.findall(".//testcase")
+                  if len(cases) != 1 or cases[0].attrib.get("name") != name:
+                      category = "WRONG_TESTCASE_SET"
+                  else:
+                      case = cases[0]
+                      failures = case.findall("failure")
+                      if case.find("error") is not None or case.find("skipped") is not None:
+                          category = "ERROR_OR_SKIPPED"
+                      elif test_exit == "0" and not failures:
+                          category = "UNEXPECTED_GREEN"
+                      elif test_exit == "0" or len(failures) != 1:
+                          category = "EXIT_REPORT_MISMATCH"
+                      else:
+                          failure = failures[0]
+                          message = failure.attrib.get("message", "")
+                          trace = failure.text or ""
+                          observed = message + "\n" + trace
+                          timeout_class = "org.scalatest.exceptions.TestFailedDueToTimeoutException"
+                          failure_type = failure.attrib.get("type", "")
+                          direct_timeout = failure_type in (timeout_class, "class " + timeout_class)
+                          forked_timeout = (
+                              failure_type == "sbt.ForkMain$ForkError"
+                              and message.startswith(timeout_class + ":")
+                              and trace.startswith("sbt.ForkMain$ForkError: " + timeout_class + ":")
+                          )
+                          tuple_pattern = r"\(\s*false\s*,\s*false\s*\)\s+was not equal to\s+\(\s*true\s*,\s*true\s*\)"
+                          mismatch_message = bool(re.search(tuple_pattern, message))
+                          mismatch_trace = bool(re.search(tuple_pattern, trace))
+                          mismatch = mismatch_message or mismatch_trace
+                          final_call = re.search(r"OffchainParentRecoverySpec\.scala:60\b", trace)
+                          final_matcher = re.search(r"OffchainParentRecoverySpec\.scala:61\b", trace)
+                          earlier = re.search(r"OffchainParentRecoverySpec\.scala:(49|50|55|56)\b", trace)
+                          ask_timeout = re.search(r"AskTimeoutException|Future timed out|java\.util\.concurrent\.TimeoutException", observed)
+                          safe_shape = {
+                              "envelope": "direct" if direct_timeout else "forked" if forked_timeout else "other",
+                              "tupleInMessage": str(mismatch_message).lower(),
+                              "tupleInTrace": str(mismatch_trace).lower(),
+                              "lastFailureMarker": str("Last failure message:" in observed).lower(),
+                              "finalCallFrame": str(bool(final_call)).lower(),
+                              "finalMatcherFrame": str(bool(final_matcher)).lower(),
+                              "earlierPhaseFrame": str(bool(earlier)).lower(),
+                              "askTimeoutMarker": str(bool(ask_timeout)).lower(),
+                          }
+                          if not (direct_timeout or forked_timeout):
+                              category = "OTHER_FAILURE_TYPE"
+                          elif earlier:
+                              category = "EARLIER_PHASE_FAILURE"
+                          elif ask_timeout:
+                              category = "ASK_OR_OTHER_TIMEOUT"
+                          elif "Last failure message:" not in observed:
+                              category = "MISSING_LAST_FAILURE_MARKER"
+                          elif not mismatch:
+                              category = "OTHER_ASSERTION_FAILURE"
+                          elif final_call and final_matcher:
+                              counts = {"tests": "1", "failures": "1", "errors": "0", "skipped": "0"}
+                              if root.tag != "testsuite" or any(root.attrib.get(k) != v for k, v in counts.items()):
+                                  category = "REPORT_COUNT_MISMATCH"
+                              else:
+                                  category = "EXPECTED_BASELINE_RED"
+                          else:
+                              category = "MISSING_FINAL_PHASE_FRAMES"
+              except (ET.ParseError, OSError, ValueError):
+                  category = "UNREADABLE_REPORT"
+
+          commit = os.environ.get("SOURCE_COMMIT", "")
+          if not re.fullmatch(r"[0-9a-f]{40}", commit):
+              commit = ""
+          sanitized = ET.Element("wallet-parent-recovery-diagnostic", {
+              "sourceCommit": commit,
+              "testcase": name,
+              "classification": category,
+              **safe_shape,
+          })
+          output = Path(os.environ["RUNNER_TEMP"]) / "wallet-parent-recovery-diagnostic.xml"
+          ET.ElementTree(sanitized).write(output, encoding="utf-8", xml_declaration=True)
+          print(f"Wallet parent recovery diagnostic: {category}")
+          raise SystemExit(0 if category == "EXPECTED_BASELINE_RED" else 1)
+          PY
+      - name: Retain sanitized diagnostic only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wallet-parent-recovery-diagnostic
+          path: ${{ runner.temp }}/wallet-parent-recovery-diagnostic.xml
+          if-no-files-found: warn
+          retention-days: 7
