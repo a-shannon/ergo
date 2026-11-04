@@ -58,10 +58,29 @@ jobs:
         with:
           jvm: temurin:8
           apps: sbt
-      - name: Compile node tests
-        id: compile
+      - name: Compile exact base source without the new fixture
+        id: baseline_compile
         shell: bash
         run: |
+          set -e
+          fixture=src/test/scala/org/ergoplatform/nodeView/wallet/OffchainParentRecoverySpec.scala
+          hidden="$RUNNER_TEMP/OffchainParentRecoverySpec.scala.hidden"
+          test -f "$fixture"
+          test ! -e "$hidden"
+          mv "$fixture" "$hidden"
+          trap 'mv "$hidden" "$fixture"' EXIT
+          set +e
+          sbt -batch -Denv=test ++2.12.20 "Test/compile" > "$RUNNER_TEMP/wallet-parent-baseline-compile.log" 2>&1
+          result=$?
+          set -e
+          printf 'exit_code=%s\n' "$result" >> "$GITHUB_OUTPUT"
+      - name: Compile node tests
+        id: compile
+        if: steps.baseline_compile.outputs.exit_code == '0'
+        shell: bash
+        run: |
+          test "$(git hash-object src/test/scala/org/ergoplatform/nodeView/wallet/OffchainParentRecoverySpec.scala)" = \
+            "3ccd61e11f519f28ad270dba8220903bd021e112"
           set +e
           sbt -batch -Denv=test ++2.12.20 "Test/compile" > "$RUNNER_TEMP/wallet-parent-compile.log" 2>&1
           result=$?
@@ -83,6 +102,7 @@ jobs:
         if: always()
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
+          BASELINE_EXIT: ${{ steps.baseline_compile.outputs.exit_code }}
           COMPILE_EXIT: ${{ steps.compile.outputs.exit_code }}
           TEST_EXIT: ${{ steps.target.outputs.exit_code }}
         run: |
@@ -108,6 +128,8 @@ jobs:
           }
           compile_shape = {
               "compileCause": "other",
+              "baselineExitCode": "",
+              "compileExitCode": "",
               "compileLogState": "not_checked",
               "compilerErrorHeaders": "unknown",
               "compilerFirstFile": "",
@@ -116,7 +138,7 @@ jobs:
               "compilerDiagnostic": "other",
           }
 
-          def summarize_compile_log(log_path):
+          def summarize_compile_log(log_path, exit_code):
               shape = compile_shape.copy()
               try:
                   if not log_path.is_file():
@@ -131,8 +153,9 @@ jobs:
                   return shape
 
               shape["compileLogState"] = "read"
+              contents = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", contents)
               header_pattern = re.compile(
-                  r"^\[error\][ \t]+(?P<path>/[^\r\n:]*?\.scala):"
+                  r"^\[error\][ \t]+(?P<path>(?:/|\./)?[A-Za-z0-9_./-]+\.scala):"
                   r"(?P<line>[1-9]\d{0,6})(?::(?P<column>[1-9]\d{0,4}))?:"
                   r"[ \t]*(?P<detail>[^\r\n]*)$",
                   re.MULTILINE,
@@ -142,6 +165,14 @@ jobs:
               if not headers:
                   if re.search(r"\b(?:ResolveException|ResolutionError|Error downloading|unresolved dependency)\b", contents, re.IGNORECASE):
                       shape["compileCause"] = "dependency_resolution"
+                  elif re.search(r"\b(?:Not a valid command|Not a valid project ID|No such setting/task|error loading project definition)\b", contents, re.IGNORECASE):
+                      shape["compileCause"] = "sbt_configuration"
+                  elif re.search(r"sbt: command not found|Could not find or load main class", contents, re.IGNORECASE):
+                      shape["compileCause"] = "launcher"
+                  elif re.search(r"No space left on device", contents, re.IGNORECASE):
+                      shape["compileCause"] = "disk_full"
+                  elif exit_code == "137" or re.search(r"OutOfMemoryError|GC overhead limit exceeded", contents):
+                      shape["compileCause"] = "memory_or_kill"
                   return shape
 
               try:
@@ -186,12 +217,26 @@ jobs:
                   break
               return shape
 
+          baseline_exit = os.environ.get("BASELINE_EXIT", "")
           compile_exit = os.environ.get("COMPILE_EXIT", "")
           test_exit = os.environ.get("TEST_EXIT", "")
-          if compile_exit and compile_exit != "0":
-              category = "COMPILE_OR_BUILD_FAILURE"
+          if re.fullmatch(r"(?:0|[1-9][0-9]{0,2})", baseline_exit) and int(baseline_exit) <= 255:
+              compile_shape["baselineExitCode"] = baseline_exit
+          if re.fullmatch(r"(?:0|[1-9][0-9]{0,2})", compile_exit) and int(compile_exit) <= 255:
+              compile_shape["compileExitCode"] = compile_exit
+          if baseline_exit and baseline_exit != "0":
+              category = "BASELINE_COMPILE_OR_BUILD_FAILURE"
               compile_shape = summarize_compile_log(
-                  Path(os.environ["RUNNER_TEMP"]) / "wallet-parent-compile.log"
+                  Path(os.environ["RUNNER_TEMP"]) / "wallet-parent-baseline-compile.log",
+                  baseline_exit,
+              )
+          elif baseline_exit != "0":
+              category = "PRECHECK_FAILURE"
+          elif compile_exit and compile_exit != "0":
+              category = "CANDIDATE_ONLY_COMPILE_FAILURE"
+              compile_shape = summarize_compile_log(
+                  Path(os.environ["RUNNER_TEMP"]) / "wallet-parent-compile.log",
+                  compile_exit,
               )
           elif compile_exit != "0":
               category = "PRECHECK_FAILURE"
