@@ -6,7 +6,7 @@ import akka.http.scaladsl.testkit.{RouteTestTimeout, ScalatestRouteTest}
 import de.heikoseeberger.akkahttpcirce.FailFastCirceSupport
 import io.circe.Json
 import io.circe.syntax._
-import org.ergoplatform.ErgoBox
+import org.ergoplatform.{ErgoAddressEncoder, ErgoBox}
 import org.ergoplatform.http.api.ScanEntities.{ScanIdBoxId, ScanIdWrapper}
 import org.ergoplatform.http.api.{ApiCodecs, ScanApiRoute}
 import org.ergoplatform.nodeView.wallet.scanning._
@@ -19,7 +19,7 @@ import scorex.crypto.authds.ADKey
 import scorex.util.encode.Base16
 import scorex.utils.Random
 import sigma.ast.ByteArrayConstant
-import sigma.serialization.ValueSerializer
+import sigma.serialization.{ErgoTreeSerializer, ValueSerializer}
 
 import scala.concurrent.duration._
 import scala.util.Try
@@ -282,18 +282,32 @@ class ScanApiRouteSpec extends AnyFlatSpec
     val addressBytes = testnetP2S.getBytes("UTF-8")
     addressBytes.length should be > 255
 
-    // Make the POST request to the p2sRule endpoint
+    val expectedTruncatedName = new String(addressBytes, 0, Scan.MaxScanNameLength, "UTF-8")
+    var registeredScanId: ScanIdWrapper = null
+
+    // Register the full address and retain the id returned by the route.
     Post("/scan/p2sRule", HttpEntity(ContentTypes.`application/json`, "\"" + testnetP2S + "\"")) ~> route ~> check {
-      // The request should succeed (even though we're using a mock wallet)
-      // In a real scenario, this would register a scan with a truncated name
       status shouldBe StatusCodes.OK
+      registeredScanId = responseAs[ScanIdWrapper]
+    }
 
-      // Verify that the scan name would be truncated to 255 bytes
-      val expectedTruncatedName = new String(testnetP2S.getBytes("UTF-8"), 0, 255, "UTF-8")
-      expectedTruncatedName.getBytes("UTF-8").length shouldBe 255
-
-      // The truncated name should be a prefix of the original address
-      testnetP2S should startWith(expectedTruncatedName)
+    val fullAddress = ErgoAddressEncoder(ergoSettings.chainSettings.addressPrefix).fromString(testnetP2S).get
+    val expectedRuleValue = ByteArrayConstant(
+      ErgoTreeSerializer.DefaultSerializer.serializeErgoTree(fullAddress.script))
+    Get(prefix + "/listAll") ~> route ~> check {
+      status shouldBe StatusCodes.OK
+      val registered = responseAs[Seq[Scan]].find(_.scanId == registeredScanId.scanId)
+      registered shouldBe defined
+      val scan = registered.get
+      scan.scanName shouldBe expectedTruncatedName
+      scan.scanName.getBytes("UTF-8").length shouldBe Scan.MaxScanNameLength
+      scan.scanName should not be testnetP2S
+      scan.walletInteraction shouldBe ScanWalletInteraction.Off
+      scan.removeOffchain shouldBe true
+      scan.trackingRule shouldBe a[EqualsScanningPredicate]
+      val predicate = scan.trackingRule.asInstanceOf[EqualsScanningPredicate]
+      predicate.regId shouldBe ErgoBox.R1
+      ValueSerializer.serialize(predicate.value).toSeq shouldBe ValueSerializer.serialize(expectedRuleValue).toSeq
     }
   }
 

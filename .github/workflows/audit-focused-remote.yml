@@ -1,0 +1,126 @@
+name: Focused audit validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact full source commit on this fork
+        required: true
+        type: string
+      suite:
+        description: Affected source closure
+        required: true
+        type: choice
+        options:
+          - scan-p2s
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    if: github.repository == 'a-shannon/ergo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate source request
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SUITE: ${{ inputs.suite }}
+        run: |
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$SUITE" = scan-p2s
+
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Confirm route and test closure
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          PR_HEAD: c0a31f00560ea48cb09d20385f29f6d2fa86675b
+        run: |
+          set -euo pipefail
+          test "$GITHUB_SHA" = "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD^)" = "$PR_HEAD"
+          test "$(git rev-parse 'HEAD:build.sbt')" = 2fb3ba62fb92ff45e45a3639c2dace53f31ed86d
+          test "$(git rev-parse 'HEAD:src/main/scala/org/ergoplatform/http/api/ScanApiRoute.scala')" = 49b689485038c2d1d08807f8bb6351011a496f88
+          test "$(git rev-parse 'HEAD:src/test/scala/org/ergoplatform/http/routes/ScanApiRouteSpec.scala')" = be4e914cde20572eaeb98d83f062a5f551a0d33f
+          changed_paths="$(git diff --name-only "$PR_HEAD" HEAD)"
+          expected_paths="$(printf '%s\n' \
+            '.github/workflows/audit-focused-remote.yml' \
+            'src/test/scala/org/ergoplatform/http/routes/ScanApiRouteSpec.scala')"
+          test "$changed_paths" = "$expected_paths"
+
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Set up Java 8 and sbt
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Run long P2S route-to-scan test
+        env:
+          SIGMASTATE_VERSION: '6.0.2'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'testOnly org.ergoplatform.http.routes.ScanApiRouteSpec -- -z "successfully handle p2sRule with long testnet address and truncate scan name"'
+
+      - name: Confirm one successful named case
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from xml.etree import ElementTree
+
+          def classify(root):
+              suite_name = "org.ergoplatform.http.routes.ScanApiRouteSpec"
+              expected_case_name = (
+                  "ScanApiRoute should successfully handle p2sRule with long testnet "
+                  "address and truncate scan name"
+              )
+              assert root.tag == "testsuite"
+              assert root.attrib["name"] == suite_name
+              counts = {key: int(root.attrib[key])
+                        for key in ("tests", "failures", "errors", "skipped")}
+              assert counts == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0}
+              cases = root.findall("testcase")
+              assert len(cases) == 1
+              case = cases[0]
+              assert case.attrib["classname"] == suite_name
+              assert case.attrib["name"] == expected_case_name
+              assert not any(child.tag in ("failure", "error", "skipped") for child in case)
+              return {"suite_name": suite_name, "case_name": expected_case_name, **counts}
+
+          report = Path("target/test-reports/TEST-org.ergoplatform.http.routes.ScanApiRouteSpec.xml")
+          root = ElementTree.parse(report).getroot()
+          receipt = {"classification": "PASS", "source_commit": os.environ["SOURCE_COMMIT"],
+                     **classify(root)}
+          Path("scan-p2s-receipt.json").write_text(
+              json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+      - name: Retain bounded oracle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-p2s-${{ inputs.source_commit }}
+          path: scan-p2s-receipt.json
+          if-no-files-found: error
+          retention-days: 7
