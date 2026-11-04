@@ -1,0 +1,349 @@
+name: Focused audit validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact full source commit on this fork
+        required: true
+        type: string
+      suite:
+        description: Affected source closure
+        required: true
+        type: choice
+        options:
+          - matrix-pending
+          - matrix-forks
+          - matrix-mempool
+          - matrix-wallet-join
+          - matrix-wallet-closeout
+          - digest-proof-rebuild
+          - mempool-providers
+          - mempool-conflicts
+          - nipopow-producer
+          - nipopow-validation
+          - nipopow-validation-remainder
+          - proofbytes-decoder
+          - wallet-height-mint
+          - history-649
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate source identity
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SUITE: ${{ inputs.suite }}
+        run: |
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          case "$SUITE" in
+            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|proofbytes-decoder|wallet-height-mint|history-649) ;;
+            *) exit 1 ;;
+          esac
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+      - name: Confirm tested commit
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: 'test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"'
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Build pinned Matrix SigmaState dependency
+        if: inputs.suite == 'matrix-pending' || inputs.suite == 'matrix-forks' || inputs.suite == 'matrix-mempool' || inputs.suite == 'matrix-wallet-join' || inputs.suite == 'matrix-wallet-closeout'
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
+      - name: Setup Scala and Java
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Run Matrix pending synchronization closure
+        if: inputs.suite == 'matrix-pending'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.network.MatrixInputIdAdmissionSpec" \
+            "testOnly org.ergoplatform.network.llm_generated.InputBlockPendingCacheSpec" \
+            "testOnly org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification"
+      - name: Run Matrix fork completion and sibling regressions
+        if: inputs.suite == 'matrix-forks'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification"
+      - name: Run real holder fork-to-mempool regression
+        if: inputs.suite == 'matrix-mempool'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "longer input block fork removes a restored conflict when winner was never pooled"'
+      - name: Run real holder wallet rollback and mempool closure
+        if: inputs.suite == 'matrix-wallet-join'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.wallet.InputBlockWalletSpec" \
+            'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "longer input block fork removes a restored conflict when winner was never pooled"'
+      - name: Run mempool provider regressions
+        if: inputs.suite == 'mempool-providers'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.mempool.ErgoMemPoolInputProvidersSpec"
+      - name: Run affected Matrix wallet closure
+        if: inputs.suite == 'matrix-wallet-closeout'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.wallet.InputBlockWalletSpec" \
+            'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "longer input block fork removes a restored conflict when winner was never pooled"' \
+            "testOnly org.ergoplatform.nodeView.wallet.ErgoWalletSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.ErgoWalletServiceSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.WalletScanLogicSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.persistence.OffChainRegistrySpec"
+      - name: Run Digest proof retention through extra-index rebuild
+        if: inputs.suite == 'digest-proof-rebuild'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            "testOnly org.ergoplatform.nodeView.history.extra.ExtraIndexerTemplateKeySpec"
+      - name: Run applied transaction conflict closure
+        if: inputs.suite == 'mempool-conflicts'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.mempool.AppliedTransactionConflictsSpec" \
+            "testOnly org.ergoplatform.nodeView.mempool.ErgoMemPoolSpec" \
+            "testOnly org.ergoplatform.nodeView.mempool.OrderedTxPoolSpec"
+      # NiPoPoW runs use the real history producer, HTTP route and P2P cache consumer.
+      - name: Run NiPoPoW producer and HTTP route regressions
+        if: inputs.suite == 'nipopow-producer'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            "testOnly org.ergoplatform.http.routes.NipopowApiRoutesSpec"
+      - name: Run NiPoPoW proof and consumer closure
+        if: inputs.suite == 'nipopow-validation'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec" \
+            "testOnly *PoPowAlgosSpec *NipopowVerifierSpec *SerializationTests *PopowProcessorSpecification *NipopowApiRoutesSpec" \
+            "testOnly *ErgoSanityUTXO *ErgoSanityDigest -- -z GetNipopowProof" \
+            ++2.13.18 \
+            "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec"
+      - name: Run remaining NiPoPoW consumer and cross-version checks
+        if: inputs.suite == 'nipopow-validation-remainder'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            "testOnly *PoPowAlgosSpec *NipopowVerifierSpec *SerializationTests *PopowProcessorSpecification *NipopowApiRoutesSpec" \
+            "testOnly *ErgoSanityUTXO *ErgoSanityDigest -- -z GetNipopowProof" \
+            ++2.13.18 \
+            "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec"
+      - name: Run proofBytes decoder compatibility cases
+        if: inputs.suite == 'proofbytes-decoder'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "ergoCore/testOnly org.ergoplatform.serialization.ProverResultJsonDecoderSpec"
+      - name: Run wallet mint identity and output height regressions
+        if: inputs.suite == 'wallet-height-mint'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.wallet.ErgoWalletServiceSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.WalletOutputHeightSpec"
+      - name: "Confirm #649 History diagnostic source"
+        if: inputs.suite == 'history-649'
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          test "$GITHUB_SHA" = "$SOURCE_COMMIT"
+          test "$(git rev-parse 'HEAD:src/main/scala/org/ergoplatform/nodeView/history/ErgoHistory.scala')" = "fe58d9a0e2bc5efd822f1dc9d9c476b4b67f5e2f"
+          test "$(git rev-parse 'HEAD:src/test/scala/org/ergoplatform/nodeView/history/VerifyNonADHistorySpecification.scala')" = "686c7bb047df406d4f354b973751a0b36c610c5e"
+      - name: "Run #649 History depth witness (expected red)"
+        id: history_test
+        if: inputs.suite == 'history-649'
+        continue-on-error: true
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'testOnly org.ergoplatform.nodeView.history.VerifyNonADHistorySpecification -- -z "full chain status after invalidating fork block"'
+      - name: Confirm four named decoder cases
+        if: inputs.suite == 'proofbytes-decoder'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          report = Path(
+              "ergo-core/target/test-reports/"
+              "TEST-org.ergoplatform.serialization.ProverResultJsonDecoderSpec.xml"
+          )
+          if not report.is_file():
+              raise SystemExit(f"Missing named JUnit report: {report}")
+          cases = ET.parse(report).getroot().findall(".//testcase")
+          expected = {
+              "missing proofBytes decodes to empty bytes and keeps the extension",
+              "null proofBytes decodes to empty bytes and keeps the extension",
+              "empty-string proofBytes decodes to empty bytes and keeps the extension",
+              "nonempty proofBytes retains its exact bytes and the extension",
+          }
+          names = {case.attrib.get("name") for case in cases}
+          if len(cases) != 4 or names != expected:
+              raise SystemExit(f"Expected four named cases, found {len(cases)}: {names}")
+          if any(case.find(tag) is not None for case in cases
+                 for tag in ("failure", "error", "skipped")):
+              raise SystemExit(f"Failing, errored or skipped case in {report}")
+          print(f"{report}: four named cases, zero failures/errors/skips")
+          PY
+      - name: Confirm six mint and three height cases
+        if: inputs.suite == 'wallet-height-mint'
+        run: |
+          python3 - <<'PY'
+          from collections import Counter
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          report_dir = Path("target/test-reports")
+          expected = {
+              "ErgoWalletServiceSpec": {
+                  "mint identity follows final replacement with explicit inputs true",
+                  "mint identity follows final replacement with explicit inputs false",
+                  "mint identity follows final compression with explicit inputs true",
+                  "mint identity follows final compression with explicit inputs false",
+                  "mint identity follows final unchanged selection with explicit inputs true",
+                  "mint identity follows final unchanged selection with explicit inputs false",
+              },
+              "WalletOutputHeightSpec": {
+                  "wallet-derived outputs use the maximum selected spending height",
+                  "automatic wallet selection can choose a newer off-chain input",
+                  "explicit inputs raise all outputs to the next block height",
+              },
+          }
+          for short_name, required in expected.items():
+              suite = f"org.ergoplatform.nodeView.wallet.{short_name}"
+              report = report_dir / f"TEST-{suite}.xml"
+              if not report.is_file():
+                  raise SystemExit(f"Missing named JUnit report: {report}")
+              root = ET.parse(report).getroot()
+              cases = list(root.iter("testcase"))
+              names = [case.attrib.get("name") for case in cases]
+              if not names or any(not name for name in names):
+                  raise SystemExit(f"Missing named test cases in {report}")
+              if any(next(root.iter(tag), None) is not None
+                     for tag in ("failure", "error", "skipped")):
+                  raise SystemExit(f"Failing, errored or skipped case in {report}")
+              for testsuite in root.iter("testsuite"):
+                  for field in ("failures", "errors", "skipped"):
+                      if int(testsuite.attrib.get(field, "0")) != 0:
+                          raise SystemExit(f"Nonzero {field} in {report}")
+              observed = (
+                  [name for name in names if name.startswith("mint identity follows final ")]
+                  if short_name == "ErgoWalletServiceSpec" else names
+              )
+              if Counter(observed) != Counter(required):
+                  raise SystemExit(
+                      f"Expected {len(required)} named cases in {report}; found {observed}"
+                  )
+              print(f"{report}: {len(required)} named cases, zero failures/errors/skips")
+          PY
+      - name: "Classify #649 History depth witness"
+        if: always() && inputs.suite == 'history-649'
+        env:
+          TEST_OUTCOME: ${{ steps.history_test.outcome }}
+        run: |
+          python3 - <<'PY'
+          from collections import Counter
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          def inconclusive(reason):
+              print("verdict=inconclusive")
+              print(f"reason={reason}")
+              raise SystemExit(1)
+
+          if os.environ.get("TEST_OUTCOME") != "failure":
+              inconclusive("test_step_did_not_fail")
+
+          suite = "org.ergoplatform.nodeView.history.VerifyNonADHistorySpecification"
+          report = Path("target/test-reports") / f"TEST-{suite}.xml"
+          if not report.is_file():
+              inconclusive("missing_report")
+          try:
+              root = ET.parse(report).getroot()
+          except (ET.ParseError, OSError):
+              inconclusive("unreadable_report")
+
+          expected = {
+              depth: f"full chain status after invalidating fork block {depth}"
+              for depth in range(3)
+          }
+          cases = list(root.iter("testcase"))
+          names = [case.attrib.get("name") for case in cases]
+          if Counter(names) != Counter(expected.values()):
+              inconclusive("case_set_mismatch")
+          if any(case.attrib.get("classname") != suite for case in cases):
+              inconclusive("case_class_mismatch")
+
+          suites = list(root.iter("testsuite"))
+          if len(suites) != 1:
+              inconclusive("suite_count_mismatch")
+          try:
+              aggregates = {
+                  field: int(suites[0].attrib.get(field, "0" if field == "skipped" else "-1"))
+                  for field in ("tests", "failures", "errors", "skipped")
+              }
+          except ValueError:
+              inconclusive("invalid_suite_aggregate")
+          if aggregates != {"tests": 3, "failures": 2, "errors": 0, "skipped": 0}:
+              inconclusive("suite_aggregate_mismatch")
+          if list(root.iter("error")) or list(root.iter("skipped")):
+              inconclusive("error_or_skip")
+          if any((node.text or "").strip() for node in root.iter("system-err")):
+              inconclusive("suite_abort_or_stderr")
+          if len(list(root.iter("failure"))) != 2:
+              inconclusive("failure_count_mismatch")
+
+          by_name = {case.attrib["name"]: case for case in cases}
+          if by_name[expected[0]].find("failure") is not None:
+              inconclusive("depth_zero_failed")
+          for depth in (1, 2):
+              failures = by_name[expected[depth]].findall("failure")
+              if len(failures) != 1:
+                  inconclusive(f"depth_{depth}_failure_count")
+              failure = failures[0]
+              failure_type = failure.attrib.get("type", "")
+              # ScalaTest 3.2.10 can leave type empty for a TestFailed event.
+              if failure_type and not (failure_type.endswith("TestFailedException") or
+                                       failure_type.endswith("sbt.ForkMain$ForkError")):
+                  inconclusive(f"depth_{depth}_failure_type")
+              detail = (failure.attrib.get("message", "") + "\n" +
+                        "".join(failure.itertext()))
+              clue = f"invalidating altChain({depth}): bestFull="
+              if clue not in detail or "original=" not in detail or "fork=" not in detail:
+                  inconclusive(f"depth_{depth}_not_final_comparison")
+
+          print("selected_test_count=3")
+          print("test_exit_class=nonzero")
+          print("verdict=expected_history_depth_gap")
+          print("reason=two_final_comparisons")
+          PY
+      - name: Retain test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: focused-${{ inputs.suite }}-${{ inputs.source_commit }}
+          path: |
+            target/test-reports/
+            ergo-core/target/test-reports/
+          if-no-files-found: warn
+          retention-days: 7

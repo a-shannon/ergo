@@ -46,47 +46,48 @@ class VerifyNonADHistorySpecification extends ErgoCorePropertyTest {
     pi.toApply.map(_.asInstanceOf[ErgoFullBlock]) shouldBe expected
   }
 
-  property("full chain status updating") {
+  (0 until 3).foreach { invalidIdx =>
+    property(s"full chain status after invalidating fork block $invalidIdx") {
 
-    def isInBestChain(b: ErgoFullBlock, h: ErgoHistory): Boolean = {
-      h.asInstanceOf[FullBlockProcessor].isInBestFullChain(b.id)
+      def isInBestChain(b: ErgoFullBlock, h: ErgoHistory): Boolean = {
+        h.asInstanceOf[FullBlockProcessor].isInBestFullChain(b.id)
+      }
+
+      var history = genHistory()
+      val initChain = genChain(6, history)
+      val stableChain = initChain.take(3)
+      val altChain = genChain(8, stableChain.last).tail
+
+      history = applyChain(history, initChain)
+      history.bestFullBlockIdOpt.get shouldEqual initChain.last.id
+      initChain.forall(b => isInBestChain(b, history)) shouldBe true
+
+      history = applyChain(history, altChain)
+      altChain.head.header.parentId shouldEqual stableChain.last.id
+      initChain(stableChain.length).header.parentId shouldEqual stableChain.last.id
+      (altChain.head.id.toSeq != initChain(stableChain.length).id.toSeq) shouldBe true
+      history.bestFullBlockIdOpt.get shouldEqual altChain.last.id
+      stableChain.forall(b => isInBestChain(b, history)) shouldBe true
+      initChain.drop(3).forall(b => !isInBestChain(b, history)) shouldBe true
+      altChain.forall(b => isInBestChain(b, history)) shouldBe true
+
+      val survivingTip = if (invalidIdx == 0) stableChain.last else altChain(invalidIdx - 1)
+      (history.scoreOf(initChain.last.id).get >
+        history.scoreOf(survivingTip.id).get) shouldBe true
+
+      history = history.reportModifierIsInvalid(altChain(invalidIdx).blockTransactions,
+        ProgressInfo(None, Seq.empty, Seq.empty, Seq.empty)).get._1
+
+      val observedBestFull = history.bestFullBlockIdOpt
+      val observedOriginalMarkers = initChain.map(b => isInBestChain(b, history)).toVector
+      val observedForkMarkers = altChain.map(b => isInBestChain(b, history)).toVector
+      withClue(s"invalidating altChain($invalidIdx): bestFull=$observedBestFull, " +
+        s"original=$observedOriginalMarkers, fork=$observedForkMarkers: ") {
+        observedBestFull.get shouldEqual initChain.last.id
+        observedOriginalMarkers shouldBe Seq.fill(initChain.length)(true)
+        observedForkMarkers shouldBe Seq.fill(altChain.length)(false)
+      }
     }
-
-    var history = genHistory()
-    val initChain = genChain(6, history)
-
-    val stableChain = initChain.take(3)
-    val altChain = genChain(8, stableChain.last).tail
-
-    // apply initial initChain (1 to 6)
-    history = applyChain(history, initChain)
-
-    history.bestFullBlockIdOpt.get shouldEqual initChain.last.id
-    initChain.forall(b => isInBestChain(b, history)) shouldBe true
-
-    // apply better initChain forking initial one (1 to 3 (init initChain), 3 to 11 (new initChain))
-    history = applyChain(history, altChain)
-
-    history.bestFullBlockIdOpt.get shouldEqual altChain.last.id
-    // first blocks from init chain are still marked as best chain
-    stableChain.forall(b => isInBestChain(b, history)) shouldBe true
-    // other blocks from init chain are no more in best chain
-    initChain.drop(3).forall(b => !isInBestChain(b, history)) shouldBe true
-    // all blocks from fork are marked as best chain
-    altChain.forall(b => isInBestChain(b, history)) shouldBe true
-
-    val invalidChainHead = altChain.head
-
-    // invalidate modifier from fork
-    history.reportModifierIsInvalid(invalidChainHead.blockTransactions,
-      ProgressInfo(None, Seq.empty, Seq.empty, Seq.empty))
-
-    history.bestFullBlockIdOpt.get shouldEqual initChain.last.id
-
-    // all blocks from init chain are marked as best chain again
-    initChain.forall(b => isInBestChain(b, history)) shouldBe true
-    // blocks from fork no longer marked as best chain
-    altChain.forall(b => !isInBestChain(b, history)) shouldBe true
   }
 
   property("bootstrap from headers and last full blocks") {
