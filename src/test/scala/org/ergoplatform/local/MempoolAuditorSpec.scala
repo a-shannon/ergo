@@ -1,6 +1,8 @@
 package org.ergoplatform.local
 
-import akka.actor.{ActorRef, ActorSystem}
+import java.util.concurrent.ConcurrentLinkedQueue
+
+import akka.actor.{Actor, ActorRef, ActorSystem}
 import akka.testkit.{TestActorRef, TestProbe}
 import org.ergoplatform.{ErgoAddressEncoder, ErgoBox}
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
@@ -25,6 +27,7 @@ import sigmastate.interpreter.Interpreter.emptyEnv
 import org.ergoplatform.settings.Constants.TrueTree
 import scorex.util.ModifierId
 
+import scala.collection.JavaConverters._
 import scala.concurrent.duration._
 
 class MempoolAuditorSpec extends AnyFlatSpec with NodeViewTestOps with ErgoTestHelpers with MempoolTestHelpers {
@@ -145,14 +148,50 @@ class MempoolAuditorSpec extends AnyFlatSpec with NodeViewTestOps with ErgoTestH
   private def chainFrom(inputs: Seq[ErgoBox], length: Int): Seq[ErgoTransaction] =
     (1 until length).scanLeft(spending(inputs))((prev, _) => spending(prev.outputs))
 
+  private final class RoundTrace {
+    private val started = System.nanoTime()
+    private val events = new ConcurrentLinkedQueue[String]()
+
+    def record(phase: String): Unit =
+      events.add(s"$phase:+${(System.nanoTime() - started) / 1000000}ms")
+
+    def snapshot: String = events.iterator().asScala.mkString(", ")
+  }
+
+  private class TracedAuditor(holder: ActorRef,
+                              network: ActorRef,
+                              settings: ErgoSettings,
+                              trace: RoundTrace) extends MempoolAuditor(holder, network, settings) {
+    override def aroundReceive(receive: Actor.Receive, msg: Any): Unit = {
+      val handlingDone = msg == MempoolAuditor.CleanupDone && receive.isDefinedAt(msg)
+      msg match {
+        case _: RecheckMempool => trace.record("recheck_enter")
+        case _ =>
+      }
+      if (handlingDone) trace.record("done_enter")
+      super.aroundReceive(receive, msg)
+      msg match {
+        case _: RecheckMempool => trace.record("recheck_return")
+        case _ =>
+      }
+      if (handlingDone) trace.record("done_return")
+    }
+  }
+
   // runs one cleanup and rebroadcast round over `pool` and returns the announced ids in order (one `Inv` each)
-  private def announcedIds(us: UtxoState, pool: Seq[ErgoTransaction], rebroadcastCount: Int): Seq[ModifierId] = {
+  private def announcedIds(us: UtxoState,
+                           pool: Seq[ErgoTransaction],
+                           rebroadcastCount: Int,
+                           phaseTrace: Option[RoundTrace] = None): Seq[ModifierId] = {
     implicit val system: ActorSystem = ActorSystem()
     try {
       val probe = TestProbe()
       val roundSettings =
         settingsToTest.copy(nodeSettings = settingsToTest.nodeSettings.copy(rebroadcastCount = rebroadcastCount))
-      val auditor: ActorRef = TestActorRef(new MempoolAuditor(probe.ref, probe.ref, roundSettings))
+      val auditor: ActorRef = phaseTrace match {
+        case Some(trace) => TestActorRef(new TracedAuditor(probe.ref, probe.ref, roundSettings, trace))
+        case None => TestActorRef(new MempoolAuditor(probe.ref, probe.ref, roundSettings))
+      }
       auditor ! RecheckMempool(us, new FakeMempool(pool.map(UnconfirmedTransaction(_, None))))
       val announcements: PartialFunction[Any, Seq[ModifierId]] = {
         case SendToNetwork(msg, _) => msg.input.toOption.toSeq.flatMap {
@@ -163,11 +202,28 @@ class MempoolAuditorSpec extends AnyFlatSpec with NodeViewTestOps with ErgoTestH
       }
       // a round announces all its ids in one go, after the cleanup run, however long that takes: wait for the first
       // announcement, then take the rest
-      val first = probe.fishForMessage(30.seconds) {
-        case _: SendToNetwork => true
-        case _ => false
+      phaseTrace.foreach(_.record("wait_start"))
+      val first = try {
+        probe.fishForMessage(30.seconds) {
+          case _: SendToNetwork => true
+          case _ => false
+        }
+      } catch {
+        case error: AssertionError if phaseTrace.nonEmpty =>
+          phaseTrace.get.record("wait_failed")
+          val annotated = new AssertionError(s"First announcement wait failed; phases: ${phaseTrace.get.snapshot}")
+          annotated.initCause(error)
+          throw annotated
       }
-      announcements(first) ++ probe.receiveWhile(max = 10.seconds, idle = 1.second)(announcements).flatten
+      phaseTrace.foreach(_.record("first_network"))
+      val announced = announcements(first) ++ probe.receiveWhile(max = 10.seconds, idle = 1.second)(announcements).flatten
+      phaseTrace.foreach { trace =>
+        val observed = trace.snapshot
+        if (!observed.contains("recheck_return") || !observed.contains("done_enter")) {
+          throw new AssertionError(s"Phase trace missed recheck/Done after first network message: $observed")
+        }
+      }
+      announced
     } finally {
       system.terminate()
     }
@@ -205,9 +261,10 @@ class MempoolAuditorSpec extends AnyFlatSpec with NodeViewTestOps with ErgoTestH
   it should "not stop a rebroadcast round below the configured rebroadcastCount" in {
     val (us, bxs) = stateAfterOneBlock()
     val chain = chainFrom(bxs.take(1), MempoolAuditor.MaxAnnouncedPerRound + 5)
+    val phases = new RoundTrace
 
     // the whole chain is selected
-    announcedIds(us, chain.reverse, rebroadcastCount = chain.size) shouldBe chain.map(_.id)
+    announcedIds(us, chain.reverse, rebroadcastCount = chain.size, phaseTrace = Some(phases)) shouldBe chain.map(_.id)
   }
 
   it should "rebroadcast a pooled transaction together with the in-pool transaction that creates its data input" in {
