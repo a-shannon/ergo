@@ -24,6 +24,7 @@ on:
           - nipopow-validation
           - nipopow-validation-remainder
           - kvreader-lifecycle
+          - kvreader-crossscala
 
 permissions:
   contents: read
@@ -40,7 +41,7 @@ jobs:
         run: |
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
-            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|kvreader-lifecycle) ;;
+            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|kvreader-lifecycle|kvreader-crossscala) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -72,6 +73,21 @@ jobs:
             'avldb/src/test/scala/scorex/db/KVStoreReaderLifecycleSpec.scala')
           actual=$(git diff-tree --no-commit-id --name-only -r HEAD | LC_ALL=C sort)
           test "$actual" = "$expected"
+      - name: Confirm KV reader cross-Scala candidate
+        if: inputs.suite == 'kvreader-crossscala'
+        id: cross_source
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          test "$EVENT_SHA" = "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD^)" = "c103ed5cfa5d9068451cfc704fb80e1357116399"
+          test "$(git hash-object avldb/src/main/scala/scorex/db/KVStoreReader.scala)" = "14673e757dd3ef79e9e2f4f4b05beb9ec40f8ad1"
+          test "$(git hash-object avldb/src/test/scala/scorex/db/KVStoreReaderLifecycleSpec.scala)" = "ca83683a39ba458e6acf32ee9a770ba5530cd225"
+          test "$(git hash-object build.sbt)" = "be61e3d1a6674f6ad65aa570e3c8af0c2028a3c3"
+          test "$(git hash-object project/build.properties)" = "61c9b1cb115daf7244c8bdf5afb23d24ff85d987"
+          actual=$(git diff-tree --no-commit-id --name-only -r HEAD)
+          test "$actual" = '.github/workflows/audit-focused-remote.yml'
       - name: Cache sbt
         uses: actions/cache@v4
         with:
@@ -344,6 +360,195 @@ jobs:
               inconclusive("test_step_not_success")
           print("verdict=focused_success")
           PY
+      - name: Test KV reader on Scala 2.11.12
+        if: inputs.suite == 'kvreader-crossscala'
+        id: cross_211
+        run: |
+          set -euo pipefail
+          report=avldb/target/test-reports/TEST-scorex.db.KVStoreReaderLifecycleSpec.xml
+          log="$RUNNER_TEMP/kvreader-scala-2.11.12.log"
+          test ! -e "$report"
+          sbt -batch -Denv=test -Dsbt.log.noformat=true ++2.11.12 \
+            "show avldb/scalaVersion" \
+            "avldb/testOnly scorex.db.KVStoreReaderLifecycleSpec" 2>&1 | tee "$log"
+          python3 - "$log" "2.11.12" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          version = sys.argv[2]
+          matches = [
+              line for line in lines
+              if re.fullmatch(r"(?:\[info\]\s*)?" + re.escape(version), line.strip())
+          ]
+          if len(matches) != 1:
+              print("effective Scala version not uniquely attested")
+              raise SystemExit(1)
+          print(f"effective_avldb_scala_version={version}")
+          PY
+          dir=diagnostic-reports/scala-2.11.12
+          mkdir -p "$dir"
+          printf '2.11.12\n' > "$dir/effective-scala-version.txt"
+          test -s "$report"
+          mv "$report" "$dir/"
+          test ! -e "$report"
+      - name: Test KV reader on Scala 2.13.18
+        if: inputs.suite == 'kvreader-crossscala'
+        id: cross_213
+        run: |
+          set -euo pipefail
+          report=avldb/target/test-reports/TEST-scorex.db.KVStoreReaderLifecycleSpec.xml
+          first=diagnostic-reports/scala-2.11.12/TEST-scorex.db.KVStoreReaderLifecycleSpec.xml
+          test -s "$first"
+          test ! -e "$report"
+          log="$RUNNER_TEMP/kvreader-scala-2.13.18.log"
+          sbt -batch -Denv=test -Dsbt.log.noformat=true ++2.13.18 \
+            "show avldb/scalaVersion" \
+            "avldb/testOnly scorex.db.KVStoreReaderLifecycleSpec" 2>&1 | tee "$log"
+          python3 - "$log" "2.13.18" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          version = sys.argv[2]
+          matches = [
+              line for line in lines
+              if re.fullmatch(r"(?:\[info\]\s*)?" + re.escape(version), line.strip())
+          ]
+          if len(matches) != 1:
+              print("effective Scala version not uniquely attested")
+              raise SystemExit(1)
+          print(f"effective_avldb_scala_version={version}")
+          PY
+          dir=diagnostic-reports/scala-2.13.18
+          mkdir -p "$dir"
+          printf '2.13.18\n' > "$dir/effective-scala-version.txt"
+          test -s "$report"
+          mv "$report" "$dir/"
+          test ! -e "$report"
+      - name: Classify KV reader cross-Scala reports
+        if: always() && inputs.suite == 'kvreader-crossscala'
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_OUTCOME: ${{ steps.cross_source.outcome }}
+          SCALA211_OUTCOME: ${{ steps.cross_211.outcome }}
+          SCALA213_OUTCOME: ${{ steps.cross_213.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          def inconclusive(reason):
+              print("verdict=inconclusive")
+              print(f"reason={reason}")
+              raise SystemExit(1)
+
+          outcomes = (
+              os.environ.get("SOURCE_OUTCOME"),
+              os.environ.get("SCALA211_OUTCOME"),
+              os.environ.get("SCALA213_OUTCOME"),
+          )
+          if outcomes != ("success", "success", "success"):
+              inconclusive("source_or_test_step_failed")
+
+          source = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"], text=True
+          ).strip()
+          if source != os.environ.get("SOURCE_COMMIT"):
+              inconclusive("source_commit_mismatch")
+          product = subprocess.check_output(
+              ["git", "hash-object", "avldb/src/main/scala/scorex/db/KVStoreReader.scala"],
+              text=True,
+          ).strip()
+          test = subprocess.check_output(
+              ["git", "hash-object", "avldb/src/test/scala/scorex/db/KVStoreReaderLifecycleSpec.scala"],
+              text=True,
+          ).strip()
+          if (product, test) != (
+              "14673e757dd3ef79e9e2f4f4b05beb9ec40f8ad1",
+              "ca83683a39ba458e6acf32ee9a770ba5530cd225",
+          ):
+              inconclusive("source_blob_mismatch")
+
+          suite = "scorex.db.KVStoreReaderLifecycleSpec"
+          names = {
+              f"{method} closes its iterator and snapshot after a healthy read"
+              for method in ("getWithFilter", "getRange")
+          } | {
+              f"{method} closes its snapshot when iterator {stage} throws"
+              for method in ("getWithFilter", "getRange")
+              for stage in ("construction", "close")
+          }
+          report_name = "TEST-scorex.db.KVStoreReaderLifecycleSpec.xml"
+          receipts = []
+          for version in ("2.11.12", "2.13.18"):
+              folder = Path("diagnostic-reports") / f"scala-{version}"
+              report = folder / report_name
+              marker = folder / "effective-scala-version.txt"
+              if not folder.is_dir() or set(folder.iterdir()) != {report, marker}:
+                  inconclusive(f"report_set_{version}")
+              if marker.read_text() != version + "\n":
+                  inconclusive(f"effective_version_{version}")
+              try:
+                  root = ET.parse(report).getroot()
+                  suites = list(root.iter("testsuite"))
+                  cases = list(root.iter("testcase"))
+                  counts = {
+                      field: int(suites[0].attrib.get(
+                          field, "0" if field == "skipped" else "-1"
+                      ))
+                      for field in ("tests", "failures", "errors", "skipped")
+                  }
+              except (ET.ParseError, OSError, ValueError, IndexError):
+                  inconclusive(f"unreadable_{version}")
+              if (root.tag != "testsuite" or len(suites) != 1 or
+                  suites[0].attrib.get("name") != suite):
+                  inconclusive(f"suite_shape_{version}")
+              if counts != {
+                  "tests": 6, "failures": 0, "errors": 0, "skipped": 0
+              }:
+                  inconclusive(f"counts_{version}")
+              if (len(cases) != 6 or
+                  {case.attrib.get("name") for case in cases} != names or
+                  any(case.attrib.get("classname") != suite for case in cases)):
+                  inconclusive(f"cases_{version}")
+              if any(
+                  next(root.iter(tag), None) is not None
+                  for tag in ("failure", "error", "skipped")
+              ):
+                  inconclusive(f"case_result_{version}")
+              if any(
+                  (node.text or "").strip()
+                  for node in root.iter("system-err")
+              ):
+                  inconclusive(f"stderr_{version}")
+              receipts.append({
+                  "scalaVersion": version,
+                  "suite": suite,
+                  "cases": sorted(names),
+                  **counts,
+              })
+              print(f"{version}: six lifecycle cases, zero failures/errors/skips")
+
+          if list(Path("avldb/target/test-reports").glob("TEST-*.xml")):
+              inconclusive("unmoved_current_report")
+          receipt = {
+              "classification": "PASS",
+              "sourceCommit": source,
+              "sourceParent": "c103ed5cfa5d9068451cfc704fb80e1357116399",
+              "productBlob": product,
+              "testBlob": test,
+              "runAttempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+              "results": receipts,
+          }
+          Path("diagnostic-reports/kvreader-crossscala-receipt.json").write_text(
+              json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+          )
+          print("verdict=crossscala_focused_success")
+          PY
       - name: Retain test reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -354,5 +559,8 @@ jobs:
             ergo-core/target/test-reports/
             avldb/target/test-reports/
             diagnostic-reports/old-product/
+            diagnostic-reports/scala-2.11.12/
+            diagnostic-reports/scala-2.13.18/
+            diagnostic-reports/kvreader-crossscala-receipt.json
           if-no-files-found: warn
           retention-days: 7
