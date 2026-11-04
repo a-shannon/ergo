@@ -89,6 +89,7 @@ jobs:
           python3 - <<'PY'
           import os
           import re
+          import subprocess
           from pathlib import Path
           import xml.etree.ElementTree as ET
 
@@ -105,10 +106,93 @@ jobs:
               "earlierPhaseFrame": "false",
               "askTimeoutMarker": "false",
           }
+          compile_shape = {
+              "compileCause": "other",
+              "compileLogState": "not_checked",
+              "compilerErrorHeaders": "unknown",
+              "compilerFirstFile": "",
+              "compilerFirstLine": "",
+              "compilerFirstColumn": "",
+              "compilerDiagnostic": "other",
+          }
+
+          def summarize_compile_log(log_path):
+              shape = compile_shape.copy()
+              try:
+                  if not log_path.is_file():
+                      shape["compileLogState"] = "missing"
+                      return shape
+                  if log_path.stat().st_size > 2 * 1024 * 1024:
+                      shape["compileLogState"] = "oversize"
+                      return shape
+                  contents = log_path.read_text(encoding="utf-8", errors="replace")
+              except OSError:
+                  shape["compileLogState"] = "unreadable"
+                  return shape
+
+              shape["compileLogState"] = "read"
+              header_pattern = re.compile(
+                  r"^\[error\][ \t]+(?P<path>/[^\r\n:]*?\.scala):"
+                  r"(?P<line>[1-9]\d{0,6})(?::(?P<column>[1-9]\d{0,4}))?:"
+                  r"[ \t]*(?P<detail>[^\r\n]*)$",
+                  re.MULTILINE,
+              )
+              headers = list(header_pattern.finditer(contents))
+              shape["compilerErrorHeaders"] = str(len(headers))
+              if not headers:
+                  if re.search(r"\b(?:ResolveException|ResolutionError|Error downloading|unresolved dependency)\b", contents, re.IGNORECASE):
+                      shape["compileCause"] = "dependency_resolution"
+                  return shape
+
+              try:
+                  repository = Path.cwd().resolve()
+              except (OSError, ValueError, RuntimeError):
+                  return shape
+              for header in headers:
+                  try:
+                      relative = Path(header.group("path")).resolve().relative_to(repository)
+                      basename = relative.name
+                      if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.scala", basename):
+                          continue
+                      if not (repository / relative).is_file():
+                          continue
+                  except (OSError, ValueError, RuntimeError):
+                      continue
+                  try:
+                      tracked = subprocess.run(
+                          ["git", "cat-file", "-e", "HEAD:" + relative.as_posix()],
+                          cwd=repository,
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL,
+                          check=False,
+                      ).returncode == 0
+                  except OSError:
+                      tracked = False
+                  if not tracked:
+                      continue
+                  shape["compileCause"] = "scala_compile"
+                  shape["compilerFirstFile"] = basename
+                  shape["compilerFirstLine"] = str(int(header.group("line")))
+                  shape["compilerFirstColumn"] = str(int(header.group("column"))) if header.group("column") else ""
+                  detail = header.group("detail").lower()
+                  if "ambiguous" in detail:
+                      shape["compilerDiagnostic"] = "ambiguous"
+                  elif "could not find implicit" in detail or "no implicit" in detail or "implicit value not found" in detail:
+                      shape["compilerDiagnostic"] = "missing_implicit"
+                  elif "type mismatch" in detail:
+                      shape["compilerDiagnostic"] = "type_mismatch"
+                  elif "not found" in detail or "is not a member of" in detail:
+                      shape["compilerDiagnostic"] = "not_found"
+                  break
+              return shape
+
           compile_exit = os.environ.get("COMPILE_EXIT", "")
           test_exit = os.environ.get("TEST_EXIT", "")
           if compile_exit and compile_exit != "0":
               category = "COMPILE_OR_BUILD_FAILURE"
+              compile_shape = summarize_compile_log(
+                  Path(os.environ["RUNNER_TEMP"]) / "wallet-parent-compile.log"
+              )
           elif compile_exit != "0":
               category = "PRECHECK_FAILURE"
           elif not test_exit:
@@ -192,6 +276,7 @@ jobs:
               "testcase": name,
               "classification": category,
               **safe_shape,
+              **compile_shape,
           })
           output = Path(os.environ["RUNNER_TEMP"]) / "wallet-parent-recovery-diagnostic.xml"
           ET.ElementTree(sanitized).write(output, encoding="utf-8", xml_declaration=True)
