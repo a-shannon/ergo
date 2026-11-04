@@ -1,0 +1,278 @@
+name: Focused audit validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact full source commit on this fork
+        required: true
+        type: string
+      suite:
+        description: Affected source closure
+        required: true
+        type: choice
+        options:
+          - matrix-pending
+          - matrix-forks
+          - matrix-mempool
+          - matrix-wallet-join
+          - matrix-wallet-closeout
+          - digest-proof-rebuild
+          - mempool-providers
+          - mempool-conflicts
+          - nipopow-producer
+          - nipopow-validation
+          - nipopow-validation-remainder
+          - header-votes-comparison
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate source identity
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SUITE: ${{ inputs.suite }}
+        run: |
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          case "$SUITE" in
+            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|header-votes-comparison) ;;
+            *) exit 1 ;;
+          esac
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+      - name: Confirm tested commit
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: 'test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"'
+      - name: Confirm Header votes source closure
+        if: inputs.suite == 'header-votes-comparison'
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          BASE_COMMIT: 808189de57d67f2be1160c1ca56633077f3b3f40
+        run: |
+          test "$GITHUB_SHA" = "$SOURCE_COMMIT"
+          git merge-base --is-ancestor "$BASE_COMMIT" "$SOURCE_COMMIT"
+          changed_paths="$(git diff --name-only "$BASE_COMMIT" "$SOURCE_COMMIT")"
+          expected_paths="$(printf '%s\n' \
+            '.github/workflows/audit-focused-remote.yml' \
+            'ergo-core/src/main/scala/org/ergoplatform/modifiers/history/header/Header.scala' \
+            'ergo-core/src/test/scala/org/ergoplatform/mining/AutolykosPowSchemeSpec.scala')"
+          test "$changed_paths" = "$expected_paths"
+          test "$(git rev-parse "$BASE_COMMIT^{tree}")" = 'abd4c73efa5d717cd1772318cf494d3fe6784f01'
+          test "$(git rev-parse "$BASE_COMMIT:ergo-core/src/main/scala/org/ergoplatform/modifiers/history/header/Header.scala")" = '4a0ec34cf096d8cc9bf1da6ddc47d9a6c83ddf59'
+          test "$(git rev-parse 'HEAD:ergo-core/src/main/scala/org/ergoplatform/modifiers/history/header/Header.scala')" = '909a2e263da38be6b7e3b425f312bc3fbfea8ee4'
+          test "$(git rev-parse 'HEAD:ergo-core/src/test/scala/org/ergoplatform/mining/AutolykosPowSchemeSpec.scala')" = 'f4ab87315cce1ba46c3beb7fb639716fed997080'
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Build pinned Matrix SigmaState dependency
+        if: inputs.suite == 'matrix-pending' || inputs.suite == 'matrix-forks' || inputs.suite == 'matrix-mempool' || inputs.suite == 'matrix-wallet-join' || inputs.suite == 'matrix-wallet-closeout'
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
+      - name: Setup Scala and Java
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Characterize Header votes on the old product
+        if: inputs.suite == 'header-votes-comparison'
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          BASE_COMMIT: 808189de57d67f2be1160c1ca56633077f3b3f40
+          SIGMASTATE_VERSION: '6.0.7'
+        run: |
+          product=ergo-core/src/main/scala/org/ergoplatform/modifiers/history/header/Header.scala
+          report=ergo-core/target/test-reports/TEST-org.ergoplatform.mining.AutolykosPowSchemeSpec.xml
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test ! -e "$report"
+          git show "$BASE_COMMIT:$product" > "$product"
+          test "$(git hash-object --path="$product" "$product")" = '4a0ec34cf096d8cc9bf1da6ddc47d9a6c83ddf59'
+          test "$(git diff --name-only)" = "$product"
+          set +e
+          sbt -batch -Denv=test ++2.12.20 \
+            'ergoCore/testOnly org.ergoplatform.mining.AutolykosPowSchemeSpec -- -z "Header JSON votes malformed hex returns a field failure without throwing"'
+          test_exit=$?
+          set -e
+          test "$test_exit" -ne 0
+          test -f "$report"
+          mkdir -p diagnostic-reports/old-product
+          mv "$report" diagnostic-reports/old-product/
+      - name: Confirm exact old-product failure
+        if: inputs.suite == 'header-votes-comparison'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          report = Path('diagnostic-reports/old-product/TEST-org.ergoplatform.mining.AutolykosPowSchemeSpec.xml')
+          if not report.is_file():
+              raise SystemExit('old-product Header votes JUnit report missing')
+          root = ET.parse(report).getroot()
+          if root.tag != 'testsuite':
+              raise SystemExit(f'unexpected old-product JUnit root: {root.tag}')
+          fields = ('tests', 'failures', 'errors', 'skipped')
+          try:
+              counts = {field: int(root.attrib[field]) for field in fields}
+          except (KeyError, ValueError) as exc:
+              raise SystemExit(f'incomplete old-product JUnit counts: {exc}')
+          cases = root.findall('.//testcase')
+          name = 'Header JSON votes malformed hex returns a field failure without throwing'
+          if counts != {'tests': 1, 'failures': 1, 'errors': 0, 'skipped': 0}:
+              raise SystemExit(f'wrong old-product counts: {counts}')
+          if len(cases) != 1 or cases[0].attrib.get('name') != name:
+              raise SystemExit('old product did not run exactly the named testcase')
+          failure = cases[0].find('failure')
+          if failure is None or cases[0].find('error') is not None or cases[0].find('skipped') is not None:
+              raise SystemExit('old product did not fail at one assertion')
+          failure_text = failure.attrib.get('message', '') + '\n' + ''.join(failure.itertext())
+          if 'AutolykosPowSchemeSpec.scala:161' not in failure_text:
+              raise SystemExit('old product failed outside the no-throw assertion')
+          if 'false was not equal to true' not in failure_text.lower():
+              raise SystemExit('old product did not report the no-throw boolean assertion')
+          print('Header votes old-product failure identified at line 161')
+          PY
+      - name: Validate Header votes on the corrected product
+        if: inputs.suite == 'header-votes-comparison'
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SIGMASTATE_VERSION: '6.0.7'
+        run: |
+          product=ergo-core/src/main/scala/org/ergoplatform/modifiers/history/header/Header.scala
+          report=ergo-core/target/test-reports/TEST-org.ergoplatform.mining.AutolykosPowSchemeSpec.xml
+          git restore --source="$SOURCE_COMMIT" -- "$product"
+          test "$(git hash-object --path="$product" "$product")" = '909a2e263da38be6b7e3b425f312bc3fbfea8ee4'
+          git diff --quiet
+          test ! -e "$report"
+          sbt -batch -Denv=test ++2.12.20 \
+            'ergoCore/testOnly org.ergoplatform.mining.AutolykosPowSchemeSpec -- -z "Header JSON votes malformed hex returns a field failure without throwing"'
+      - name: Confirm corrected Header votes testcase
+        if: inputs.suite == 'header-votes-comparison'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          report = Path('ergo-core/target/test-reports/TEST-org.ergoplatform.mining.AutolykosPowSchemeSpec.xml')
+          if not report.is_file():
+              raise SystemExit('corrected Header votes JUnit report missing')
+          root = ET.parse(report).getroot()
+          if root.tag != 'testsuite':
+              raise SystemExit(f'unexpected corrected JUnit root: {root.tag}')
+          fields = ('tests', 'failures', 'errors', 'skipped')
+          try:
+              counts = {field: int(root.attrib[field]) for field in fields}
+          except (KeyError, ValueError) as exc:
+              raise SystemExit(f'incomplete corrected JUnit counts: {exc}')
+          cases = root.findall('.//testcase')
+          name = 'Header JSON votes malformed hex returns a field failure without throwing'
+          if counts != {'tests': 1, 'failures': 0, 'errors': 0, 'skipped': 0}:
+              raise SystemExit(f'wrong corrected counts: {counts}')
+          if len(cases) != 1 or cases[0].attrib.get('name') != name:
+              raise SystemExit('corrected product did not run exactly the named testcase')
+          if cases[0].find('failure') is not None or cases[0].find('error') is not None or cases[0].find('skipped') is not None:
+              raise SystemExit('corrected testcase contains a failure, error or skip')
+          print('Header votes corrected testcase passed once')
+          PY
+      - name: Run Matrix pending synchronization closure
+        if: inputs.suite == 'matrix-pending'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.network.MatrixInputIdAdmissionSpec" \
+            "testOnly org.ergoplatform.network.llm_generated.InputBlockPendingCacheSpec" \
+            "testOnly org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification"
+      - name: Run Matrix fork completion and sibling regressions
+        if: inputs.suite == 'matrix-forks'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification"
+      - name: Run real holder fork-to-mempool regression
+        if: inputs.suite == 'matrix-mempool'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "longer input block fork removes a restored conflict when winner was never pooled"'
+      - name: Run real holder wallet rollback and mempool closure
+        if: inputs.suite == 'matrix-wallet-join'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.wallet.InputBlockWalletSpec" \
+            'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "longer input block fork removes a restored conflict when winner was never pooled"'
+      - name: Run mempool provider regressions
+        if: inputs.suite == 'mempool-providers'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.mempool.ErgoMemPoolInputProvidersSpec"
+      - name: Run affected Matrix wallet closure
+        if: inputs.suite == 'matrix-wallet-closeout'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.wallet.InputBlockWalletSpec" \
+            'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "longer input block fork removes a restored conflict when winner was never pooled"' \
+            "testOnly org.ergoplatform.nodeView.wallet.ErgoWalletSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.ErgoWalletServiceSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.WalletScanLogicSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.persistence.OffChainRegistrySpec"
+      - name: Run Digest proof retention through extra-index rebuild
+        if: inputs.suite == 'digest-proof-rebuild'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            "testOnly org.ergoplatform.nodeView.history.extra.ExtraIndexerTemplateKeySpec"
+      - name: Run applied transaction conflict closure
+        if: inputs.suite == 'mempool-conflicts'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.mempool.AppliedTransactionConflictsSpec" \
+            "testOnly org.ergoplatform.nodeView.mempool.ErgoMemPoolSpec" \
+            "testOnly org.ergoplatform.nodeView.mempool.OrderedTxPoolSpec"
+      # NiPoPoW runs use the real history producer, HTTP route and P2P cache consumer.
+      - name: Run NiPoPoW producer and HTTP route regressions
+        if: inputs.suite == 'nipopow-producer'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            "testOnly org.ergoplatform.http.routes.NipopowApiRoutesSpec"
+      - name: Run NiPoPoW proof and consumer closure
+        if: inputs.suite == 'nipopow-validation'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec" \
+            "testOnly *PoPowAlgosSpec *NipopowVerifierSpec *SerializationTests *PopowProcessorSpecification *NipopowApiRoutesSpec" \
+            "testOnly *ErgoSanityUTXO *ErgoSanityDigest -- -z GetNipopowProof" \
+            ++2.13.18 \
+            "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec"
+      - name: Run remaining NiPoPoW consumer and cross-version checks
+        if: inputs.suite == 'nipopow-validation-remainder'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            "testOnly *PoPowAlgosSpec *NipopowVerifierSpec *SerializationTests *PopowProcessorSpecification *NipopowApiRoutesSpec" \
+            "testOnly *ErgoSanityUTXO *ErgoSanityDigest -- -z GetNipopowProof" \
+            ++2.13.18 \
+            "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec"
+      - name: Retain test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: focused-${{ inputs.suite }}-${{ inputs.source_commit }}
+          path: |
+            target/test-reports/
+            ergo-core/target/test-reports/
+            diagnostic-reports/old-product/
+          if-no-files-found: warn
+          retention-days: 7
