@@ -1,0 +1,358 @@
+name: Focused audit validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact full source commit on this fork
+        required: true
+        type: string
+      suite:
+        description: Affected source closure
+        required: true
+        type: choice
+        options:
+          - matrix-pending
+          - matrix-forks
+          - matrix-mempool
+          - matrix-wallet-join
+          - matrix-wallet-closeout
+          - digest-proof-rebuild
+          - mempool-providers
+          - mempool-conflicts
+          - nipopow-producer
+          - nipopow-validation
+          - nipopow-validation-remainder
+          - kvreader-lifecycle
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate source identity
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SUITE: ${{ inputs.suite }}
+        run: |
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          case "$SUITE" in
+            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder|kvreader-lifecycle) ;;
+            *) exit 1 ;;
+          esac
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+      - name: Confirm tested commit
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: 'test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"'
+      - name: Confirm KV reader candidate
+        if: inputs.suite == 'kvreader-lifecycle'
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          test "$EVENT_SHA" = "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD^)" = "a88c3ef9fdaa3ccb92af298f303f64d81fa873ba"
+          test "$(git hash-object avldb/src/main/scala/scorex/db/KVStoreReader.scala)" = "14673e757dd3ef79e9e2f4f4b05beb9ec40f8ad1"
+          test "$(git hash-object avldb/src/test/scala/scorex/db/KVStoreReaderLifecycleSpec.scala)" = "ca83683a39ba458e6acf32ee9a770ba5530cd225"
+          test "$(git hash-object avldb/src/main/scala/scorex/db/LDBVersionedStore.scala)" = "a4ea496e448809adb7b17c0f3020fec24d4c000f"
+          test "$(git hash-object avldb/src/test/scala/scorex/db/LDBVersionedStoreRecoverySpec.scala)" = "039951cec42a2c666f1fb312d7b0f29a0ec17ad0"
+          test "$(git hash-object src/test/scala/org/ergoplatform/db/KvStoreReaderSpec.scala)" = "9159876876b827255fba59685741dd7ff4cdbb7f"
+          test "$(git hash-object src/test/scala/org/ergoplatform/db/LDBKVStoreSpec.scala)" = "cd32b21c29494868264de870c8113fdf49c5f430"
+          expected=$(printf '%s\n' \
+            '.github/workflows/audit-focused-remote.yml' \
+            'avldb/src/main/scala/scorex/db/KVStoreReader.scala' \
+            'avldb/src/test/scala/scorex/db/KVStoreReaderLifecycleSpec.scala')
+          actual=$(git diff-tree --no-commit-id --name-only -r HEAD | LC_ALL=C sort)
+          test "$actual" = "$expected"
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Build pinned Matrix SigmaState dependency
+        if: inputs.suite == 'matrix-pending' || inputs.suite == 'matrix-forks' || inputs.suite == 'matrix-mempool' || inputs.suite == 'matrix-wallet-join' || inputs.suite == 'matrix-wallet-closeout'
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
+      - name: Setup Scala and Java
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Run Matrix pending synchronization closure
+        if: inputs.suite == 'matrix-pending'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.network.MatrixInputIdAdmissionSpec" \
+            "testOnly org.ergoplatform.network.llm_generated.InputBlockPendingCacheSpec" \
+            "testOnly org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification"
+      - name: Run Matrix fork completion and sibling regressions
+        if: inputs.suite == 'matrix-forks'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification"
+      - name: Run real holder fork-to-mempool regression
+        if: inputs.suite == 'matrix-mempool'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "longer input block fork removes a restored conflict when winner was never pooled"'
+      - name: Run real holder wallet rollback and mempool closure
+        if: inputs.suite == 'matrix-wallet-join'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.wallet.InputBlockWalletSpec" \
+            'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "longer input block fork removes a restored conflict when winner was never pooled"'
+      - name: Run mempool provider regressions
+        if: inputs.suite == 'mempool-providers'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.mempool.ErgoMemPoolInputProvidersSpec"
+      - name: Run affected Matrix wallet closure
+        if: inputs.suite == 'matrix-wallet-closeout'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.wallet.InputBlockWalletSpec" \
+            'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "longer input block fork removes a restored conflict when winner was never pooled"' \
+            "testOnly org.ergoplatform.nodeView.wallet.ErgoWalletSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.ErgoWalletServiceSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.WalletScanLogicSpec" \
+            "testOnly org.ergoplatform.nodeView.wallet.persistence.OffChainRegistrySpec"
+      - name: Run Digest proof retention through extra-index rebuild
+        if: inputs.suite == 'digest-proof-rebuild'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            "testOnly org.ergoplatform.nodeView.history.extra.ExtraIndexerTemplateKeySpec"
+      - name: Run applied transaction conflict closure
+        if: inputs.suite == 'mempool-conflicts'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.mempool.AppliedTransactionConflictsSpec" \
+            "testOnly org.ergoplatform.nodeView.mempool.ErgoMemPoolSpec" \
+            "testOnly org.ergoplatform.nodeView.mempool.OrderedTxPoolSpec"
+      # NiPoPoW runs use the real history producer, HTTP route and P2P cache consumer.
+      - name: Run NiPoPoW producer and HTTP route regressions
+        if: inputs.suite == 'nipopow-producer'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            "testOnly org.ergoplatform.http.routes.NipopowApiRoutesSpec"
+      - name: Run NiPoPoW proof and consumer closure
+        if: inputs.suite == 'nipopow-validation'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec" \
+            "testOnly *PoPowAlgosSpec *NipopowVerifierSpec *SerializationTests *PopowProcessorSpecification *NipopowApiRoutesSpec" \
+            "testOnly *ErgoSanityUTXO *ErgoSanityDigest -- -z GetNipopowProof" \
+            ++2.13.18 \
+            "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec"
+      - name: Run remaining NiPoPoW consumer and cross-version checks
+        if: inputs.suite == 'nipopow-validation-remainder'
+        run: |
+          sbt -batch -Denv=test ++2.12.20 \
+            'set libraryDependencies += "com.typesafe.akka" %% "akka-http-testkit" % "10.2.7" % Test' \
+            "testOnly *PoPowAlgosSpec *NipopowVerifierSpec *SerializationTests *PopowProcessorSpecification *NipopowApiRoutesSpec" \
+            "testOnly *ErgoSanityUTXO *ErgoSanityDigest -- -z GetNipopowProof" \
+            ++2.13.18 \
+            "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec"
+      - name: Characterize old KV reader snapshot cleanup
+        if: inputs.suite == 'kvreader-lifecycle'
+        id: old_kvreader
+        continue-on-error: true
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          product=avldb/src/main/scala/scorex/db/KVStoreReader.scala
+          report=avldb/target/test-reports/TEST-scorex.db.KVStoreReaderLifecycleSpec.xml
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          git show "a88c3ef9fdaa3ccb92af298f303f64d81fa873ba:$product" > "$product"
+          test "$(git hash-object --path="$product" "$product")" = "583bec352779649cc1f25552b4cbaae0fe985ee5"
+          set +e
+          sbt -batch -Denv=test ++2.12.20 \
+            "avldb/testOnly scorex.db.KVStoreReaderLifecycleSpec"
+          test_exit=$?
+          set -e
+          mkdir -p diagnostic-reports/old-product
+          cp "$report" diagnostic-reports/old-product/
+          test "$test_exit" -ne 0
+      - name: Run corrected KV reader and consumer closure
+        if: inputs.suite == 'kvreader-lifecycle'
+        id: kvreader_tests
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          product=avldb/src/main/scala/scorex/db/KVStoreReader.scala
+          git restore --source="$SOURCE_COMMIT" -- "$product"
+          test "$(git hash-object --path="$product" "$product")" = "14673e757dd3ef79e9e2f4f4b05beb9ec40f8ad1"
+          git diff --quiet
+          sbt -batch -Denv=test ++2.12.20 \
+            "avldb/testOnly scorex.db.KVStoreReaderLifecycleSpec" \
+            'avldb/testOnly scorex.db.LDBVersionedStoreRecoverySpec -- -z "update recovers after ldb_main write 1 with applied=false"' \
+            "testOnly org.ergoplatform.db.KvStoreReaderSpec" \
+            'testOnly org.ergoplatform.db.LDBKVStoreSpec -- -z "put/get/getAll/delete"'
+      - name: Classify KV reader reports
+        if: always() && inputs.suite == 'kvreader-lifecycle'
+        env:
+          OLD_OUTCOME: ${{ steps.old_kvreader.outcome }}
+          TEST_OUTCOME: ${{ steps.kvreader_tests.outcome }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          def inconclusive(reason):
+              print("verdict=inconclusive")
+              print(f"reason={reason}")
+              raise SystemExit(1)
+
+          expected = {
+              Path("avldb/target/test-reports/TEST-scorex.db.KVStoreReaderLifecycleSpec.xml"): (
+                  "scorex.db.KVStoreReaderLifecycleSpec",
+                  {
+                      f"{method} closes its iterator and snapshot after a healthy read"
+                      for method in ("getWithFilter", "getRange")
+                  } | {
+                      f"{method} closes its snapshot when iterator {stage} throws"
+                      for method in ("getWithFilter", "getRange")
+                      for stage in ("construction", "close")
+                  },
+              ),
+              Path("avldb/target/test-reports/TEST-scorex.db.LDBVersionedStoreRecoverySpec.xml"): (
+                  "scorex.db.LDBVersionedStoreRecoverySpec",
+                  {"update recovers after ldb_main write 1 with applied=false"},
+              ),
+              Path("target/test-reports/TEST-org.ergoplatform.db.KvStoreReaderSpec.xml"): (
+                  "org.ergoplatform.db.KvStoreReaderSpec",
+                  {"getRange works properly"},
+              ),
+              Path("target/test-reports/TEST-org.ergoplatform.db.LDBKVStoreSpec.xml"): (
+                  "org.ergoplatform.db.LDBKVStoreSpec",
+                  {"put/get/getAll/delete"},
+              ),
+          }
+          if os.environ.get("OLD_OUTCOME") != "success":
+              inconclusive("old_step_not_success")
+          lifecycle = Path(
+              "avldb/target/test-reports/TEST-scorex.db.KVStoreReaderLifecycleSpec.xml"
+          )
+          old = Path("diagnostic-reports/old-product") / lifecycle.name
+          if set(old.parent.glob("TEST-*.xml")) != {old} or not old.is_file():
+              inconclusive("old_report_set")
+          try:
+              old_root = ET.parse(old).getroot()
+              old_suites = list(old_root.iter("testsuite"))
+              old_cases = list(old_root.iter("testcase"))
+              old_counts = {
+                  field: int(old_suites[0].attrib.get(
+                      field, "0" if field == "skipped" else "-1"
+                  ))
+                  for field in ("tests", "failures", "errors", "skipped")
+              }
+          except (ET.ParseError, OSError, ValueError, IndexError):
+              inconclusive("old_report_unreadable")
+          if (old_root.tag != "testsuite" or len(old_suites) != 1 or
+              old_suites[0].attrib.get("name") != expected[lifecycle][0]):
+              inconclusive("old_suite_shape")
+          if old_counts != {
+              "tests": 6, "failures": 4, "errors": 0, "skipped": 0
+          }:
+              inconclusive("old_counts")
+          if len(list(old_root.iter("failure"))) != 4:
+              inconclusive("old_failure_count")
+          if (list(old_root.iter("error")) or list(old_root.iter("skipped")) or
+              any((node.text or "").strip() for node in old_root.iter("system-err"))):
+              inconclusive("old_abort_or_stderr")
+          lifecycle_names = expected[lifecycle][1]
+          if len(old_cases) != 6 or {
+              case.attrib.get("name") for case in old_cases
+          } != lifecycle_names or any(
+              case.attrib.get("classname") != expected[lifecycle][0]
+              for case in old_cases
+          ):
+              inconclusive("old_cases")
+          for case in old_cases:
+              failure = case.find("failure")
+              if case.find("error") is not None or case.find("skipped") is not None:
+                  inconclusive("old_error_or_skip")
+              if "after a healthy read" in case.attrib["name"]:
+                  if failure is not None:
+                      inconclusive("old_healthy_failed")
+              else:
+                  if failure is None:
+                      inconclusive("old_negative_passed")
+                  detail = failure.attrib.get("message", "") + "\n" + "".join(
+                      failure.itertext()
+                  )
+                  frame_line = (
+                      108 if "iterator construction throws" in case.attrib["name"]
+                      else 120
+                  )
+                  if ("0 was not equal to 1" not in detail or
+                      f"KVStoreReaderLifecycleSpec.scala:{frame_line}" not in detail):
+                      inconclusive("old_failure_elsewhere")
+          print("old product: two healthy passed, four cleanup negatives failed")
+          for directory in {path.parent for path in expected}:
+              if set(directory.glob("TEST-*.xml")) != {
+                  path for path in expected if path.parent == directory
+              }:
+                  inconclusive(f"report_set_{directory}")
+          for report, (suite, names) in expected.items():
+              if not report.is_file():
+                  inconclusive(f"missing_{suite}")
+              try:
+                  root = ET.parse(report).getroot()
+                  suites = list(root.iter("testsuite"))
+                  cases = list(root.iter("testcase"))
+                  counts = {
+                      field: int(suites[0].attrib.get(
+                          field, "0" if field == "skipped" else "-1"
+                      ))
+                      for field in ("tests", "failures", "errors", "skipped")
+                  }
+              except (ET.ParseError, OSError, ValueError, IndexError):
+                  inconclusive(f"unreadable_{suite}")
+              if (root.tag != "testsuite" or len(suites) != 1 or
+                  suites[0].attrib.get("name") != suite):
+                  inconclusive(f"suite_shape_{suite}")
+              if counts != {
+                  "tests": len(names), "failures": 0, "errors": 0, "skipped": 0
+              }:
+                  inconclusive(f"counts_{suite}")
+              if len(cases) != len(names) or {
+                  case.attrib.get("name") for case in cases
+              } != names or any(case.attrib.get("classname") != suite for case in cases):
+                  inconclusive(f"cases_{suite}")
+              if any(next(root.iter(tag), None) is not None
+                     for tag in ("failure", "error", "skipped")):
+                  inconclusive(f"case_result_{suite}")
+              print(f"{suite}: {len(names)} cases, zero failures/errors/skips")
+          if os.environ.get("TEST_OUTCOME") != "success":
+              inconclusive("test_step_not_success")
+          print("verdict=focused_success")
+          PY
+      - name: Retain test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: focused-${{ inputs.suite }}-${{ inputs.source_commit }}
+          path: |
+            target/test-reports/
+            ergo-core/target/test-reports/
+            avldb/target/test-reports/
+            diagnostic-reports/old-product/
+          if-no-files-found: warn
+          retention-days: 7
