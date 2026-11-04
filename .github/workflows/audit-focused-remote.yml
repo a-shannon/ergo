@@ -43,7 +43,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
           test -f src/test/scala/org/ergoplatform/nodeView/wallet/OffchainParentRecoverySpec.scala
           test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/wallet/OffchainParentRecoverySpec.scala)" = \
-            "3ccd61e11f519f28ad270dba8220903bd021e112"
+            "a3a0fd28240b2402974e3c13328113d798cacfab"
       - name: Cache sbt
         uses: actions/cache@v4
         with:
@@ -80,7 +80,7 @@ jobs:
         shell: bash
         run: |
           test "$(git hash-object src/test/scala/org/ergoplatform/nodeView/wallet/OffchainParentRecoverySpec.scala)" = \
-            "3ccd61e11f519f28ad270dba8220903bd021e112"
+            "a3a0fd28240b2402974e3c13328113d798cacfab"
           set +e
           sbt -batch -Denv=test ++2.12.20 "Test/compile" > "$RUNNER_TEMP/wallet-parent-compile.log" 2>&1
           result=$?

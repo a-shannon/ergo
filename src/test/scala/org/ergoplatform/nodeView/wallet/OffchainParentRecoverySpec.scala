@@ -47,18 +47,18 @@ class OffchainParentRecoverySpec extends ErgoCorePropertyTest with WalletTestOps
       wallet.scanOffchain(parent)
       wallet.walletActor ! ChangedMempool(parentPool)
       eventually {
-        (inWallet, inPaymentsScan) shouldBe (true, true)
+        (inWallet, inPaymentsScan) shouldBe ((true, true))
       }
 
       wallet.scanOffchain(child)
       wallet.walletActor ! ChangedMempool(bothPool)
       eventually {
-        (inWallet, inPaymentsScan) shouldBe (false, false)
+        (inWallet, inPaymentsScan) shouldBe ((false, false))
       }
 
       wallet.walletActor ! ChangedMempool(afterChildRemoval)
       eventually {
-        (inWallet, inPaymentsScan) shouldBe (true, true)
+        (inWallet, inPaymentsScan) shouldBe ((true, true))
       }
     }
   }
