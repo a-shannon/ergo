@@ -1,0 +1,608 @@
+name: Focused storage and merge validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact full source commit on this public fork
+        required: true
+        type: string
+      suite:
+        description: Affected integration closure
+        required: true
+        type: choice
+        options:
+          - pr2542-master-join
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    if: inputs.suite == 'pr2542-master-join'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate exact input
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$SOURCE_COMMIT" = "$EVENT_SHA"
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+      - name: Confirm merged source and affected closure
+        id: source_check
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD^)" = "29c0c690185eb1d86733e854710c4e65c9b980a6"
+          test "$(git rev-list --parents -n 1 HEAD^)" = "29c0c690185eb1d86733e854710c4e65c9b980a6 b7cf74a98ef9cf6824b54b5f07529bf9ee0b2d81 c1a69f65df2228ce26b7d1c2360b472ef79fc55c"
+          test "$(git rev-parse '29c0c690185eb1d86733e854710c4e65c9b980a6^{tree}')" = "a65ad72e7b21bf8e33b2f8a4a89c63003407709e"
+          test "$(git diff-tree --no-commit-id --name-only -r HEAD)" = ".github/workflows/audit-focused-remote.yml"
+          test "$(git hash-object build.sbt)" = "6fc9ac87bc4d489029ef09c4dab9004b5556555d"
+          test "$(git hash-object avldb/build.sbt)" = "4653df6e091d4b6e0a9cdd7206fa4c8c74f973ad"
+          test "$(git hash-object project/build.properties)" = "61c9b1cb115daf7244c8bdf5afb23d24ff85d987"
+          test "$(git hash-object avldb/src/main/scala/scorex/db/KVStoreReader.scala)" = "14673e757dd3ef79e9e2f4f4b05beb9ec40f8ad1"
+          test "$(git hash-object avldb/src/main/scala/scorex/db/LDBKVStore.scala)" = "d2f9a320abe4e58f372f17b7448dea5307bd7adf"
+          test "$(git hash-object avldb/src/main/scala/scorex/db/LDBVersionedStore.scala)" = "a4ea496e448809adb7b17c0f3020fec24d4c000f"
+          test "$(git hash-object avldb/src/main/scala/scorex/db/LDBVersionedStoreJournal.scala)" = "30859c0577638b69478667e405f29491a0135a60"
+          test "$(git hash-object avldb/src/test/scala/scorex/db/KVStoreReaderLifecycleSpec.scala)" = "ca83683a39ba458e6acf32ee9a770ba5530cd225"
+          test "$(git hash-object avldb/src/test/scala/scorex/db/LDBVersionedStoreSnapshotSpec.scala)" = "41d8de496426ef524aa823f5eeb3719293d6873f"
+          test "$(git hash-object avldb/src/test/scala/scorex/db/LDBVersionedStoreRecoverySpec.scala)" = "039951cec42a2c666f1fb312d7b0f29a0ec17ad0"
+          test "$(git hash-object avldb/src/test/scala/scorex/db/LDBVersionedStoreSpec.scala)" = "59863452ab026f1605d75ea821ae6c95049f795d"
+          test "$(git hash-object src/test/scala/org/ergoplatform/mining/CandidateGeneratorSpec.scala)" = "163481285ecb0f97d3123923edf9e0f9467361a6"
+          test "$(git hash-object src/test/scala/org/ergoplatform/modifiers/mempool/ErgoNodeTransactionSpec.scala)" = "eab12f48352fc0b0c948fcc8b8e5a53e70c9d46f"
+          test "$(git hash-object src/test/scala/org/ergoplatform/nodeView/viewholder/ErgoNodeViewHolderSpec.scala)" = "e399fb292b2432f7df9c36ee77aaa8553d9f12ae"
+          test "$(git hash-object src/test/scala/org/ergoplatform/db/KvStoreReaderSpec.scala)" = "9159876876b827255fba59685741dd7ff4cdbb7f"
+          test "$(git hash-object src/test/scala/org/ergoplatform/db/LDBKVStoreSpec.scala)" = "eaaf444d565c39f7ce40abf8c7c1e433ae3425be"
+      - name: Cache sbt dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-pr2542-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Setup Scala and Java
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Run merged Scala 2.12 affected suites
+        id: merged_212
+        run: |
+          set -euo pipefail
+          test ! -d avldb/target/test-reports
+          test ! -d target/test-reports
+          log="$RUNNER_TEMP/pr2542-merged-2.12.log"
+          set +e
+          sbt -batch -Denv=test -Dsbt.log.noformat=true ++2.12.20 \
+            "show avldb/scalaVersion" \
+            "avldb/testOnly scorex.db.KVStoreReaderLifecycleSpec" \
+            "avldb/testOnly scorex.db.LDBVersionedStoreSnapshotSpec" \
+            'avldb/testOnly scorex.db.LDBVersionedStoreRecoverySpec -- -z "update recovers after ldb_main write 1 with applied=false"' \
+            'avldb/testOnly scorex.db.LDBVersionedStoreSpec -- -z "processAll && getWithFilter"' \
+            "testOnly org.ergoplatform.mining.CandidateGeneratorSpec" \
+            "testOnly org.ergoplatform.modifiers.mempool.ErgoNodeTransactionSpec" \
+            'testOnly org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec -- -z "prepared UTXO snapshot"' \
+            'testOnly org.ergoplatform.db.KvStoreReaderSpec -- -z "getRange works properly"' \
+            'testOnly org.ergoplatform.db.LDBKVStoreSpec -- -z "put/get/getAll/delete"' \
+            > "$log" 2>&1
+          sbt_exit=$?
+          python3 - "$log" "2.12.20" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          version = sys.argv[2]
+          if sum(
+              bool(re.fullmatch(r"(?:\[info\]\s*)?" + re.escape(version), line.strip()))
+              for line in lines
+          ) != 1:
+              print("effective avldb Scala version not uniquely attested")
+              raise SystemExit(1)
+          print(f"effective_avldb_scala_version={version}")
+          PY
+          version_exit=$?
+          set -e
+          dest=diagnostic-reports/scala-2.12.20
+          mkdir -p "$dest/avldb" "$dest/root"
+          if [ "$version_exit" -eq 0 ]; then
+            printf '2.12.20\n' > "$dest/effective-scala-version.txt"
+          fi
+          missing=0
+          for suite in KVStoreReaderLifecycleSpec LDBVersionedStoreSnapshotSpec LDBVersionedStoreRecoverySpec LDBVersionedStoreSpec; do
+            report="avldb/target/test-reports/TEST-scorex.db.$suite.xml"
+            if [ -s "$report" ]; then mv "$report" "$dest/avldb/"; else missing=1; fi
+          done
+          for suite in org.ergoplatform.mining.CandidateGeneratorSpec org.ergoplatform.modifiers.mempool.ErgoNodeTransactionSpec org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec org.ergoplatform.db.KvStoreReaderSpec org.ergoplatform.db.LDBKVStoreSpec; do
+            report="target/test-reports/TEST-$suite.xml"
+            if [ -s "$report" ]; then mv "$report" "$dest/root/"; else missing=1; fi
+          done
+          PHASE=2.12.20 SBT_EXIT="$sbt_exit" VERSION_EXIT="$version_exit" python3 - "$log" "$dest/phase-status.json" <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path, PurePosixPath
+          log = Path(sys.argv[1]).read_bytes() if Path(sys.argv[1]).is_file() else b""
+          location = None
+          for line in log.decode(errors="replace").replace("\\", "/").splitlines():
+              if "[error]" not in line:
+                  continue
+              match = re.search(
+                  r"((?:avldb|src|ergo-core|ergo-wallet)/[A-Za-z0-9_./-]+\.scala):(\d+)",
+                  line,
+              )
+              if match:
+                  candidate = match.group(1)
+                  normalized = PurePosixPath(candidate)
+                  if (normalized.is_absolute() or ".." in normalized.parts or
+                      normalized.as_posix() != candidate):
+                      continue
+                  try:
+                      tracked = subprocess.run(
+                          ["git", "ls-tree", "HEAD", "--", candidate],
+                          capture_output=True, text=True,
+                      )
+                  except OSError:
+                      continue
+                  if (tracked.returncode == 0 and re.fullmatch(
+                      r"100(?:644|755) blob [0-9a-f]{40}\t" + re.escape(candidate),
+                      tracked.stdout.strip(),
+                  )):
+                      location = f"{candidate}:{match.group(2)}"
+                      break
+          Path(sys.argv[2]).write_text(json.dumps({
+              "phase": os.environ["PHASE"],
+              "sbtExit": int(os.environ["SBT_EXIT"]),
+              "versionCheckExit": int(os.environ["VERSION_EXIT"]),
+              "logSha256": hashlib.sha256(log).hexdigest(),
+              "firstErrorLocation": location,
+          }, sort_keys=True, separators=(",", ":")) + "\n")
+          PY
+          if [ "$sbt_exit" -ne 0 ] || [ "$version_exit" -ne 0 ] || [ "$missing" -ne 0 ]; then
+            echo "verdict=inconclusive phase=2.12.20"
+            exit 1
+          fi
+      - name: Run merged Scala 2.13 reader lifecycle
+        id: merged_213
+        run: |
+          set -euo pipefail
+          first=diagnostic-reports/scala-2.12.20/avldb/TEST-scorex.db.KVStoreReaderLifecycleSpec.xml
+          report=avldb/target/test-reports/TEST-scorex.db.KVStoreReaderLifecycleSpec.xml
+          test -s "$first"
+          test ! -e "$report"
+          log="$RUNNER_TEMP/pr2542-merged-2.13.log"
+          set +e
+          sbt -batch -Denv=test -Dsbt.log.noformat=true ++2.13.18 \
+            "show avldb/scalaVersion" \
+            "avldb/testOnly scorex.db.KVStoreReaderLifecycleSpec" \
+            > "$log" 2>&1
+          sbt_exit=$?
+          python3 - "$log" "2.13.18" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          version = sys.argv[2]
+          if sum(
+              bool(re.fullmatch(r"(?:\[info\]\s*)?" + re.escape(version), line.strip()))
+              for line in lines
+          ) != 1:
+              print("effective avldb Scala version not uniquely attested")
+              raise SystemExit(1)
+          print(f"effective_avldb_scala_version={version}")
+          PY
+          version_exit=$?
+          set -e
+          dest=diagnostic-reports/scala-2.13.18
+          mkdir -p "$dest/avldb"
+          if [ "$version_exit" -eq 0 ]; then
+            printf '2.13.18\n' > "$dest/effective-scala-version.txt"
+          fi
+          missing=0
+          if [ -s "$report" ]; then mv "$report" "$dest/avldb/"; else missing=1; fi
+          PHASE=2.13.18 SBT_EXIT="$sbt_exit" VERSION_EXIT="$version_exit" python3 - "$log" "$dest/phase-status.json" <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path, PurePosixPath
+          log = Path(sys.argv[1]).read_bytes() if Path(sys.argv[1]).is_file() else b""
+          location = None
+          for line in log.decode(errors="replace").replace("\\", "/").splitlines():
+              if "[error]" not in line:
+                  continue
+              match = re.search(
+                  r"((?:avldb|src|ergo-core|ergo-wallet)/[A-Za-z0-9_./-]+\.scala):(\d+)",
+                  line,
+              )
+              if match:
+                  candidate = match.group(1)
+                  normalized = PurePosixPath(candidate)
+                  if (normalized.is_absolute() or ".." in normalized.parts or
+                      normalized.as_posix() != candidate):
+                      continue
+                  try:
+                      tracked = subprocess.run(
+                          ["git", "ls-tree", "HEAD", "--", candidate],
+                          capture_output=True, text=True,
+                      )
+                  except OSError:
+                      continue
+                  if (tracked.returncode == 0 and re.fullmatch(
+                      r"100(?:644|755) blob [0-9a-f]{40}\t" + re.escape(candidate),
+                      tracked.stdout.strip(),
+                  )):
+                      location = f"{candidate}:{match.group(2)}"
+                      break
+          Path(sys.argv[2]).write_text(json.dumps({
+              "phase": os.environ["PHASE"],
+              "sbtExit": int(os.environ["SBT_EXIT"]),
+              "versionCheckExit": int(os.environ["VERSION_EXIT"]),
+              "logSha256": hashlib.sha256(log).hexdigest(),
+              "firstErrorLocation": location,
+          }, sort_keys=True, separators=(",", ":")) + "\n")
+          PY
+          if [ "$sbt_exit" -ne 0 ] || [ "$version_exit" -ne 0 ] || [ "$missing" -ne 0 ]; then
+            echo "verdict=inconclusive phase=2.13.18"
+            exit 1
+          fi
+      - name: Classify merged source reports
+        if: always()
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_OUTCOME: ${{ steps.source_check.outcome }}
+          TEST212_OUTCOME: ${{ steps.merged_212.outcome }}
+          TEST213_OUTCOME: ${{ steps.merged_213.outcome }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path, PurePosixPath
+          import xml.etree.ElementTree as ET
+
+          reasons = []
+          if (
+              os.environ.get("SOURCE_OUTCOME"),
+              os.environ.get("TEST212_OUTCOME"),
+              os.environ.get("TEST213_OUTCOME"),
+          ) != ("success", "success", "success"):
+              reasons.append("source_or_test_step_failed")
+          if os.environ.get("GITHUB_RUN_ATTEMPT") != "1":
+              reasons.append("run_attempt_not_one")
+          try:
+              source = subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip()
+          except (OSError, subprocess.CalledProcessError):
+              source = ""
+          if source != os.environ.get("SOURCE_COMMIT"):
+              reasons.append("source_commit_mismatch")
+          try:
+              tracked_clean = all(
+                  subprocess.run(
+                      command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                  ).returncode == 0
+                  for command in (
+                      ["git", "diff", "--quiet"],
+                      ["git", "diff", "--cached", "--quiet"],
+                  )
+              )
+          except OSError:
+              tracked_clean = False
+          if not tracked_clean:
+              reasons.append("tracked_source_changed_after_tests")
+
+          expected = {
+              "scala-2.12.20/avldb/TEST-scorex.db.KVStoreReaderLifecycleSpec.xml": (
+                  "scorex.db.KVStoreReaderLifecycleSpec", 6,
+                  (
+                      "getWithFilter closes its iterator and snapshot after a healthy read",
+                      "getWithFilter closes its snapshot when iterator construction throws",
+                      "getWithFilter closes its snapshot when iterator close throws",
+                      "getRange closes its iterator and snapshot after a healthy read",
+                      "getRange closes its snapshot when iterator construction throws",
+                      "getRange closes its snapshot when iterator close throws",
+                  ),
+              ),
+              "scala-2.12.20/avldb/TEST-scorex.db.LDBVersionedStoreSnapshotSpec.xml": (
+                  "scorex.db.LDBVersionedStoreSnapshotSpec", 15,
+                  (
+                      "snapshot acquisition failure releases the write lock",
+                      "snapshot processing failure closes the snapshot once",
+                      "snapshot close failure is returned as a Failure",
+                      "snapshot processing failure remains primary when closing also fails",
+                  ),
+              ),
+              "scala-2.12.20/avldb/TEST-scorex.db.LDBVersionedStoreRecoverySpec.xml": (
+                  "scorex.db.LDBVersionedStoreRecoverySpec", 1,
+                  ("update recovers after ldb_main write 1 with applied=false",),
+              ),
+              "scala-2.12.20/avldb/TEST-scorex.db.LDBVersionedStoreSpec.xml": (
+                  "scorex.db.LDBVersionedStoreSpec", 1,
+                  ("processAll && getWithFilter",),
+              ),
+              "scala-2.12.20/root/TEST-org.ergoplatform.mining.CandidateGeneratorSpec.xml": (
+                  "org.ergoplatform.mining.CandidateGeneratorSpec", 22,
+                  (
+                      "cache candidate until newly mined block is applied",
+                      "ignore cached candidate when forced = true",
+                      "recover with a filled candidate when proof generation fails once",
+                      "fall back to emission-only candidate when proof generation keeps failing",
+                  ),
+              ),
+              "scala-2.12.20/root/TEST-org.ergoplatform.modifiers.mempool.ErgoNodeTransactionSpec.xml": (
+                  "org.ergoplatform.modifiers.mempool.ErgoNodeTransactionSpec", 20,
+                  (
+                      "more than one pair of data inputs with same box id prohibited since activation height",
+                      "spam simulation (transaction validation cost with too many tokens exceeds block limit)",
+                  ),
+              ),
+              "scala-2.12.20/root/TEST-org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec.xml": (
+                  "org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec", 3,
+                  (
+                      "preserve a prepared UTXO snapshot state across restart",
+                      "reject a prepared UTXO snapshot state from a noncanonical fork on restart",
+                      "require every prepared UTXO snapshot trust signal",
+                  ),
+              ),
+              "scala-2.12.20/root/TEST-org.ergoplatform.db.KvStoreReaderSpec.xml": (
+                  "org.ergoplatform.db.KvStoreReaderSpec", 1,
+                  ("getRange works properly",),
+              ),
+              "scala-2.12.20/root/TEST-org.ergoplatform.db.LDBKVStoreSpec.xml": (
+                  "org.ergoplatform.db.LDBKVStoreSpec", 1,
+                  ("put/get/getAll/delete",),
+              ),
+              "scala-2.13.18/avldb/TEST-scorex.db.KVStoreReaderLifecycleSpec.xml": (
+                  "scorex.db.KVStoreReaderLifecycleSpec", 6,
+                  (
+                      "getWithFilter closes its iterator and snapshot after a healthy read",
+                      "getWithFilter closes its snapshot when iterator construction throws",
+                      "getWithFilter closes its snapshot when iterator close throws",
+                      "getRange closes its iterator and snapshot after a healthy read",
+                      "getRange closes its snapshot when iterator construction throws",
+                      "getRange closes its snapshot when iterator close throws",
+                  ),
+              ),
+          }
+          report_root = Path("diagnostic-reports")
+          actual = {
+              p.relative_to(report_root).as_posix()
+              for version in ("2.12.20", "2.13.18")
+              for p in (report_root / f"scala-{version}").rglob("TEST-*.xml")
+          }
+          if actual != set(expected):
+              reasons.append("report_set_mismatch")
+          for version in ("2.12.20", "2.13.18"):
+              marker = report_root / f"scala-{version}" / "effective-scala-version.txt"
+              if not marker.is_file() or marker.read_text() != version + "\n":
+                  reasons.append(f"version_marker_{version}")
+          phase_statuses = []
+          def checked_location(raw):
+              if not isinstance(raw, str):
+                  return None
+              match = re.fullmatch(
+                  r"((?:avldb|src|ergo-core|ergo-wallet)/[A-Za-z0-9_./-]+\.scala):(\d+)",
+                  raw,
+              )
+              if not match:
+                  return None
+              candidate = match.group(1)
+              normalized = PurePosixPath(candidate)
+              if (normalized.is_absolute() or ".." in normalized.parts or
+                  normalized.as_posix() != candidate):
+                  return None
+              try:
+                  tracked = subprocess.run(
+                      ["git", "ls-tree", "HEAD", "--", candidate],
+                      capture_output=True, text=True,
+                  )
+              except OSError:
+                  return None
+              if (tracked.returncode != 0 or not re.fullmatch(
+                  r"100(?:644|755) blob [0-9a-f]{40}\t" + re.escape(candidate),
+                  tracked.stdout.strip(),
+              )):
+                  return None
+              return raw
+
+          for version in ("2.12.20", "2.13.18"):
+              status_file = report_root / f"scala-{version}" / "phase-status.json"
+              try:
+                  phase_status = json.loads(status_file.read_text())
+              except (OSError, ValueError):
+                  reasons.append(f"missing_phase_status_{version}")
+                  continue
+              if not isinstance(phase_status, dict):
+                  reasons.append(f"phase_status_shape_{version}")
+                  continue
+              raw_location = phase_status.get("firstErrorLocation")
+              safe_location = checked_location(raw_location)
+              if raw_location is not None and safe_location is None:
+                  reasons.append(f"phase_location_invalid_{version}")
+              log_hash = phase_status.get("logSha256")
+              if not isinstance(log_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", log_hash):
+                  log_hash = ""
+                  reasons.append(f"phase_log_hash_{version}")
+              safe_phase = {
+                  "phase": version if phase_status.get("phase") == version else "",
+                  "sbtExit": phase_status.get("sbtExit") if type(phase_status.get("sbtExit")) is int else None,
+                  "versionCheckExit": phase_status.get("versionCheckExit") if type(phase_status.get("versionCheckExit")) is int else None,
+                  "logSha256": log_hash,
+                  "firstErrorLocation": safe_location,
+              }
+              phase_statuses.append(safe_phase)
+              if (
+                  safe_phase["phase"] != version or
+                  safe_phase["sbtExit"] != 0 or
+                  safe_phase["versionCheckExit"] != 0 or
+                  not safe_phase["logSha256"]
+              ):
+                  reasons.append(f"phase_status_{version}")
+          if (list(Path("avldb/target/test-reports").glob("TEST-*.xml")) or
+              list(Path("target/test-reports").glob("TEST-*.xml"))):
+              reasons.append("unmoved_current_report")
+
+          results = []
+          projection_dir = report_root / "projections"
+          projection_dir.mkdir(parents=True, exist_ok=True)
+          for relative, (suite, count, required) in expected.items():
+              path = report_root / relative
+              if not path.is_file():
+                  reasons.append(f"missing_{suite}")
+                  continue
+              try:
+                  payload = path.read_bytes()
+                  root = ET.fromstring(payload)
+                  suites = list(root.iter("testsuite"))
+                  cases = list(root.iter("testcase"))
+                  counts = {
+                      field: int(suites[0].attrib.get(
+                          field, "0" if field == "skipped" else "-1"
+                      ))
+                      for field in ("tests", "failures", "errors", "skipped")
+                  }
+              except (OSError, ET.ParseError, ValueError, IndexError):
+                  reasons.append(f"unreadable_{suite}")
+                  continue
+              raw_sha = hashlib.sha256(payload).hexdigest()
+              projected = ET.Element("testsuite", {
+                  "name": root.attrib.get("name", ""),
+                  **{key: str(value) for key, value in counts.items()},
+                  "rawSha256": raw_sha,
+              })
+              names = []
+              case_results = []
+              for case in cases:
+                  name = case.attrib.get("name", "")
+                  names.append(name)
+                  faults = [child for child in case
+                            if child.tag in ("failure", "error", "skipped")]
+                  unexpected = [child for child in case
+                                if child.tag not in (
+                                    "failure", "error", "skipped", "system-out", "system-err"
+                                )]
+                  if len(faults) > 1:
+                      reasons.append(f"multiple_case_outcomes_{suite}")
+                  if unexpected:
+                      reasons.append(f"unexpected_case_child_{suite}")
+                  declared = case.attrib.get("status", "").lower()
+                  allowed_positive = ("", "pass", "passed", "success")
+                  if declared not in allowed_positive:
+                      reasons.append(f"case_status_{suite}")
+                  if faults:
+                      status = faults[0].tag
+                      if declared in allowed_positive and declared:
+                          reasons.append(f"contradictory_case_status_{suite}")
+                  elif unexpected:
+                      status = "unknown"
+                  elif declared in allowed_positive:
+                      status = "pass"
+                  else:
+                      status = declared if re.fullmatch(r"[a-z_-]{1,32}", declared) else "unknown"
+                  projected_case = ET.SubElement(projected, "testcase", {
+                      "name": name,
+                      "classname": case.attrib.get("classname", ""),
+                      "status": status,
+                  })
+                  case_results.append({
+                      "name": name,
+                      "classname": case.attrib.get("classname", ""),
+                      "status": status,
+                  })
+                  for fault in faults:
+                      detail = fault.attrib.get("message", "") + "\n" + "".join(fault.itertext())
+                      frame = re.search(r"[A-Za-z0-9_]+Spec\.scala:\d+", detail)
+                      ET.SubElement(projected_case, "fault", {
+                          "type": fault.attrib.get("type", ""),
+                          "sourceFrame": frame.group(0) if frame else "",
+                          "detailSha256": hashlib.sha256(detail.encode()).hexdigest(),
+                      })
+              target = projection_dir / relative
+              target.parent.mkdir(parents=True, exist_ok=True)
+              ET.ElementTree(projected).write(target, encoding="utf-8", xml_declaration=True)
+              results.append({
+                  "report": relative,
+                  "suite": suite,
+                  "counts": counts,
+                  "cases": sorted(case_results, key=lambda item: item["name"]),
+                  "rawXmlSha256": raw_sha,
+              })
+              if (root.tag != "testsuite" or len(suites) != 1 or
+                  root.attrib.get("name") != suite):
+                  reasons.append(f"suite_shape_{suite}")
+              if counts != {
+                  "tests": count, "failures": 0, "errors": 0, "skipped": 0
+              }:
+                  reasons.append(f"counts_{suite}")
+              if (len(cases) != count or len(set(names)) != count or
+                  any(case.attrib.get("classname") != suite for case in cases)):
+                  reasons.append(f"cases_{suite}")
+              for needle in required:
+                  if sum(needle in name for name in names) != 1:
+                      reasons.append(f"required_case_{suite}")
+              if any(
+                  next(root.iter(tag), None) is not None
+                  for tag in ("failure", "error", "skipped", "ignored")
+              ):
+                  reasons.append(f"case_result_{suite}")
+              for field in ("ignored", "pending", "canceled"):
+                  if root.attrib.get(field, "0") != "0":
+                      reasons.append(f"nonzero_{field}_{suite}")
+
+          receipt = {
+              "classification": "PASS" if not reasons else "INCONCLUSIVE",
+              "reasonCodes": sorted(set(reasons)),
+              "sourceCommit": source,
+              "sourceParent": "29c0c690185eb1d86733e854710c4e65c9b980a6",
+              "mergeTree": "a65ad72e7b21bf8e33b2f8a4a89c63003407709e",
+              "mergeParents": [
+                  "b7cf74a98ef9cf6824b54b5f07529bf9ee0b2d81",
+                  "c1a69f65df2228ce26b7d1c2360b472ef79fc55c",
+              ],
+              "rootBuildBlob": "6fc9ac87bc4d489029ef09c4dab9004b5556555d",
+              "avldbBuildBlob": "4653df6e091d4b6e0a9cdd7206fa4c8c74f973ad",
+              "runAttempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+              "trackedSourceClean": tracked_clean,
+              "phases": phase_statuses,
+              "results": results,
+          }
+          report_root.mkdir(parents=True, exist_ok=True)
+          (report_root / "pr2542-merge-receipt.json").write_text(
+              json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+          )
+          print(f"verdict={receipt['classification']}")
+          for reason in receipt["reasonCodes"]:
+              print(f"reason={reason}")
+          if reasons:
+              raise SystemExit(1)
+          PY
+      - name: Upload bounded test receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr2542-merge-${{ inputs.source_commit }}
+          path: |
+            diagnostic-reports/pr2542-merge-receipt.json
+            diagnostic-reports/projections/
+          if-no-files-found: warn
+          retention-days: 7
