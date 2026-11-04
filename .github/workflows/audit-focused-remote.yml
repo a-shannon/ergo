@@ -1,0 +1,205 @@
+name: Focused wallet parent restoration on PR 2409
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact public-fork source commit
+        required: true
+        type: string
+      suite:
+        description: One named actor property
+        required: true
+        type: choice
+        options:
+          - wallet-parent-pr2409
+
+permissions:
+  contents: read
+
+jobs:
+  wallet-parent-pr2409:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate inputs
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SUITE: ${{ inputs.suite }}
+        run: |
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$SUITE" = wallet-parent-pr2409
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Confirm PR head and fixture closure
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          base=41686c59feb7893bebdcbd68c917fb36b5f845fa
+          test "$GITHUB_SHA" = "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD^)" = "$base"
+          test "$(git rev-parse "$base^{tree}")" = 54a3fef4dee00a80fcecea9e691e5d14f438b933
+          test "$(git rev-list --count "$base"..HEAD)" = 1
+          changed="$(git diff --name-only "$base" HEAD)"
+          expected="$(printf '%s\n' \
+            '.github/workflows/audit-focused-remote.yml' \
+            'src/test/scala/org/ergoplatform/nodeView/wallet/OffchainParentRecoverySpec.scala')"
+          test "$changed" = "$expected"
+          test "$(git rev-parse HEAD:src/test/scala/org/ergoplatform/nodeView/wallet/OffchainParentRecoverySpec.scala)" = 0059f1cf797ff668e635d1e398d4f00d34e3bc45
+          test "$(git rev-parse HEAD:build.sbt)" = 2fb3ba62fb92ff45e45a3639c2dace53f31ed86d
+          test "$(git rev-parse HEAD:project/build.properties)" = 61c9b1cb115daf7244c8bdf5afb23d24ff85d987
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/mempool/ErgoMemPoolReader.scala)" = eda71c1f561b109c6d58662edea0ed5e29206ea8
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/mempool/ErgoMemPool.scala)" = a385c09317b5184820eb60d18a66ed1cc15c5696
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/wallet/ErgoWalletActor.scala)" = f295dba1b6d2e60f352e20ed240d511c99b2ae4f
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/wallet/ErgoWalletState.scala)" = 12a31f04ddcaf38605855c36c4b4a0e4c8d94770
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/wallet/ErgoWalletService.scala)" = 7e112edde93b831f1195f8c7dfdeba560a20495d
+          test "$(git rev-parse HEAD:src/main/scala/org/ergoplatform/nodeView/wallet/WalletScanLogic.scala)" = 5820fc79055b86d0fde0ea65d222b397d7ad277d
+      - name: Cache sbt
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Setup Scala and Java
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Run one wallet actor property
+        id: target
+        timeout-minutes: 20
+        env:
+          SIGMASTATE_VERSION: '6.0.2'
+        run: |
+          set +e
+          sbt -batch -Denv=test ++2.12.20 \
+            'testOnly org.ergoplatform.nodeView.wallet.OffchainParentRecoverySpec' \
+            > "$RUNNER_TEMP/wallet-parent-pr2409.log" 2>&1
+          result=$?
+          set -e
+          printf 'exit_code=%s\n' "$result" >> "$GITHUB_OUTPUT"
+          exit "$result"
+      - name: Classify named actor result without raw logs
+        if: always()
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          TEST_OUTCOME: ${{ steps.target.outcome }}
+          TEST_EXIT: ${{ steps.target.outputs.exit_code }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          suite = "org.ergoplatform.nodeView.wallet.OffchainParentRecoverySpec"
+          name = "a retained unconfirmed parent output returns to wallet and Payments scan after child removal"
+          report = Path("target/test-reports") / f"TEST-{suite}.xml"
+          source = os.environ.get("SOURCE_COMMIT", "")
+          outcome = os.environ.get("TEST_OUTCOME", "")
+          test_exit = os.environ.get("TEST_EXIT", "")
+          receipt = {
+              "classification": "INCONCLUSIVE",
+              "reason": "unclassified",
+              "source_commit": source if re.fullmatch(r"[0-9a-f]{40}", source) else "",
+              "suite_name": suite,
+              "case_name": name,
+              "tests": None,
+              "failures": None,
+              "errors": None,
+              "skipped": None,
+              "test_outcome": outcome if outcome in ("success", "failure", "skipped") else "",
+              "test_exit_code": test_exit if re.fullmatch(r"(?:0|[1-9][0-9]{0,2})", test_exit) and int(test_exit) <= 255 else "",
+              "envelope": "none",
+              "final_tuple_seen": False,
+              "final_frames_seen": False,
+              "earlier_phase_frame": False,
+              "ask_timeout_marker": False,
+          }
+
+          def finish(category, reason, code=1):
+              receipt["classification"] = category
+              receipt["reason"] = reason
+              path = Path(os.environ["RUNNER_TEMP"]) / "wallet-parent-pr2409-receipt.json"
+              path.write_text(json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8")
+              print(f"wallet parent PR2409 classification: {category}")
+              raise SystemExit(code)
+
+          if not receipt["source_commit"]:
+              finish("INCONCLUSIVE", "source_input")
+          if not report.is_file():
+              finish("INCONCLUSIVE", "missing_report")
+          if list(report.parent.glob("TEST-*.xml")) != [report]:
+              finish("INCONCLUSIVE", "report_set_mismatch")
+          try:
+              root = ET.parse(report).getroot()
+              if root.tag != "testsuite" or root.attrib.get("name") != suite:
+                  finish("INCONCLUSIVE", "wrong_suite")
+              cases = root.findall("testcase")
+              if len(cases) != 1:
+                  finish("INCONCLUSIVE", "case_count")
+              case = cases[0]
+              if case.attrib.get("name") != name or case.attrib.get("classname") != suite:
+                  finish("INCONCLUSIVE", "wrong_named_case")
+              counts = {key: int(root.attrib[key])
+                        for key in ("tests", "failures", "errors", "skipped")}
+              receipt.update(counts)
+              if counts["tests"] != 1 or counts["errors"] != 0 or counts["skipped"] != 0:
+                  finish("INCONCLUSIVE", "aggregate_mismatch")
+              if case.find("error") is not None or case.find("skipped") is not None:
+                  finish("INCONCLUSIVE", "error_or_skip")
+              stderr = root.find("system-err")
+              if stderr is not None and (stderr.text or "").strip():
+                  finish("INCONCLUSIVE", "suite_stderr")
+              failures = case.findall("failure")
+              if outcome == "success" and test_exit == "0" and counts["failures"] == 0 and not failures:
+                  finish("PASS", "named_case_green", 0)
+              if outcome != "failure" or not test_exit or test_exit == "0" or counts["failures"] != 1 or len(failures) != 1:
+                  finish("INCONCLUSIVE", "outcome_report_mismatch")
+              failure = failures[0]
+              message = failure.attrib.get("message", "")
+              trace = failure.text or ""
+              observed = message + "\n" + trace
+              timeout_class = "org.scalatest.exceptions.TestFailedDueToTimeoutException"
+              failure_type = failure.attrib.get("type", "")
+              direct = failure_type in (timeout_class, "class " + timeout_class)
+              forked = (failure_type == "sbt.ForkMain$ForkError"
+                        and message.startswith(timeout_class + ":")
+                        and trace.startswith("sbt.ForkMain$ForkError: " + timeout_class + ":"))
+              receipt["envelope"] = "direct" if direct else "forked" if forked else "other"
+              pattern = r"\(\s*false\s*,\s*false\s*\)\s+was not equal to\s+\(\s*true\s*,\s*true\s*\)"
+              receipt["final_tuple_seen"] = bool(re.search(pattern, observed))
+              receipt["final_frames_seen"] = bool(
+                  re.search(r"OffchainParentRecoverySpec\.scala:58\b", trace)
+                  and re.search(r"OffchainParentRecoverySpec\.scala:59\b", trace))
+              receipt["earlier_phase_frame"] = bool(
+                  re.search(r"OffchainParentRecoverySpec\.scala:(48|49|53|54)\b", trace))
+              receipt["ask_timeout_marker"] = bool(
+                  re.search(r"AskTimeoutException|Future timed out|java\.util\.concurrent\.TimeoutException", observed))
+              if ((direct or forked)
+                  and receipt["final_tuple_seen"] and receipt["final_frames_seen"]
+                  and not receipt["earlier_phase_frame"] and not receipt["ask_timeout_marker"]
+                  and "Last failure message:" in observed):
+                  finish("FINAL_RESTORATION_FAILURE", "verified_final_tuple")
+              finish("INCONCLUSIVE", "unmatched_failure")
+          except (ET.ParseError, OSError, ValueError, KeyError):
+              finish("INCONCLUSIVE", "unreadable_report")
+          PY
+      - name: Retain sanitized receipt only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wallet-parent-pr2409-${{ inputs.source_commit }}
+          path: ${{ runner.temp }}/wallet-parent-pr2409-receipt.json
+          if-no-files-found: error
+          retention-days: 7
