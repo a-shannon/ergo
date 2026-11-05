@@ -1,0 +1,492 @@
+name: Focused audit validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact workflow-only commit on this public fork
+        required: true
+        type: string
+      suite:
+        description: Bounded audit suite
+        required: true
+        type: choice
+        options:
+          - r123-clock-histogram
+
+permissions:
+  contents: read
+
+jobs:
+  clock-histogram:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    env:
+      RELEASE_SHA: 808189de57d67f2be1160c1ca56633077f3b3f40
+      OWNER_SHA: 9072baf9733d46c19a791ad87c0e910bc49259c9
+      MERGE_SHA: 3eb914e1bc1e35bf97c30dc37b7206bad5480872
+      MERGE_TREE: 20a494047afd7c2ecfa4341cb611400c72dd17ac
+      PRODUCT_PATH: src/main/scala/org/ergoplatform/nodeView/mempool/MemPoolStatistics.scala
+      TEST_PATH: src/test/scala/org/ergoplatform/nodeView/mempool/MemPoolStatisticsClockSpec.scala
+      TEST_CLASS: org.ergoplatform.nodeView.mempool.MemPoolStatisticsClockSpec
+      TEST_BLOB: a8c4c4899aa28471f1379e03f40c36eb1ae4b91f
+      PRODUCT_BLOB: 535cf83d0a722dd0b67324aa1ac0d547228ecbd0
+      RAW_MUTANT_BLOB: a150a4d43021dbe5d713cb10343e8a02fc687618
+      DURATION_MUTANT_BLOB: fa9b184b98da7c147c4ee82d49c89243d8b2155e
+    steps:
+      - name: Validate exact dispatch
+        env:
+          SUITE: ${{ inputs.suite }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$SUITE" = "r123-clock-histogram"
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$SOURCE_COMMIT" = "$EVENT_SHA"
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
+      - name: Checkout exact source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+
+      - name: Verify candidate and build closure
+        id: source
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD^)" = "$MERGE_SHA"
+          test "$(git rev-list --parents -n 1 "$MERGE_SHA")" = "$MERGE_SHA $OWNER_SHA $RELEASE_SHA"
+          test "$(git rev-parse "$MERGE_SHA^{tree}")" = "$MERGE_TREE"
+          test "$(git diff-tree --no-commit-id --name-only -r HEAD)" = ".github/workflows/audit-focused-remote.yml"
+          changed="$(git diff --name-only "$RELEASE_SHA" "$MERGE_SHA")"
+          test "$changed" = "$(printf '%s\n%s' "$PRODUCT_PATH" "$TEST_PATH")"
+          test "$(git hash-object "$PRODUCT_PATH")" = "$PRODUCT_BLOB"
+          test "$(git hash-object "$TEST_PATH")" = "$TEST_BLOB"
+          test "$(git rev-parse "$RELEASE_SHA:$PRODUCT_PATH")" = "4bb7d1d640bbb9e45566ef3af3ee8df942b62e4b"
+          if git cat-file -e "$RELEASE_SHA:$TEST_PATH" 2>/dev/null; then exit 1; fi
+          test "$(git hash-object build.sbt)" = "5ede8beddd08a5b142abd935e9bfb9215495a810"
+          test "$(git hash-object project/build.properties)" = "61c9b1cb115daf7244c8bdf5afb23d24ff85d987"
+          test "$(git hash-object src/main/scala/org/ergoplatform/nodeView/mempool/ErgoMemPool.scala)" = "cbb3ee86fbb397f3465eb3a9e0ce3d619a8c3b8f"
+          test "$(git hash-object src/main/scala/org/ergoplatform/nodeView/mempool/OrderedTxPool.scala)" = "16582d277ac2cb7425b96f593b065cc66b0ac009"
+          git diff --quiet
+          git diff --cached --quiet
+
+      - name: Setup Scala and Java
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+
+      - name: Cache sbt dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+
+      - name: Prepare four isolated sources
+        id: sources
+        run: |
+          set -euo pipefail
+          baseline="$RUNNER_TEMP/r123-baseline"
+          raw_mutant="$RUNNER_TEMP/r123-raw-order"
+          duration_mutant="$RUNNER_TEMP/r123-duration"
+          for dir in "$baseline" "$raw_mutant" "$duration_mutant"; do test ! -e "$dir"; done
+          git worktree add --detach "$baseline" "$RELEASE_SHA" > "$RUNNER_TEMP/r123-worktrees.log" 2>&1
+          git worktree add --detach "$raw_mutant" "$MERGE_SHA" >> "$RUNNER_TEMP/r123-worktrees.log" 2>&1
+          git worktree add --detach "$duration_mutant" "$MERGE_SHA" >> "$RUNNER_TEMP/r123-worktrees.log" 2>&1
+          mkdir -p "$baseline/$(dirname "$TEST_PATH")"
+          cp "$TEST_PATH" "$baseline/$TEST_PATH"
+          python3 - "$PRODUCT_PATH" "$raw_mutant" "$duration_mutant" <<'PY'
+          import hashlib
+          import sys
+          from pathlib import Path
+
+          source = Path(sys.argv[1]).read_bytes()
+          raw_dir, duration_dir = map(Path, sys.argv[2:])
+          old = b"if (currTime >= wtx.created && durationMillis >= 0 &&"
+          if source.count(old) != 1:
+              raise SystemExit("single-fault source anchor mismatch")
+          variants = (
+              (raw_dir, b"if (durationMillis >= 0 &&",
+               "a150a4d43021dbe5d713cb10343e8a02fc687618",
+               "f70a2d15bc264a9208a51f1ea6d16c8adf72e9df7b16e65e5f275f04d2f9e2f9"),
+              (duration_dir, b"if (currTime >= wtx.created &&",
+               "fa9b184b98da7c147c4ee82d49c89243d8b2155e",
+               "a830c0f6853b3508d3e226d676a612ca463558850467fd5ff999dd0972228bee"),
+          )
+          for directory, replacement, git_sha, raw_sha in variants:
+              payload = source.replace(old, replacement)
+              actual_git = hashlib.sha1(
+                  f"blob {len(payload)}\0".encode() + payload).hexdigest()
+              if actual_git != git_sha or hashlib.sha256(payload).hexdigest() != raw_sha:
+                  raise SystemExit("single-fault postimage mismatch")
+              (directory / sys.argv[1]).write_bytes(payload)
+          PY
+          test "$(git -C "$baseline" rev-parse HEAD)" = "$RELEASE_SHA"
+          test "$(git -C "$baseline" hash-object --no-filters "$TEST_PATH")" = "$TEST_BLOB"
+          test "$(git -C "$baseline" rev-parse "HEAD:$PRODUCT_PATH")" = "4bb7d1d640bbb9e45566ef3af3ee8df942b62e4b"
+          test "$(git -C "$baseline" ls-files --others --exclude-standard)" = "$TEST_PATH"
+          git -C "$baseline" diff --quiet
+          for dir in "$raw_mutant" "$duration_mutant"; do
+            test "$(git -C "$dir" rev-parse HEAD)" = "$MERGE_SHA"
+            test "$(git -C "$dir" hash-object "$TEST_PATH")" = "$TEST_BLOB"
+            test "$(git -C "$dir" diff --name-only)" = "$PRODUCT_PATH"
+          done
+          test "$(git -C "$raw_mutant" hash-object --no-filters "$PRODUCT_PATH")" = "$RAW_MUTANT_BLOB"
+          test "$(git -C "$duration_mutant" hash-object --no-filters "$PRODUCT_PATH")" = "$DURATION_MUTANT_BLOB"
+
+      - name: Run exact selected clock suites
+        id: phases
+        run: |
+          set -euo pipefail
+          run_phase() {
+            role="$1"
+            source_dir="$2"
+            selection="$3"
+            log="$RUNNER_TEMP/r123-$role.log"
+            status_file="$RUNNER_TEMP/r123-$role-phase.json"
+            if [ -n "$selection" ]; then
+              task="testOnly $TEST_CLASS -- -t \"$selection\""
+            else
+              task="testOnly $TEST_CLASS"
+            fi
+            set +e
+            (
+              cd "$source_dir"
+              timeout --signal=TERM --kill-after=20s 900s \
+                sbt -batch -Denv=test -Dsbt.log.noformat=true clean ++2.12.20 \
+                "show scalaVersion" "$task"
+            ) > "$log" 2>&1
+            sbt_exit=$?
+            set -e
+            python3 - "$role" "$sbt_exit" "$log" "$status_file" <<'PY'
+          import hashlib
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          role, code, log_path, status_path = sys.argv[1:]
+          log = Path(log_path).read_bytes()
+          lines = log.decode("utf-8", errors="replace").splitlines()
+          version_hits = sum(
+              bool(re.fullmatch(r"(?:\[info\]\s*)?2\.12\.20", line.strip()))
+              for line in lines
+          )
+          Path(status_path).write_text(json.dumps({
+              "role": role,
+              "sbtExit": int(code),
+              "logBytes": len(log),
+              "logSha256": hashlib.sha256(log).hexdigest(),
+              "effectiveScalaVersionValid": version_hits == 1,
+          }, sort_keys=True, separators=(",", ":")) + "\n")
+          PY
+            printf 'phase=%s sbt_exit=%s\n' "$role" "$sbt_exit"
+          }
+          boundary="Mempool statistics should not fail removal accounting after a backward minute"
+          wrapped="Mempool statistics should omit wrapped elapsed times in both directions without losing counts"
+          run_phase baseline "$RUNNER_TEMP/r123-baseline" "$boundary"
+          run_phase corrected "$GITHUB_WORKSPACE" ""
+          run_phase raw_order_removed "$RUNNER_TEMP/r123-raw-order" "$wrapped"
+          run_phase duration_guard_removed "$RUNNER_TEMP/r123-duration" "$wrapped"
+
+      - name: Verify sources after tests
+        id: post_source
+        if: always()
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$MERGE_SHA"
+          test "$(git hash-object "$PRODUCT_PATH")" = "$PRODUCT_BLOB"
+          test "$(git hash-object "$TEST_PATH")" = "$TEST_BLOB"
+          git diff --quiet
+          git diff --cached --quiet
+          baseline="$RUNNER_TEMP/r123-baseline"
+          raw_mutant="$RUNNER_TEMP/r123-raw-order"
+          duration_mutant="$RUNNER_TEMP/r123-duration"
+          test "$(git -C "$baseline" hash-object --no-filters "$TEST_PATH")" = "$TEST_BLOB"
+          git -C "$baseline" diff --quiet
+          test "$(git -C "$raw_mutant" hash-object --no-filters "$PRODUCT_PATH")" = "$RAW_MUTANT_BLOB"
+          test "$(git -C "$duration_mutant" hash-object --no-filters "$PRODUCT_PATH")" = "$DURATION_MUTANT_BLOB"
+          for dir in "$raw_mutant" "$duration_mutant"; do
+            test "$(git -C "$dir" hash-object "$TEST_PATH")" = "$TEST_BLOB"
+            test "$(git -C "$dir" diff --name-only)" = "$PRODUCT_PATH"
+          done
+
+      - name: Classify selected baseline, corrected and mutant cases
+        if: always()
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_OUTCOME: ${{ steps.source.outcome }}
+          SOURCES_OUTCOME: ${{ steps.sources.outcome }}
+          PHASES_OUTCOME: ${{ steps.phases.outcome }}
+          POST_SOURCE_OUTCOME: ${{ steps.post_source.outcome }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          suite = "org.ergoplatform.nodeView.mempool.MemPoolStatisticsClockSpec"
+          report_name = f"TEST-{suite}.xml"
+          names = (
+              "Mempool statistics should not fail removal accounting after a backward minute",
+              "Mempool statistics should omit negative residence times without losing removal counts",
+              "Mempool statistics should omit wrapped elapsed times in both directions without losing counts",
+              "Mempool statistics should preserve earlier fee samples when a later clock reading is invalid",
+              "Mempool statistics should retain the valid duration bins through the one-hour boundary",
+          )
+          boundary, wrapped, valid_hour = names[0], names[2], names[4]
+          selected = {
+              "baseline": (boundary,),
+              "corrected": names,
+              "raw_order_removed": (wrapped,),
+              "duration_guard_removed": (wrapped,),
+          }
+          expected_frame = {
+              "baseline": "MemPoolStatisticsClockSpec.scala:25",
+              "raw_order_removed": "MemPoolStatisticsClockSpec.scala:48",
+              "duration_guard_removed": "MemPoolStatisticsClockSpec.scala:43",
+          }
+          reasons = []
+          source_input = os.environ.get("SOURCE_COMMIT", "")
+          safe_source = source_input if re.fullmatch(r"[0-9a-f]{40}", source_input) else ""
+          if not safe_source:
+              reasons.append("invalid_source_input")
+          if tuple(os.environ.get(key) for key in (
+              "SOURCE_OUTCOME", "SOURCES_OUTCOME", "PHASES_OUTCOME", "POST_SOURCE_OUTCOME"
+          )) != ("success", "success", "success", "success"):
+              reasons.append("source_or_phase_step_failed")
+          if os.environ.get("GITHUB_RUN_ATTEMPT") != "1":
+              reasons.append("run_attempt_not_one")
+          try:
+              head = subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+              ).strip()
+          except (OSError, subprocess.CalledProcessError):
+              head = ""
+          if head != safe_source:
+              reasons.append("source_checkout_mismatch")
+
+          output = Path("diagnostic-projections")
+          output.mkdir(parents=True, exist_ok=True)
+          phase_results = []
+          case_results = []
+          for role in selected:
+              raw_status = Path(os.environ["RUNNER_TEMP"]) / f"r123-{role}-phase.json"
+              try:
+                  status = json.loads(raw_status.read_text())
+              except (OSError, ValueError):
+                  status = {}
+                  reasons.append(f"missing_phase_status_{role}")
+              if not isinstance(status, dict):
+                  status = {}
+                  reasons.append(f"phase_status_shape_{role}")
+              safe_phase = {
+                  "role": role if status.get("role") == role else "",
+                  "sbtExit": status.get("sbtExit") if type(status.get("sbtExit")) is int else None,
+                  "logBytes": status.get("logBytes") if type(status.get("logBytes")) is int else None,
+                  "logSha256": status.get("logSha256") if isinstance(status.get("logSha256"), str)
+                      and re.fullmatch(r"[0-9a-f]{64}", status.get("logSha256")) else "",
+                  "effectiveScalaVersionValid": status.get("effectiveScalaVersionValid") is True,
+              }
+              phase_results.append(safe_phase)
+              if (not safe_phase["role"] or not safe_phase["logSha256"] or
+                  safe_phase["logBytes"] is None or safe_phase["logBytes"] <= 0 or
+                  not safe_phase["effectiveScalaVersionValid"]):
+                  reasons.append(f"phase_status_{role}")
+              if role == "corrected":
+                  if safe_phase["sbtExit"] != 0:
+                      reasons.append("corrected_exit_not_zero")
+              elif safe_phase["sbtExit"] != 1:
+                  reasons.append(f"negative_exit_not_one_{role}")
+
+              source_dirs = {
+                  "baseline": "r123-baseline",
+                  "raw_order_removed": "r123-raw-order",
+                  "duration_guard_removed": "r123-duration",
+              }
+              source_dir = (
+                  Path(os.environ["GITHUB_WORKSPACE"]) if role == "corrected"
+                  else Path(os.environ["RUNNER_TEMP"]) / source_dirs[role]
+              )
+              report_dir = source_dir / "target" / "test-reports"
+              reports = sorted(p.name for p in report_dir.glob("TEST-*.xml"))
+              if reports != [report_name]:
+                  reasons.append(f"report_set_{role}")
+              report = report_dir / report_name
+              if not report.is_file() or report.is_symlink():
+                  reasons.append(f"missing_or_nonregular_report_{role}")
+                  continue
+              try:
+                  payload = report.read_bytes()
+                  root = ET.fromstring(payload)
+                  counts = {
+                      field: int(root.attrib.get(field, "0" if field == "skipped" else "-1"))
+                      for field in ("tests", "failures", "errors", "skipped")
+                  }
+              except (OSError, ET.ParseError, ValueError):
+                  reasons.append(f"unreadable_report_{role}")
+                  continue
+              raw_sha = hashlib.sha256(payload).hexdigest()
+              projected = ET.Element("testsuite", {
+                  "name": suite if root.attrib.get("name") == suite else "",
+                  **{key: str(value) for key, value in counts.items()},
+                  "rawSha256": raw_sha,
+              })
+              if (root.tag != "testsuite" or root.attrib.get("name") != suite or
+                  len(list(root.iter("testsuite"))) != 1):
+                  reasons.append(f"suite_shape_{role}")
+              for field in ("ignored", "pending", "canceled"):
+                  if root.attrib.get(field, "0") != "0":
+                      reasons.append(f"nonzero_{field}_{role}")
+              cases = list(root.iter("testcase"))
+              seen = []
+              statuses = {}
+              for case in cases:
+                  name = case.attrib.get("name", "")
+                  classname = case.attrib.get("classname", "")
+                  seen.append(name)
+                  faults = [child for child in case
+                            if child.tag in ("failure", "error", "skipped")]
+                  unexpected = [child for child in case
+                                if child.tag not in (
+                                    "failure", "error", "skipped", "system-out", "system-err"
+                                )]
+                  if len(faults) > 1 or unexpected:
+                      reasons.append(f"case_shape_{role}")
+                  declared = case.attrib.get("status", "").lower()
+                  status_value = faults[0].tag if faults else "pass"
+                  if faults:
+                      if declared not in ("", "fail", "failed", "failure"):
+                          reasons.append(f"contradictory_case_status_{role}")
+                  elif declared not in ("", "pass", "passed", "success"):
+                      reasons.append(f"unknown_case_status_{role}")
+                  statuses[name] = status_value
+                  projected_case = ET.SubElement(projected, "testcase", {
+                      "name": name if name in names else "",
+                      "classname": suite if classname == suite else "",
+                      "status": status_value,
+                  })
+                  if classname != suite:
+                      reasons.append(f"case_class_{role}")
+                  for fault in faults:
+                      detail = fault.attrib.get("message", "") + "\n" + "".join(fault.itertext())
+                      frame = re.search(r"MemPoolStatisticsClockSpec\.scala:\d+", detail)
+                      fault_type = fault.attrib.get("type", "")
+                      if (fault.tag != "failure" or
+                          not frame or frame.group(0) != expected_frame.get(role, "")):
+                          reasons.append(f"unattributed_failure_{role}")
+                      safe_type = (
+                          fault_type if len(fault_type) <= 160 and re.fullmatch(
+                              r"[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*",
+                              fault_type
+                          ) else ""
+                      )
+                      if fault_type and not safe_type:
+                          reasons.append(f"unsafe_failure_type_{role}")
+                      if role == "baseline" and (
+                          "removal accounting failed" not in detail or
+                          "IndexOutOfBoundsException" not in detail
+                      ):
+                          reasons.append("baseline_wrong_cause")
+                      ET.SubElement(projected_case, "fault", {
+                          "type": safe_type,
+                          "sourceFrame": frame.group(0) if frame else "",
+                          "detailSha256": hashlib.sha256(detail.encode()).hexdigest(),
+                      })
+              if (len(cases) != len(selected[role]) or
+                  len(set(seen)) != len(cases) or
+                  set(seen) != set(selected[role])):
+                  reasons.append(f"case_set_{role}")
+              expected_status = {
+                  name: ("pass" if role == "corrected" else "failure")
+                  for name in selected[role]
+              }
+              if statuses != expected_status:
+                  reasons.append(f"case_outcome_{role}")
+              actual_counts = {
+                  "tests": len(cases),
+                  "failures": sum(value == "failure" for value in statuses.values()),
+                  "errors": sum(value == "error" for value in statuses.values()),
+                  "skipped": sum(value == "skipped" for value in statuses.values()),
+              }
+              wanted_counts = {
+                  "tests": len(selected[role]),
+                  "failures": 0 if role == "corrected" else 1,
+                  "errors": 0,
+                  "skipped": 0,
+              }
+              if counts != actual_counts or counts != wanted_counts:
+                  reasons.append(f"counts_{role}")
+              projected_path = output / role / report_name
+              projected_path.parent.mkdir(parents=True, exist_ok=True)
+              ET.ElementTree(projected).write(
+                  projected_path, encoding="utf-8", xml_declaration=True)
+              case_results.append({
+                  "role": role,
+                  "suite": suite,
+                  "counts": counts,
+                  "cases": sorted(
+                      ({"name": name, "status": status}
+                       for name, status in statuses.items() if name in names),
+                      key=lambda item: item["name"],
+                  ),
+                  "rawXmlSha256": raw_sha,
+              })
+
+          if (len(case_results) != len(selected) or
+              {result["role"] for result in case_results} != set(selected)):
+              reasons.append("missing_role_result")
+
+          manifest = {
+              "schema": "ergo-r123-clock-histogram-v1",
+              "classification": "PASS" if not reasons else "INCONCLUSIVE",
+              "reasonCodes": sorted(set(reasons)),
+              "sourceCommit": safe_source,
+              "sourceParent": os.environ["MERGE_SHA"],
+              "candidateTree": os.environ["MERGE_TREE"],
+              "releaseCommit": os.environ["RELEASE_SHA"],
+              "ownerCommit": os.environ["OWNER_SHA"],
+              "candidateProductBlob": os.environ["PRODUCT_BLOB"],
+              "releaseProductBlob": "4bb7d1d640bbb9e45566ef3af3ee8df942b62e4b",
+              "testBlob": os.environ["TEST_BLOB"],
+              "mutantBlobs": {
+                  "raw_order_removed": os.environ["RAW_MUTANT_BLOB"],
+                  "duration_guard_removed": os.environ["DURATION_MUTANT_BLOB"],
+              },
+              "runAttempt": int(os.environ["GITHUB_RUN_ATTEMPT"])
+                  if os.environ.get("GITHUB_RUN_ATTEMPT", "").isdigit() else None,
+              "phases": phase_results,
+              "results": case_results,
+              "rawLogsNotEmbedded": True,
+              "rawXmlNotEmbedded": True,
+          }
+          (output / "receipt.json").write_text(
+              json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+          print("classification=" + manifest["classification"])
+          print("reason_codes=" + ",".join(manifest["reasonCodes"]))
+          sys.exit(0 if not reasons else 1)
+          PY
+
+      - name: Upload bounded projected receipts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: r123-clock-${{ github.sha }}
+          path: diagnostic-projections/
+          if-no-files-found: error
+          retention-days: 7
