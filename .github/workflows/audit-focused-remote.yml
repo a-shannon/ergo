@@ -14,6 +14,7 @@ on:
         options:
           - matrix-pending
           - matrix-forks
+          - matrix-input-cache
           - matrix-mempool
           - matrix-wallet-join
           - matrix-wallet-closeout
@@ -39,7 +40,7 @@ jobs:
         run: |
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
-            matrix-pending|matrix-forks|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder) ;;
+            matrix-pending|matrix-forks|matrix-input-cache|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -61,7 +62,7 @@ jobs:
             ~/.cache/coursier/v1
           key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
       - name: Build pinned Matrix SigmaState dependency
-        if: inputs.suite == 'matrix-pending' || inputs.suite == 'matrix-forks' || inputs.suite == 'matrix-mempool' || inputs.suite == 'matrix-wallet-join' || inputs.suite == 'matrix-wallet-closeout'
+        if: inputs.suite == 'matrix-pending' || inputs.suite == 'matrix-forks' || inputs.suite == 'matrix-input-cache' || inputs.suite == 'matrix-mempool' || inputs.suite == 'matrix-wallet-join' || inputs.suite == 'matrix-wallet-closeout'
         uses: ./.github/actions/bootstrap-sigmastate
         with:
           scala-version: 2.12.20
@@ -82,6 +83,75 @@ jobs:
         run: |
           sbt -batch -Denv=test ++2.12.20 \
             "testOnly org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification"
+      - name: Run processed input cache availability diagnostic
+        if: inputs.suite == 'matrix-input-cache'
+        run: |
+          test ! -e target/test-reports
+          report_dir="$GITHUB_WORKSPACE/target/scalatest-input-cache-reports"
+          test ! -e "$report_dir"
+          spec=src/test/scala/org/ergoplatform/nodeView/history/modifierprocessors/llm_generated/ProcessedInputCacheAvailabilitySpec.scala
+          git ls-files --error-unmatch -- "$spec" >/dev/null
+          mkdir -p "$report_dir"
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.history.modifierprocessors.llm_generated.ProcessedInputCacheAvailabilitySpec -- -u $report_dir"
+      - name: Verify processed input cache test selection
+        if: inputs.suite == 'matrix-input-cache'
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          from xml.etree import ElementTree as ET
+
+          expected_class = "org.ergoplatform.nodeView.history.modifierprocessors.llm_generated.ProcessedInputCacheAvailabilitySpec"
+          expected_case = "processed input body cache loss is distinct from an unprocessed input block"
+          reports = sorted(Path("target/scalatest-input-cache-reports").glob("TEST-*.xml"))
+          if len(reports) != 1:
+              raise SystemExit(f"expected one test report, found {len(reports)}")
+          root = ET.parse(reports[0]).getroot()
+          suites = list(root.iter("testsuite"))
+          cases = list(root.iter("testcase"))
+          if len(suites) != 1 or len(cases) != 1:
+              raise SystemExit(f"expected one suite and one case, found {len(suites)} and {len(cases)}")
+          suite, case = suites[0], cases[0]
+          if suite.get("name") not in (expected_class, expected_class.rsplit(".", 1)[-1]):
+              raise SystemExit("the intended input cache suite was not selected")
+          if case.get("classname") != expected_class or case.get("name") != expected_case:
+              raise SystemExit("the intended input cache property was not selected")
+          status = case.get("status")
+          if status is not None and status.lower() not in ("pass", "passed", "success"):
+              raise SystemExit(f"the selected input cache property has non-passing status {status!r}")
+          if any(suite.get(key, "0") != "0" for key in ("failures", "errors", "skipped")):
+              raise SystemExit("the selected input cache property did not pass")
+          if suite.get("tests") != "1" or any(case.find(tag) is not None for tag in ("failure", "error", "skipped")):
+              raise SystemExit("the selected input cache report is incomplete or failed")
+          facts = {
+              "source_commit": os.environ["SOURCE_COMMIT"],
+              "suite": suite.get("name"),
+              "case_class": case.get("classname"),
+              "case_name": case.get("name"),
+              "tests": 1,
+              "failures": 0,
+              "errors": 0,
+              "skipped": 0,
+              "xml_bytes": reports[0].stat().st_size,
+              "xml_sha256": hashlib.sha256(reports[0].read_bytes()).hexdigest(),
+              "status": "passed",
+          }
+          Path("target/input-cache-facts.json").write_text(json.dumps(facts, sort_keys=True) + "\n", encoding="utf-8")
+          print(f"selected one passing input cache property in {reports[0]}")
+          PY
+      - name: Retain processed input cache facts
+        if: inputs.suite == 'matrix-input-cache'
+        uses: actions/upload-artifact@v4
+        with:
+          name: focused-input-cache-${{ inputs.source_commit }}
+          path: target/input-cache-facts.json
+          if-no-files-found: error
+          retention-days: 7
       - name: Run real holder fork-to-mempool regression
         if: inputs.suite == 'matrix-mempool'
         run: |
@@ -148,7 +218,7 @@ jobs:
             ++2.13.18 \
             "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec"
       - name: Retain test reports
-        if: always()
+        if: always() && inputs.suite != 'matrix-input-cache'
         uses: actions/upload-artifact@v4
         with:
           name: focused-${{ inputs.suite }}-${{ inputs.source_commit }}
