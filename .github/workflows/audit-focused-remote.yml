@@ -16,6 +16,7 @@ on:
           - matrix-forks
           - matrix-input-cache
           - history-redelivery
+          - holder-ordering-prune
           - matrix-mempool
           - matrix-wallet-join
           - matrix-wallet-closeout
@@ -43,6 +44,7 @@ jobs:
           case "$SUITE" in
             matrix-pending|matrix-forks|matrix-input-cache|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder) ;;
             history-redelivery) ;;
+            holder-ordering-prune) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -64,7 +66,7 @@ jobs:
             ~/.cache/coursier/v1
           key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
       - name: Build pinned Matrix SigmaState dependency
-        if: inputs.suite == 'matrix-pending' || inputs.suite == 'matrix-forks' || inputs.suite == 'matrix-input-cache' || inputs.suite == 'matrix-mempool' || inputs.suite == 'matrix-wallet-join' || inputs.suite == 'matrix-wallet-closeout'
+        if: inputs.suite == 'matrix-pending' || inputs.suite == 'matrix-forks' || inputs.suite == 'matrix-input-cache' || inputs.suite == 'holder-ordering-prune' || inputs.suite == 'matrix-mempool' || inputs.suite == 'matrix-wallet-join' || inputs.suite == 'matrix-wallet-closeout'
         uses: ./.github/actions/bootstrap-sigmastate
         with:
           scala-version: 2.12.20
@@ -252,6 +254,108 @@ jobs:
           path: target/history-redelivery-facts.json
           if-no-files-found: error
           retention-days: 7
+      - name: Run holder ordering cache prune diagnostic
+        if: inputs.suite == 'holder-ordering-prune'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e target/test-reports
+          report_dir="$GITHUB_WORKSPACE/target/scalatest-holder-ordering-prune-reports"
+          test ! -e "$report_dir"
+          spec=src/test/scala/org/ergoplatform/nodeView/viewholder/llm_generated/HolderOrderingCachePruneSpec.scala
+          git ls-files --error-unmatch -- "$spec" >/dev/null
+          mkdir -p "$report_dir"
+          log_file="$RUNNER_TEMP/holder-ordering-prune.log"
+          set +e
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.viewholder.llm_generated.HolderOrderingCachePruneSpec -- -z ordinary -u $report_dir" \
+            >"$log_file" 2>&1
+          sbt_exit=$?
+          set -e
+          printf '%s\n' "$sbt_exit" > "$RUNNER_TEMP/holder-ordering-prune.exit"
+          printf 'Holder ordering prune sbt exit: %s\n' "$sbt_exit"
+      - name: Classify holder ordering cache prune diagnostic
+        if: inputs.suite == 'holder-ordering-prune'
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+          from xml.etree import ElementTree as ET
+
+          expected_class = "org.ergoplatform.nodeView.viewholder.llm_generated.HolderOrderingCachePruneSpec"
+          expected_case = "ordinary full-block progress prunes prior ordering transactions"
+          final_marker = "HOLDER_PRUNE_FINAL: "
+          final_frame = re.compile(r"(?m)^\s*at\s+.+\(HolderOrderingCachePruneSpec\.scala:49\)\s*$")
+          reports = sorted(Path("target/scalatest-holder-ordering-prune-reports").glob("TEST-*.xml"))
+          if len(reports) != 1:
+              raise SystemExit(f"expected one holder ordering prune report, found {len(reports)}")
+          root = ET.parse(reports[0]).getroot()
+          suites = list(root.iter("testsuite"))
+          cases = list(root.iter("testcase"))
+          if len(suites) != 1 or len(cases) != 1:
+              raise SystemExit(f"expected one suite and one case, found {len(suites)} and {len(cases)}")
+          suite, case = suites[0], cases[0]
+          if suite.get("name") not in (expected_class, expected_class.rsplit(".", 1)[-1]):
+              raise SystemExit("wrong holder ordering prune suite")
+          if case.get("classname") != expected_class or case.get("name") != expected_case:
+              raise SystemExit("wrong holder ordering prune property")
+          if case.get("status") is not None:
+              raise SystemExit("unexpected testcase status attribute")
+          if suite.get("tests") != "1" or suite.get("errors") != "0" or suite.get("skipped", "0") != "0":
+              raise SystemExit("holder ordering prune count or terminal status is inconclusive")
+          exit_path = Path(os.environ["RUNNER_TEMP"]) / "holder-ordering-prune.exit"
+          sbt_exit = int(exit_path.read_text(encoding="utf-8").strip())
+          failures = list(case.findall("failure"))
+          children = list(case)
+          if sbt_exit == 1 and suite.get("failures") == "1" and len(failures) == len(children) == 1:
+              failure = failures[0]
+              if failure.get("type") != "class org.scalatest.exceptions.TestFailedException":
+                  raise SystemExit("wrong holder ordering prune failure type")
+              message = failure.get("message", "")
+              if message.count(final_marker) != 1:
+                  raise SystemExit("holder ordering prune failed outside the final assertion")
+              if final_frame.search(failure.text or "") is None:
+                  raise SystemExit("holder ordering prune final source frame absent")
+              status, reason = "reproduced", "final_holder_prune_assertion"
+          elif sbt_exit == 0 and suite.get("failures") == "0" and not children:
+              status, reason = "not_reproduced", "target_passed"
+          else:
+              raise SystemExit("holder ordering prune result is inconclusive")
+          log_path = Path(os.environ["RUNNER_TEMP"]) / "holder-ordering-prune.log"
+          facts = {
+              "source_commit": os.environ["SOURCE_COMMIT"],
+              "suite": suite.get("name"),
+              "case_class": case.get("classname"),
+              "case_name": case.get("name"),
+              "tests": 1,
+              "failures": int(suite.get("failures")),
+              "errors": 0,
+              "skipped": 0,
+              "sbt_exit": sbt_exit,
+              "status": status,
+              "reason": reason,
+              "xml_bytes": reports[0].stat().st_size,
+              "xml_sha256": hashlib.sha256(reports[0].read_bytes()).hexdigest(),
+              "log_bytes": log_path.stat().st_size,
+              "log_sha256": hashlib.sha256(log_path.read_bytes()).hexdigest(),
+          }
+          Path("target/holder-ordering-prune-facts.json").write_text(
+              json.dumps(facts, sort_keys=True) + "\n", encoding="utf-8")
+          print(f"holder ordering prune: {status}/{reason}, sbt_exit={sbt_exit}")
+          PY
+      - name: Retain holder ordering cache prune facts
+        if: inputs.suite == 'holder-ordering-prune'
+        uses: actions/upload-artifact@v4
+        with:
+          name: focused-holder-ordering-prune-${{ inputs.source_commit }}
+          path: target/holder-ordering-prune-facts.json
+          if-no-files-found: error
+          retention-days: 7
       - name: Run real holder fork-to-mempool regression
         if: inputs.suite == 'matrix-mempool'
         run: |
@@ -318,7 +422,7 @@ jobs:
             ++2.13.18 \
             "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec"
       - name: Retain test reports
-        if: always() && inputs.suite != 'matrix-input-cache' && inputs.suite != 'history-redelivery'
+        if: always() && inputs.suite != 'matrix-input-cache' && inputs.suite != 'history-redelivery' && inputs.suite != 'holder-ordering-prune'
         uses: actions/upload-artifact@v4
         with:
           name: focused-${{ inputs.suite }}-${{ inputs.source_commit }}
