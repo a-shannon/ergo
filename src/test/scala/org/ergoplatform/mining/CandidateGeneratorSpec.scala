@@ -5,6 +5,7 @@ import akka.pattern.{StatusReply, ask}
 import akka.testkit.{TestKit, TestProbe}
 import akka.util.Timeout
 import org.bouncycastle.util.BigIntegers
+import org.ergoplatform.core.idToVersion
 import org.ergoplatform.mining.CandidateGenerator.{Candidate, GenerateCandidate}
 import org.ergoplatform.network.message.inputblocks.InputBlockTransactionsData
 import org.ergoplatform.subblocks.InputBlockAnnouncement
@@ -13,7 +14,7 @@ import org.ergoplatform.modifiers.history.BlockTransactions
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction, UnsignedErgoTransaction}
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{ChangedMempool, FullBlockApplied, LocalBlockApplied, SemanticallyFailedModification}
-import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.{EliminateTransactions, LocallyGeneratedTransaction}
+import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.{EliminateTransactions, GetDataFromCurrentView, LocallyGeneratedTransaction}
 import org.ergoplatform.nodeView.ErgoReadersHolder.{GetReaders, Readers}
 import org.ergoplatform.nodeView.history.{ErgoHistory, ErgoHistoryReader}
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
@@ -89,6 +90,78 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
     testProbe.expectMsgClass(newBlockDelay, newBlockSignal)
     testProbe.expectMsgClass(newBlockDelay, newBlockSignal)
     system.terminate()
+  }
+
+  it should "evict an old generated ordering cache entry after two applied blocks" in new TestKit(ActorSystem()) {
+    val candidateProbe = TestProbe(system)
+    val orderingProbe = TestProbe(system)
+    system.eventStream.subscribe(orderingProbe.ref, classOf[LocallyGeneratedOrderingBlock])
+
+    val testSettings = defaultSettings.copy(
+      directory = s"${defaultSettings.directory}-ordering-cache-${System.nanoTime()}"
+    )
+    testSettings.chainSettings.powScheme.isInstanceOf[DefaultFakePowScheme] shouldBe true
+    val viewHolderRef = ErgoNodeViewRef(testSettings)
+    val readersHolderRef = ErgoReadersHolderRef(viewHolderRef)
+    val candidateGenerator = CandidateGenerator(
+      defaultMinerSecret.publicImage, readersHolderRef, viewHolderRef, testSettings
+    )
+
+    def generateAndObserve(expectedVersion: Header.Version,
+                           expectedParent: Option[ErgoFullBlock]): (ErgoFullBlock, Seq[ErgoTransaction]) = {
+      val candidate = eventually(timeout(newBlockDelay), interval(100.millis)) {
+        candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), candidateProbe.ref)
+        val current = candidateProbe.expectMsgPF(candidateGenDelay) {
+          case StatusReply.Success(c: Candidate) => c
+        }
+        current.candidateBlock.parentOpt.map(_.id) shouldBe expectedParent.map(_.header.id)
+        current.candidateBlock.version shouldBe expectedVersion
+        current
+      }
+      val solved = testSettings.chainSettings.powScheme.proveCandidate(
+        candidate.candidateBlock, defaultMinerSecret.w, 0, 1000, candidate.parameters
+      )
+      val provedBlock = solved match {
+        case org.ergoplatform.OrderingBlockFound(block) => block
+        case other => fail(s"Expected ordering block, got $other")
+      }
+
+      candidateGenerator.tell(OrderingSolutionFound(provedBlock.header.powSolution), candidateProbe.ref)
+      candidateProbe.expectMsg(newBlockDelay, StatusReply.Success(()))
+      val (block, orderingTxs) = orderingProbe.expectMsgPF(newBlockDelay) {
+        case LocallyGeneratedOrderingBlock(efb, txs) if efb.id == provedBlock.id => (efb, txs)
+      }
+      block.header.version shouldBe expectedVersion
+      orderingTxs.map(_.id) shouldBe candidate.candidateBlock.orderingBlockTransactions.map(_.id)
+
+      // The Holder query runs after its local-block handler and observes the post-save state.
+      val appliedAndStored = await((viewHolderRef ? GetDataFromCurrentView[UtxoState, Boolean] { view =>
+        view.history.bestFullBlockOpt.exists(_.header.id == block.header.id) &&
+        view.state.version == idToVersion(block.id) &&
+        view.history.getOrderingBlockTransactions(block.id).exists(_.map(_.id) == orderingTxs.map(_.id))
+      }).mapTo[Boolean])
+      appliedAndStored shouldBe true
+      (block, orderingTxs)
+    }
+
+    try {
+      val (first, firstOrderingTxs) = generateAndObserve(Header.InitialVersion, None)
+      firstOrderingTxs.nonEmpty shouldBe true
+      val (second, _) = generateAndObserve(Header.Interpreter60Version, Some(first))
+      second.id should not be first.id
+      second.header.parentId shouldBe first.header.id
+      second.header.height shouldBe first.header.height + 1
+
+      // The direct prune branch has its own test; this assertion isolates its Holder trigger.
+      val oldEntryPresent = await((viewHolderRef ? GetDataFromCurrentView[UtxoState, Boolean] { view =>
+        view.history.getOrderingBlockTransactions(first.id).isDefined
+      }).mapTo[Boolean])
+      withClue("GENERATED_ORDERING_PRUNE_FINAL: ") {
+        oldEntryPresent shouldBe false
+      }
+    } finally {
+      system.terminate()
+    }
   }
 
   it should "recover when locally mined block is invalidated by node view holder" in new TestKit(
