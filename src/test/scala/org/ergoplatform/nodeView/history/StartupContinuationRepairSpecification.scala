@@ -181,6 +181,38 @@ class StartupContinuationRepairSpecification extends ErgoCorePropertyTest with F
     }
   }
 
+  property("redelivered header after interrupted cleanup keeps one height-row ID") {
+    withFork(withSibling = false) { (history, a8, b7, _, _) =>
+      invalidate(history, a8)
+      history.forgetHeader(a8.id).get
+      history.historyStorage.contains(a8.id) shouldBe false
+      history.isSemanticallyValid(a8.id) shouldBe ModifierSemanticValidity.Absent
+      history.headerIdsAtHeight(a8.height).count(_ == a8.id) shouldBe 1
+      history.bestHeaderIdOpt shouldBe Some(b7.id)
+      history.bestFullBlockIdOpt shouldBe Some(b7.id)
+      history.historyStorage.contains(b7.id) shouldBe true
+
+      history.append(a8.header).get
+      history.historyStorage.contains(a8.id) shouldBe true
+      history.isSemanticallyValid(a8.id) shouldBe ModifierSemanticValidity.Unknown
+      history.typedModifierById[Header](a8.id).map(_.id) shouldBe Some(a8.id)
+      history.bestHeaderIdOpt shouldBe Some(b7.id)
+      history.bestFullBlockIdOpt shouldBe Some(b7.id)
+
+      val rowOccurrences = history.headerIdsAtHeight(a8.height).count(_ == a8.id)
+      val transactionsId = a8.header.transactionsId
+      val downloadOccurrences = history
+        .nextModifiersToDownload(3, (_, id) => id == transactionsId)
+        .values.flatten.count(_ == transactionsId)
+      val finalClue =
+        s"REDELIVERED_ROW_AND_DOWNLOAD_UNIQUE: row=$rowOccurrences " +
+          s"download=$downloadOccurrences: "
+      withClue(finalClue) {
+        (rowOccurrences, downloadOccurrences) shouldBe ((1, 1))
+      }
+    }
+  }
+
   property("startup retains a stored continuation with a malformed validity marker") {
     withFork(withSibling = false) { (history, a8, b7, _, settings) =>
       history.historyStorage.insert(
