@@ -15,6 +15,7 @@ on:
           - matrix-pending
           - matrix-forks
           - matrix-input-cache
+          - history-redelivery
           - matrix-mempool
           - matrix-wallet-join
           - matrix-wallet-closeout
@@ -41,6 +42,7 @@ jobs:
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           case "$SUITE" in
             matrix-pending|matrix-forks|matrix-input-cache|matrix-mempool|matrix-wallet-join|matrix-wallet-closeout|digest-proof-rebuild|mempool-providers|mempool-conflicts|nipopow-producer|nipopow-validation|nipopow-validation-remainder) ;;
+            history-redelivery) ;;
             *) exit 1 ;;
           esac
       - name: Checkout exact source
@@ -152,6 +154,104 @@ jobs:
           path: target/input-cache-facts.json
           if-no-files-found: error
           retention-days: 7
+      - name: Run header redelivery diagnostic
+        if: inputs.suite == 'history-redelivery'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e target/test-reports
+          report_dir="$GITHUB_WORKSPACE/target/scalatest-history-redelivery-reports"
+          test ! -e "$report_dir"
+          spec=src/test/scala/org/ergoplatform/nodeView/history/StartupContinuationRepairSpecification.scala
+          git ls-files --error-unmatch -- "$spec" >/dev/null
+          mkdir -p "$report_dir"
+          log_file="$RUNNER_TEMP/history-redelivery.log"
+          set +e
+          sbt -batch -Denv=test ++2.12.20 \
+            "testOnly org.ergoplatform.nodeView.history.StartupContinuationRepairSpecification -- -z redelivered -u $report_dir" \
+            >"$log_file" 2>&1
+          sbt_exit=$?
+          set -e
+          printf '%s\n' "$sbt_exit" > "$RUNNER_TEMP/history-redelivery.exit"
+          printf 'Header redelivery sbt exit: %s\n' "$sbt_exit"
+      - name: Classify header redelivery diagnostic
+        if: inputs.suite == 'history-redelivery'
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          from xml.etree import ElementTree as ET
+
+          expected_class = "org.ergoplatform.nodeView.history.StartupContinuationRepairSpecification"
+          expected_case = "redelivered header after interrupted cleanup keeps one height-row ID"
+          final_marker = "REDELIVERED_ROW_AND_DOWNLOAD_UNIQUE:"
+          final_clue = final_marker + " row=2 download=2: "
+          reports = sorted(Path("target/scalatest-history-redelivery-reports").glob("TEST-*.xml"))
+          if len(reports) != 1:
+              raise SystemExit(f"expected one header redelivery report, found {len(reports)}")
+          root = ET.parse(reports[0]).getroot()
+          suites = list(root.iter("testsuite"))
+          cases = list(root.iter("testcase"))
+          if len(suites) != 1 or len(cases) != 1:
+              raise SystemExit(f"expected one suite and one case, found {len(suites)} and {len(cases)}")
+          suite, case = suites[0], cases[0]
+          if suite.get("name") not in (expected_class, expected_class.rsplit(".", 1)[-1]):
+              raise SystemExit("wrong header redelivery suite")
+          if case.get("classname") != expected_class or case.get("name") != expected_case:
+              raise SystemExit("wrong header redelivery property")
+          if case.get("status") is not None:
+              raise SystemExit("unexpected testcase status attribute")
+          if suite.get("tests") != "1" or suite.get("errors") != "0" or suite.get("skipped", "0") != "0":
+              raise SystemExit("header redelivery case count or terminal status is inconclusive")
+          exit_path = Path(os.environ["RUNNER_TEMP"]) / "history-redelivery.exit"
+          sbt_exit = int(exit_path.read_text(encoding="utf-8").strip())
+          failures = list(case.findall("failure"))
+          children = list(case)
+          if sbt_exit == 1 and suite.get("failures") == "1" and len(failures) == len(children) == 1:
+              failure = failures[0]
+              if failure.get("type") != "class org.scalatest.exceptions.TestFailedException":
+                  raise SystemExit("wrong header redelivery failure type")
+              message = failure.get("message", "")
+              if message.count(final_marker) != 1 or message.count(final_clue) != 1:
+                  raise SystemExit("header redelivery failed outside the exact final tuple")
+              status, reason = "reproduced", "final_tuple_row2_download2"
+          elif sbt_exit == 0 and suite.get("failures") == "0" and not children:
+              status, reason = "not_reproduced", "target_passed"
+          else:
+              raise SystemExit("header redelivery result is inconclusive")
+          log_path = Path(os.environ["RUNNER_TEMP"]) / "history-redelivery.log"
+          facts = {
+              "source_commit": os.environ["SOURCE_COMMIT"],
+              "suite": suite.get("name"),
+              "case_class": case.get("classname"),
+              "case_name": case.get("name"),
+              "tests": 1,
+              "failures": int(suite.get("failures")),
+              "errors": 0,
+              "skipped": 0,
+              "sbt_exit": sbt_exit,
+              "status": status,
+              "reason": reason,
+              "xml_bytes": reports[0].stat().st_size,
+              "xml_sha256": hashlib.sha256(reports[0].read_bytes()).hexdigest(),
+              "log_bytes": log_path.stat().st_size,
+              "log_sha256": hashlib.sha256(log_path.read_bytes()).hexdigest(),
+          }
+          Path("target/history-redelivery-facts.json").write_text(json.dumps(facts, sort_keys=True) + "\n", encoding="utf-8")
+          print(f"header redelivery: {status}/{reason}, sbt_exit={sbt_exit}")
+          PY
+      - name: Retain header redelivery facts
+        if: inputs.suite == 'history-redelivery'
+        uses: actions/upload-artifact@v4
+        with:
+          name: focused-history-redelivery-${{ inputs.source_commit }}
+          path: target/history-redelivery-facts.json
+          if-no-files-found: error
+          retention-days: 7
       - name: Run real holder fork-to-mempool regression
         if: inputs.suite == 'matrix-mempool'
         run: |
@@ -218,7 +318,7 @@ jobs:
             ++2.13.18 \
             "ergoCore/testOnly *ExtensionCandidateTest *PoPowHeaderSpec *NipopowProofInteropSpec"
       - name: Retain test reports
-        if: always() && inputs.suite != 'matrix-input-cache'
+        if: always() && inputs.suite != 'matrix-input-cache' && inputs.suite != 'history-redelivery'
         uses: actions/upload-artifact@v4
         with:
           name: focused-${{ inputs.suite }}-${{ inputs.source_commit }}
