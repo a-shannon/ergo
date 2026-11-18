@@ -56,6 +56,14 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
     .withFallback(allowLocalConfig)
 
   private val observations = new ConvergenceObservations
+
+  private def recordCompatibility(phase: String, a: Node, b: Node): Unit = {
+    sys.env.get("COMPAT_OBSERVER").foreach { script =>
+      val command = Seq("python3", script, phase, a.nodeInfo.hostRestApiPort.toString,
+        b.nodeInfo.hostRestApiPort.toString, a.containerId, b.containerId)
+      require(scala.sys.process.Process(command).! == 0, s"Compatibility observation failed: $phase")
+    }
+  }
   private case class NodeSnapshot(info: Option[NodeInfo])
   private val probes = scala.collection.mutable.Map.empty[
     Node, (observations.Probe[NodeInfo], observations.Probe[Int])]
@@ -207,10 +215,17 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
       // shared chain; its lead of at least `delta` (more than 128 blocks) puts nodeB on
       // the far-behind download path when it switches (#2673)
       Async.await(minerAIsolated.waitForHeight(sharedHeight + chainLength + delta))
+      val stableA = if (sys.env.contains("COMPAT_OBSERVER")) {
+        // Freeze the winning tip before mining the losing branch, keeping both
+        // branch points within the retained-history window for full-block comparison.
+        docker.stopNode(minerAIsolated.containerId)
+        docker.startDevNetNode(minerAConfigNonGen, noConnectionsConfig,
+          specialVolumeOpt = Some((localVolumeA, remoteVolumeA))).get
+      } else minerAIsolated
 
       val minerBIsolated: Node = docker.startDevNetNode(minerBConfig, noConnectionsConfig,
         specialVolumeOpt = Some((localVolumeB, remoteVolumeB))).get
-      Async.await(observeNodes("isolated miners started", minerAIsolated, minerBIsolated))
+      Async.await(observeNodes("isolated miners started", stableA, minerBIsolated))
       // in isolation nodeB gets no new headers, so its miner never starts if its headers
       // are 6 or more above its full blocks
       val minerBStartGap = headersAheadOfFullBlocks(Async.await(minerBIsolated.info))
@@ -223,12 +238,12 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
 
       log.info("Mining phase done")
 
-      val minerABestHeight = Async.await(minerAIsolated.fullHeight)
+      val minerABestHeight = Async.await(stableA.fullHeight)
       val minerBBestHeight = Async.await(minerBIsolated.fullHeight)
-      Async.await(observeNodes("isolated mining complete", minerAIsolated, minerBIsolated))
+      Async.await(observeNodes("isolated mining complete", stableA, minerBIsolated))
       // with no peers each miner mined its own fork: different blocks `chainLength / 2`
       // below nodeB's tip show that nodeB has a deep rollback to do
-      val isolatedMiners = Seq(minerAIsolated, minerBIsolated)
+      val isolatedMiners = Seq(stableA, minerBIsolated)
       val isolatedPeers = Async.await(Future.traverse(isolatedMiners) { node =>
         node.connectedPeers.map(peers => node.nodeName -> peers.map(_.name))
       })
@@ -244,13 +259,23 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
         forkIds.flatMap(_._2).distinct should have size 2
       }
 
-      docker.stopNode(minerAIsolated.containerId)
+      docker.stopNode(stableA.containerId)
       docker.stopNode(minerBIsolated.containerId)
+
+      if (sys.env.contains("COMPAT_OBSERVER")) {
+        val staticA = docker.startDevNetNode(minerAConfigNonGen, noConnectionsConfig,
+          specialVolumeOpt = Some((localVolumeA, remoteVolumeA))).get
+        val staticB = docker.startDevNetNode(minerBConfigNonGen, noConnectionsConfig,
+          specialVolumeOpt = Some((localVolumeB, remoteVolumeB))).get
+        recordCompatibility("isolated", staticA, staticB)
+        docker.stopNode(staticA.containerId)
+        docker.stopNode(staticB.containerId)
+      }
 
       log.info("heightA: " + minerABestHeight)
       log.info("heightB: " + minerBBestHeight)
 
-      // the far-behind download path needs a lead of more than 128 blocks
+      // The far-behind download path needs a lead of more than 128 blocks.
       withClue(s"nodeA at $minerABestHeight, nodeB at $minerBBestHeight: ") {
         minerABestHeight - minerBBestHeight should be > 128
       }
@@ -278,6 +303,7 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
       log.info("Chain switching done")
 
       minerBInfo.bestBlockIdOpt shouldEqual minerAInfo.bestBlockIdOpt
+      recordCompatibility("reconnected", minerA, minerB)
     }
 
     try {

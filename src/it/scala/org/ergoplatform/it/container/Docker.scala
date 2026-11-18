@@ -300,7 +300,11 @@ class Docker(
       s"$miscCmdOptions /opt/ergo/ergo.jar $networkTypeCmdOption -c /opt/ergo/${networkType.verboseName}Template.conf"
 
     client
-      .createContainerCmd(ErgoImageLatest)
+      .createContainerCmd(
+        if (networkType == DevNet && sys.env.get("COMPAT_RELEASE_PEER").contains(settings.scorexSettings.network.nodeName))
+          "ergo-compat-release:6.0.8"
+        else ErgoImageLatest
+      )
       .withExposedPorts(
         List(ExposedPort.tcp(restApiPort), ExposedPort.tcp(networkPort)).asJava
       )
