@@ -267,6 +267,7 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
           specialVolumeOpt = Some((localVolumeA, remoteVolumeA))).get
         val staticB = docker.startDevNetNode(minerBConfigNonGen, noConnectionsConfig,
           specialVolumeOpt = Some((localVolumeB, remoteVolumeB))).get
+        Async.await(docker.waitForStartup(List(staticA, staticB)))
         recordCompatibility("isolated", staticA, staticB)
         docker.stopNode(staticA.containerId)
         docker.stopNode(staticB.containerId)
