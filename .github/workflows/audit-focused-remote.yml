@@ -49,7 +49,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sbt -batch -Denv=test ++2.12.20 'it/docker'
+          sbt -batch -Denv=test ++2.12.20 docker
           docker image inspect org.ergoplatform/ergo >/dev/null
       - name: Bind released node image
         timeout-minutes: 5
@@ -83,7 +83,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$COMPAT_RECEIPTS"
-          sbt -batch -Denv=test ++2.12.20 'it/testOnly org.ergoplatform.it.DeepRollBackSpec'
+          sbt -batch -Denv=test ++2.12.20 'it:testOnly org.ergoplatform.it.DeepRollBackSpec'
           test -s "$COMPAT_RECEIPTS/result.json"
       - name: Candidate joins v6.0.8 branch
         id: candidate_follows
@@ -99,7 +99,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$COMPAT_RECEIPTS"
-          sbt -batch -Denv=test ++2.12.20 'it/testOnly org.ergoplatform.it.DeepRollBackSpec'
+          sbt -batch -Denv=test ++2.12.20 'it:testOnly org.ergoplatform.it.DeepRollBackSpec'
           test -s "$COMPAT_RECEIPTS/result.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
