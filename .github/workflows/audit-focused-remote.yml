@@ -1,29 +1,41 @@
 name: Mixed release fork convergence
 
 'on':
-  push:
-    branches: [a-shannon/mixed-release-observation-20261118]
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact full commit on this fork
+        required: true
+        type: string
+      suite:
+        description: Accepted compatibility run
+        required: true
+        type: choice
+        options: [matrix-forks]
 
 permissions:
   contents: read
 
 jobs:
   observe:
-    if: github.repository == 'a-shannon/ergo' && github.event.repository.private == false && github.event.created && github.run_attempt == 1
+    if: github.repository == 'a-shannon/ergo' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.sha == inputs.source_commit && inputs.suite == 'matrix-forks' && github.run_attempt == 1
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          fetch-depth: 2
+          fetch-depth: 0
           persist-credentials: false
       - name: Verify sources and prepared observation
         shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = 46d0beaa33562f099ff3579036238e78d314ed99
-          test "$(git diff --name-only HEAD^ HEAD)" = "$(printf '%s\n' \
-            .github/workflows/mixed-release-observation.yml \
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          git merge-base --is-ancestor 46d0beaa33562f099ff3579036238e78d314ed99 HEAD
+          test "$(git diff --name-only 46d0beaa33562f099ff3579036238e78d314ed99 HEAD)" = "$(printf '%s\n' \
+            .github/workflows/audit-focused-remote.yml \
             src/it/scala/org/ergoplatform/it/DeepRollBackSpec.scala \
             src/it/scala/org/ergoplatform/it/container/Docker.scala \
             src/test/compatibility/observe.py)"
