@@ -18,8 +18,51 @@ def get(port, path):
         return json.load(response)
 
 
+def block_view(value):
+    result = {key: item for key, item in value.items() if key != "size"}
+    result["header"] = {key: item for key, item in value["header"].items() if key != "size"}
+    transactions = value["blockTransactions"]
+    result["blockTransactions"] = {
+        key: item for key, item in transactions.items() if key != "size"
+    }
+    result["blockTransactions"]["transactions"] = [
+        {key: item for key, item in tx.items() if key != "size"}
+        for tx in transactions["transactions"]
+    ]
+    if value["adProofs"] is not None:
+        result["adProofs"] = {
+            key: item for key, item in value["adProofs"].items() if key != "size"
+        }
+    return result
+
+
 def digest(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    consensus_view = block_view(value) if isinstance(value, dict) and "header" in value else value
+    return hashlib.sha256(
+        json.dumps(consensus_view, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def first_difference(left, right, path="$"):
+    if type(left) is not type(right):
+        return path
+    if isinstance(left, dict):
+        for key in sorted(left.keys() | right.keys()):
+            if key not in left or key not in right:
+                return path + "." + key
+            found = first_difference(left[key], right[key], path + "." + key)
+            if found:
+                return found
+    elif isinstance(left, list):
+        if len(left) != len(right):
+            return path
+        for index, (a, b) in enumerate(zip(left, right)):
+            found = first_difference(a, b, f"{path}[{index}]")
+            if found:
+                return found
+    elif left != right:
+        return path
+    return None
 
 
 def info(port):
@@ -116,12 +159,15 @@ if __name__ == "__main__":
         suffix = [ident for ident in losing if ident not in a]
         for ident in reversed(suffix):
             value = block(ports[1], ident)
+            if digest(value) != losing[ident][2]:
+                raise ValueError("source block changed after isolated snapshot")
             deliver(ports[0], value)
             for attempt in range(25):
                 stored = block(ports[0], ident)
                 if stored is not None:
-                    if digest(stored) != losing[ident][2]:
-                        raise ValueError("relayed block differs from original")
+                    if digest(stored) != digest(value):
+                        field = first_difference(block_view(value), block_view(stored))
+                        raise ValueError(f"relayed block differs from original at {field}")
                     break
                 time.sleep(0.4)
             else:
@@ -162,10 +208,14 @@ if __name__ == "__main__":
             if sum(item[1] for item in chain.values()) != int(score):
                 raise ValueError("chain work differs from node score")
         for ident, record in (a | losing).items():
-            for port in ports:
-                value = block(port, ident)
-                if value is None or digest(value) != record[2]:
-                    raise ValueError("both peers must retain the same complete blocks")
+            left, right = (block(port, ident) for port in ports)
+            if left is None or right is None:
+                raise ValueError("a peer is missing a complete block")
+            if digest(left) != record[2] or digest(right) != record[2]:
+                field = first_difference(block_view(left), block_view(right))
+                if field is None:
+                    raise ValueError("both peers agree but differ from isolated snapshot")
+                raise ValueError(f"complete blocks differ at {field}")
         for _ in range(3):
             time.sleep(3)
             if [info(port) for port in ports] != tips:
